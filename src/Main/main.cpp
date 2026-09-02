@@ -31,6 +31,7 @@ import std;
 import core;
 import utils;
 import version;
+import core:plugins;
 
 namespace {
 static void applyInheritedStdbuf(const char* name, FILE* stream) {
@@ -223,6 +224,18 @@ static int printHelp() noexcept {
     printCommandSummary(cmd_name, cmd_desc, command_style, color);
   }
 
+  auto plugin_commands = PluginRegistry::getAllCommands();
+  if (!plugin_commands.empty()) {
+    safePrintLn("");
+    const auto plugin_heading = winux::i18n::translate(
+        "main.plugin_commands", "Plugin Commands:");
+    safePrintLn(color ? colorizeStdout(plugin_heading, section_style)
+                      : plugin_heading);
+    for (const auto& [cmd_name, cmd_desc] : plugin_commands) {
+      printCommandSummary(cmd_name, cmd_desc, command_style, color);
+    }
+  }
+
   safePrintLn("");
   const auto tip = winux::i18n::translate(
       "main.help_tip",
@@ -246,6 +259,7 @@ int main(int argc, char* argv[]) noexcept {
   applyInheritedStdbuf("WINUX_STDBUF_I", stdin);
   applyInheritedStdbuf("WINUX_STDBUF_O", stdout);
   applyInheritedStdbuf("WINUX_STDBUF_E", stderr);
+  PluginRegistry::initialize();
   // Get the executable name (stem only)
   std::string self_name = path::get_executable_name(argv[0]);
 
@@ -281,9 +295,17 @@ int main(int argc, char* argv[]) noexcept {
           CommandRegistry::printHelp(topic);
           return 0;
         }
+        if (PluginRegistry::hasCommand(topic)) {
+          PluginRegistry::printHelp(topic);
+          return 0;
+        }
         std::string lowered = toLowerAscii(topic);
         if (CommandRegistry::hasCommand(lowered)) {
           CommandRegistry::printHelp(lowered);
+          return 0;
+        }
+        if (PluginRegistry::hasCommand(lowered)) {
+          PluginRegistry::printHelp(lowered);
           return 0;
         }
         safeErrorPrintLn(winux::i18n::format("main.error.no_help_topic",
@@ -320,6 +342,9 @@ int main(int argc, char* argv[]) noexcept {
     }
 
     if (!CommandRegistry::hasCommand(cmd_name)) {
+      if (auto plugin_forwarded = PluginRegistry::dispatch(cmd_name, cmd_args)) {
+        return *plugin_forwarded;
+      }
       // Not a builtin: try forwarding to a shim-layout payload first.
       if (auto forwarded = forwardToOptPayload(cmd_name)) {
         return *forwarded;
@@ -338,8 +363,11 @@ int main(int argc, char* argv[]) noexcept {
     // Treat executable name as command name for direct calls
     const std::span<std::string_view> cmd_args(args.data(), args.size());
 
-    // Not a builtin: try forwarding to a shim-layout payload first.
     if (!CommandRegistry::hasCommand(self_name)) {
+      if (auto plugin_forwarded = PluginRegistry::dispatch(self_name, cmd_args)) {
+        return *plugin_forwarded;
+      }
+      // Not a builtin: try forwarding to a shim-layout payload first.
       if (auto forwarded = forwardToOptPayload(self_name)) {
         return *forwarded;
       }

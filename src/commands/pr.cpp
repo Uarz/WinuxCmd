@@ -599,17 +599,39 @@ auto print_page_header(const Config& cfg, int page_num,
   char page_str[32];
   snprintf(page_str, sizeof(page_str), "Page %d", page_num);
 
-  // Center the header
-  int header_len = static_cast<int>(date_str.size()) +
-                   static_cast<int>(header_text.size()) +
-                   static_cast<int>(strlen(page_str)) + 4;
-  int pad = (cfg.page_width - header_len) / 2;
-  if (pad < 1) pad = 1;
+  // [GNU] Center the date+text+page composite within the page width, with
+  // at least one space on each side of the text. (Savannah #1728)
+  const int dlen = static_cast<int>(date_str.size());
+  const int tlen = static_cast<int>(header_text.size());
+  const int plen = static_cast<int>(strlen(page_str));
+  int left = (cfg.page_width - dlen - plen - tlen) / 2;
+  if (left < 1) left = 1;
+  int right = cfg.page_width - dlen - left - tlen - plen;
+  if (right < 1) right = 1;
 
-  std::string output = date_str + std::string(pad, ' ') + header_text +
-                       std::string(pad, ' ') + page_str;
-  safePrintLn(output);
-  safePrintLn("");  // Blank line after header
+  // [GNU] The page starts with two blank lines, the header line, and two
+  // more blank lines before the body. (Savannah #1728)
+  safePrintLn("");
+  safePrintLn("");
+  safePrintLn(date_str + std::string(left, ' ') + header_text +
+              std::string(right, ' ') + page_str);
+  safePrintLn("");
+  safePrintLn("");
+}
+
+// [GNU] The header block occupies 5 lines at the top of the page and a
+// 5-line margin is kept at the bottom, so the body capacity is
+// page_length - 10 (measured against GNU 8.32: 66-line pages break the
+// body after 56 lines). (Savannah #1728)
+auto header_block_lines(const Config& cfg) -> int {
+  return (cfg.omit_header || cfg.omit_pagination) ? 0 : 5;
+}
+
+auto body_capacity(const Config& cfg) -> int {
+  if (cfg.omit_header || cfg.omit_pagination) {
+    return std::max(1, cfg.page_length);
+  }
+  return std::max(1, cfg.page_length - 10);
 }
 
 // Print page trailer (blank lines for form feed)
@@ -694,7 +716,13 @@ auto run(const Config& cfg) -> int {
   }
 
   // Apply start_page: skip lines before the start page
-  int lines_per_page = std::max(1, cfg.page_length);
+  // [GNU] Paging counts body lines only; the header block is part of the
+  // page length. (Savannah #1728)
+  const int lines_per_page = body_capacity(cfg);
+  const int page_lines_total =
+      cfg.omit_header || cfg.omit_pagination
+          ? lines_per_page
+          : cfg.page_length;
 
   // [GNU] a start page beyond the total page count is reported and nothing
   // is printed (uutils #13557)
@@ -786,6 +814,12 @@ auto run(const Config& cfg) -> int {
 
       ++lines_on_page;
       if (lines_on_page >= lines_per_page && !cfg.omit_pagination) {
+        // [GNU] Every page is filled to the page length before the break.
+        for (int pad = page_lines_total - header_block_lines(cfg) -
+                       lines_on_page;
+             pad > 0; --pad) {
+          safePrintLn("");
+        }
         print_page_trailer(cfg);
         ++page_num;
         lines_on_page = 0;
@@ -854,6 +888,12 @@ auto run(const Config& cfg) -> int {
 
       ++lines_on_page;
       if (lines_on_page >= lines_per_page) {
+        // [GNU] Every page is filled to the page length before the break.
+        for (int pad = page_lines_total - header_block_lines(cfg) -
+                       lines_on_page;
+             pad > 0; --pad) {
+          safePrintLn("");
+        }
         print_page_trailer(cfg);
         ++page_num;
         lines_on_page = 0;
@@ -864,6 +904,15 @@ auto run(const Config& cfg) -> int {
 
   // Final page trailer
   if (in_page && !cfg.omit_pagination) {
+    // [GNU] Pad the final page with blank lines up to the page length
+    // (Savannah #1728). -t omits headers *and* trailers, so no padding.
+    if (!cfg.omit_header) {
+      int used = header_block_lines(cfg) + lines_on_page;
+      while (used < page_lines_total) {
+        safePrintLn("");
+        ++used;
+      }
+    }
     print_page_trailer(cfg);
   }
 

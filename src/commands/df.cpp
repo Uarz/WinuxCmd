@@ -260,8 +260,10 @@ struct OutputConfig {
   bool si = false;
   bool portability = false;
   bool block_size_explicit = false;
-  uint64_t block_size = 1;
-  std::string block_label = "Total";
+  // [GNU] Default block size is 1K (512 only under POSIX -P), matching
+  // coreutils df.
+  uint64_t block_size = 1024;
+  std::string block_label = "1K-blocks";
   // Suffix appended to scaled output when --block-size used a bare unit
   // suffix (e.g. "df -BM" prints sizes as "1M").
   std::string display_suffix;
@@ -560,6 +562,8 @@ auto print_usage_header(const OutputConfig& output, bool print_type,
     return;
   }
 
+  // [GNU] POSIX -P mode uses the historical "Capacity" header.
+  const char* use_label = output.portability ? "Capacity" : "Use%";
   if (output.human || output.si) {
     // [GNU] Header words match coreutils df: "Avail"/"Use%" in human mode
     // (Savannah #14358).
@@ -567,8 +571,8 @@ auto print_usage_header(const OutputConfig& output, bool print_type,
   } else {
     char buf[128];
     // [GNU] Block mode keeps "Available" but uses "Use%" (Savannah #14358).
-    snprintf(buf, sizeof(buf), "%16s        Used    Available Use%",
-             output.block_label.c_str());
+    snprintf(buf, sizeof(buf), "%16s        Used    Available %s",
+             output.block_label.c_str(), use_label);
     safePrint(buf);
   }
   safePrintLn(L" Mounted on");
@@ -634,8 +638,15 @@ auto configure_output(const CommandContext<DF_OPTIONS.size()>& ctx)
 
     if (meta.short_name == "-P" || meta.long_name == "--portability") {
       output.portability = true;
-      output.block_size = std::getenv("POSIXLY_CORRECT") ? 512 : 1024;
-      output.block_label = std::to_string(output.block_size) + "-blocks";
+      // [GNU] -P uses 1024-blocks with the "Capacity" header; with
+      // POSIXLY_CORRECT it becomes "512-blocks" (no B suffix, unlike the
+      // non-portable "512B-blocks").
+      output.block_size = 1024;
+      output.block_label = "1024-blocks";
+      if (std::getenv("POSIXLY_CORRECT") != nullptr) {
+        output.block_size = 512;
+        output.block_label = "512-blocks";
+      }
       output.block_size_explicit = true;
       output.display_suffix.clear();
       continue;
@@ -671,6 +682,14 @@ auto configure_output(const CommandContext<DF_OPTIONS.size()>& ctx)
       output.block_label = block_label_for(*value);
       output.block_size_explicit = true;
     }
+  }
+
+  // [GNU] POSIXLY_CORRECT changes the default block size to 512B
+  // ("512B-blocks") unless a size mode was requested explicitly.
+  if (!output.block_size_explicit && !output.human && !output.si &&
+      std::getenv("POSIXLY_CORRECT") != nullptr) {
+    output.block_size = 512;
+    output.block_label = "512B-blocks";
   }
 
   return output;

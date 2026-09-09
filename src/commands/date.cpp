@@ -35,6 +35,9 @@
 #include "core/command_macros.h"
 #include "pch/pch.h"
 
+#include <ctime>   // _tzset, localtime_s, mktime (TZ env support)
+#include <cstdlib> // std::getenv
+
 #pragma comment(lib, "advapi32.lib")
 import std;
 import core;
@@ -175,35 +178,83 @@ auto utc_system_time_to_filetime(const SYSTEMTIME &utc)
   return ft;
 }
 
+// [GNU] Honor the TZ environment variable like GNU date does. The CRT
+// implements POSIX TZ parsing ("PST8PDT" and friends), so when TZ is set
+// we route conversions through localtime/mktime; otherwise fall back to
+// the process/system timezone. (Savannah #9089)
+auto tz_env_active() -> bool {
+  const char *tz = std::getenv("TZ");
+  return tz != nullptr && *tz != '\0';
+}
+
+auto filetime_to_local_st(const FILETIME &ft) -> std::optional<SYSTEMTIME> {
+  if (!tz_env_active()) {
+    FILETIME local_ft{};
+    if (!FileTimeToLocalFileTime(&ft, &local_ft)) return std::nullopt;
+    SYSTEMTIME st{};
+    if (!FileTimeToSystemTime(&local_ft, &st)) return std::nullopt;
+    return st;
+  }
+  _tzset();
+  const unsigned long long ticks = filetime_to_ticks(ft);
+  const long long secs =
+      static_cast<long long>(ticks / 10000000ULL) - 11644473600LL;
+  const time_t t = static_cast<time_t>(secs);
+  struct tm tmv {};
+  if (localtime_s(&tmv, &t) != 0) return std::nullopt;
+  SYSTEMTIME st{};
+  st.wYear = static_cast<WORD>(tmv.tm_year + 1900);
+  st.wMonth = static_cast<WORD>(tmv.tm_mon + 1);
+  st.wDay = static_cast<WORD>(tmv.tm_mday);
+  st.wHour = static_cast<WORD>(tmv.tm_hour);
+  st.wMinute = static_cast<WORD>(tmv.tm_min);
+  st.wSecond = static_cast<WORD>(tmv.tm_sec);
+  st.wDayOfWeek = static_cast<WORD>(tmv.tm_wday);
+  return st;
+}
+
+auto local_st_to_filetime(const SYSTEMTIME &local) -> std::optional<FILETIME> {
+  if (!tz_env_active()) {
+    TIME_ZONE_INFORMATION tzi{};
+    GetTimeZoneInformation(&tzi);
+    SYSTEMTIME utc{};
+    if (!TzSpecificLocalTimeToSystemTime(&tzi, &local, &utc)) {
+      return std::nullopt;
+    }
+    FILETIME ft{};
+    if (!SystemTimeToFileTime(&utc, &ft)) return std::nullopt;
+    return ft;
+  }
+  if (!valid_system_time(local)) return std::nullopt;
+  struct tm tmv {};
+  tmv.tm_year = static_cast<int>(local.wYear) - 1900;
+  tmv.tm_mon = static_cast<int>(local.wMonth) - 1;
+  tmv.tm_mday = static_cast<int>(local.wDay);
+  tmv.tm_hour = static_cast<int>(local.wHour);
+  tmv.tm_min = static_cast<int>(local.wMinute);
+  tmv.tm_sec = static_cast<int>(local.wSecond);
+  tmv.tm_isdst = -1;
+  _tzset();
+  const time_t t = mktime(&tmv);
+  if (t == static_cast<time_t>(-1)) return std::nullopt;
+  const unsigned long long ticks =
+      (static_cast<unsigned long long>(t) + 11644473600ULL) * 10000000ULL;
+  return ticks_to_filetime(ticks);
+}
+
 auto local_system_time_to_filetime(const SYSTEMTIME &local)
     -> std::optional<FILETIME> {
-  if (!valid_system_time(local)) return std::nullopt;
-
-  TIME_ZONE_INFORMATION tzi{};
-  GetTimeZoneInformation(&tzi);
-
-  SYSTEMTIME utc{};
-  if (!TzSpecificLocalTimeToSystemTime(&tzi, &local, &utc)) {
-    return std::nullopt;
-  }
-
-  FILETIME ft{};
-  if (!SystemTimeToFileTime(&utc, &ft)) return std::nullopt;
-  return ft;
+  return local_st_to_filetime(local);
 }
 
 auto filetime_to_system_time(const FILETIME &ft, bool use_utc)
     -> std::optional<SYSTEMTIME> {
-  SYSTEMTIME st{};
   if (use_utc) {
+    SYSTEMTIME st{};
     if (!FileTimeToSystemTime(&ft, &st)) return std::nullopt;
     return st;
   }
-
-  FILETIME local_ft{};
-  if (!FileTimeToLocalFileTime(&ft, &local_ft)) return std::nullopt;
-  if (!FileTimeToSystemTime(&local_ft, &st)) return std::nullopt;
-  return st;
+  return filetime_to_local_st(ft);
 }
 
 auto parse_epoch_time(std::string_view s) -> std::optional<FILETIME> {
@@ -351,9 +402,11 @@ auto parse_fixed_date_time(std::string input, bool use_utc)
 
 auto timezone_offset_minutes(const FILETIME &utc, bool use_utc) -> int {
   if (use_utc) return 0;
-  FILETIME local_ft{};
-  if (!FileTimeToLocalFileTime(&utc, &local_ft)) return 0;
-  auto diff = static_cast<long long>(filetime_to_ticks(local_ft)) -
+  auto local = filetime_to_local_st(utc);
+  if (!local) return 0;
+  FILETIME as_utc{};
+  if (!SystemTimeToFileTime(&*local, &as_utc)) return 0;
+  auto diff = static_cast<long long>(filetime_to_ticks(as_utc)) -
               static_cast<long long>(filetime_to_ticks(utc));
   return static_cast<int>(diff / (10000000LL * 60));
 }
@@ -809,11 +862,11 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
         if (!SystemTimeToFileTime(&base, &out)) return std::nullopt;
         return out;
       }
-      FILETIME local_shifted{};
-      if (!FileTimeToLocalFileTime(&shifted, &local_shifted)) {
+      auto base_opt = filetime_to_local_st(shifted);
+      if (!base_opt) {
         return std::nullopt;
       }
-      if (!FileTimeToSystemTime(&local_shifted, &base)) return std::nullopt;
+      base = *base_opt;
       base.wHour = static_cast<WORD>(hour);
       base.wMinute = static_cast<WORD>(minute);
       base.wSecond = static_cast<WORD>(second);
@@ -923,10 +976,9 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
 
       FILETIME now_ft{};
       GetSystemTimeAsFileTime(&now_ft);
-      FILETIME local_now_ft{};
-      if (!FileTimeToLocalFileTime(&now_ft, &local_now_ft)) return std::nullopt;
-      SYSTEMTIME local_now{};
-      if (!FileTimeToSystemTime(&local_now_ft, &local_now)) return std::nullopt;
+      auto local_now_opt = filetime_to_local_st(now_ft);
+      if (!local_now_opt) return std::nullopt;
+      SYSTEMTIME local_now = *local_now_opt;
 
       SYSTEMTIME target{};
       target.wYear = local_now.wYear;
@@ -1262,8 +1314,9 @@ REGISTER_COMMAND(
         exit_code = 1;
       }
       SYSTEMTIME utc_st{};
-      if (TzSpecificLocalTimeToSystemTime(nullptr, &*parsed, &utc_st)) {
-        SystemTimeToFileTime(&utc_st, &utc_ft);
+      auto back_ft = local_st_to_filetime(*parsed);
+      if (back_ft) {
+        utc_ft = *back_ft;
       }
     }
     // Print the (attempted) new date like GNU does.

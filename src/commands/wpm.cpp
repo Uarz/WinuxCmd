@@ -66,7 +66,13 @@ auto constexpr WPM_OPTIONS = std::array{
     // [EXT] option
     OPTION("", "--json", "print machine-readable JSON"),
     // [EXT] option
-    OPTION("", "--plain", "print only package names for export")};
+    OPTION("", "--plain", "print only package names for export"),
+    // [EXT] option
+    OPTION("", "--proxy", "use the given HTTP proxy for downloads",
+           STRING_TYPE),
+    // [EXT] option
+    OPTION("", "--from", "install packages from a manifest file or URL",
+           STRING_TYPE)};
 
 namespace wpm {
 namespace fs = std::filesystem;
@@ -141,6 +147,8 @@ struct Options {
   fs::path root;
   std::string source;
   std::string category;
+  std::string proxy;
+  std::string from;
   bool all = false;
   bool force = false;
   bool dry_run = false;
@@ -1069,6 +1077,63 @@ auto proxy_from_environment(bool https) -> std::optional<std::wstring> {
   return std::nullopt;
 }
 
+auto user_forced_proxy(const Options& opts) -> std::optional<std::wstring> {
+  if (opts.proxy.empty()) return std::nullopt;
+  return normalize_proxy_server(opts.proxy);
+}
+
+// Builds a WinHTTP proxy bypass list from WPM_NO_PROXY/NO_PROXY/no_proxy.
+// Entries match by host suffix; a bare hostname also matches its subdomains.
+// A single "*" bypasses every host, which callers treat as "never proxy".
+auto proxy_bypass_from_environment() -> std::optional<std::wstring> {
+  std::optional<std::string> raw;
+  for (const char* name :
+       {"WPM_NO_PROXY", "wpm_no_proxy", "NO_PROXY", "no_proxy"}) {
+    if (auto value = env_var_value(name); value && !value->empty()) {
+      raw = std::move(*value);
+      break;
+    }
+  }
+  if (!raw) return std::nullopt;
+
+  std::wstring bypass;
+  size_t start = 0;
+  while (start <= raw->size()) {
+    size_t end = raw->find(',', start);
+    if (end == std::string::npos) end = raw->size();
+    std::string entry = trim_ascii(raw->substr(start, end - start));
+    start = end + 1;
+
+    if (entry.empty()) continue;
+    if (entry == "*") return std::wstring(L"*");
+    if (lower_ascii(entry) == "<local>") {
+      if (!bypass.empty()) bypass += L';';
+      bypass += L"<local>";
+      continue;
+    }
+    if (lower_ascii(entry).starts_with("http://") ||
+        lower_ascii(entry).starts_with("https://")) {
+      entry.erase(0, entry.find("://") + 3);
+    }
+    if (auto at = entry.find('/'); at != std::string::npos) {
+      entry.resize(at);
+    }
+    entry = trim_ascii(std::move(entry));
+    if (entry.empty()) continue;
+
+    if (!bypass.empty()) bypass += L';';
+    std::wstring wide = utf8_to_wstring(entry);
+    bypass += wide;
+    if (!entry.starts_with('.')) {
+      bypass += L';';
+      bypass += L'.';
+      bypass += wide;
+    }
+  }
+  if (bypass.empty()) return std::nullopt;
+  return bypass;
+}
+
 void free_proxy_info(WINHTTP_PROXY_INFO& info) {
   if (info.lpszProxy) GlobalFree(info.lpszProxy);
   if (info.lpszProxyBypass) GlobalFree(info.lpszProxyBypass);
@@ -1283,7 +1348,11 @@ auto http_get(std::string_view url, std::string_view progress_label = {},
   }
 
   if (forced_proxy) {
-    set_request_proxy(request, *forced_proxy);
+    auto bypass = proxy_bypass_from_environment();
+    if (!(bypass && *bypass == L"*")) {
+      set_request_proxy(request, *forced_proxy,
+                        bypass ? bypass->c_str() : WINHTTP_NO_PROXY_BYPASS);
+    }
   } else {
     apply_user_proxy(session, request, wurl, https);
   }
@@ -1843,7 +1912,8 @@ auto package_matches_category(const nlohmann::json& pkg,
 }
 
 auto download_artifact(const fs::path& root, const std::string& package,
-                       const nlohmann::json& artifact, bool verbose)
+                       const nlohmann::json& artifact, bool verbose,
+                       const std::optional<std::wstring>& forced_proxy)
     -> std::optional<fs::path> {
   auto urls = artifact_urls(artifact);
   if (urls.empty()) {
@@ -1873,8 +1943,10 @@ auto download_artifact(const fs::path& root, const std::string& package,
   }
   for (const auto& url : urls) {
     if (verbose) safePrintLn("wpm: downloading " + url);
-    auto result = http_get(url, wpm_text("command.wpm.status.downloading",
-                                         "wpm: downloading {}", package));
+    auto result = http_get(url,
+                           wpm_text("command.wpm.status.downloading",
+                                    "wpm: downloading {}", package),
+                           5, forced_proxy);
     if (!result.ok) {
       safeErrorPrintLn(wpm_text("command.wpm.error.download_failed",
                                 "wpm: download failed from {}: {}", url,
@@ -2046,7 +2118,8 @@ auto write_install_receipt(const fs::path& root, const nlohmann::json& pkg,
   }
   std::error_code ec;
   fs::create_directories(receipts_dir(root), ec);
-  std::ofstream out(receipt_path(root, name), std::ios::binary | std::ios::trunc);
+  std::ofstream out(receipt_path(root, name),
+                    std::ios::binary | std::ios::trunc);
   if (!out.is_open()) return;
   out << receipt.dump(2) << "\n";
 }
@@ -2376,7 +2449,8 @@ auto install_package(const Options& opts, std::string_view package_name)
   if (preflight) return *preflight;
 
   auto downloaded = download_artifact(opts.root, pkg->value("name", ""),
-                                      *artifact, opts.verbose);
+                                      *artifact, opts.verbose,
+                                      user_forced_proxy(opts));
   if (!downloaded) return 1;
 
   fs::path extracted = staging_dir(opts.root) / pkg->value("name", "package");
@@ -2445,6 +2519,196 @@ auto install_packages(const Options& opts,
   return failed == 0 ? 0 : 1;
 }
 
+auto strip_manifest_comment(std::string_view line) -> std::string_view {
+  bool in_string = false;
+  for (size_t i = 0; i < line.size(); ++i) {
+    if (line[i] == '"') in_string = !in_string;
+    if (line[i] == '#' && !in_string) return line.substr(0, i);
+  }
+  return line;
+}
+
+auto parse_toml_string_array(std::string_view value)
+    -> std::optional<std::vector<std::string>> {
+  std::vector<std::string> items;
+  size_t i = 0;
+  while (i < value.size()) {
+    if (value[i] == '"') {
+      std::string out;
+      size_t j = i + 1;
+      bool closed = false;
+      while (j < value.size()) {
+        if (value[j] == '\\' && j + 1 < value.size() &&
+            (value[j + 1] == '"' || value[j + 1] == '\\')) {
+          out += value[j + 1];
+          j += 2;
+          continue;
+        }
+        if (value[j] == '"') {
+          closed = true;
+          ++j;
+          break;
+        }
+        out += value[j++];
+      }
+      if (!closed) return std::nullopt;
+      items.push_back(std::move(out));
+      i = j;
+      continue;
+    }
+    if (value[i] == ']') break;
+    ++i;
+  }
+  return items;
+}
+
+auto unquote_toml_string(std::string_view token) -> std::optional<std::string> {
+  token = trim_ascii(std::string(token));
+  if (token.size() < 2 || token.front() != '"' || token.back() != '"') {
+    return std::nullopt;
+  }
+  auto items = parse_toml_string_array(token);
+  if (!items || items->size() != 1) return std::nullopt;
+  return std::move((*items)[0]);
+}
+
+// Minimal manifest reader for `wpm install --from`. Accepts either JSON
+// {"packages": {"wpm": ["a", "b"]}} or a TOML subset with a [packages]
+// section declaring wpm = ["a", "b"] (single or multiline array).
+auto parse_wpm_manifest(std::string_view text)
+    -> std::optional<std::vector<std::string>> {
+  auto trimmed_text = trim_ascii(std::string(text));
+  if (!trimmed_text.empty() && trimmed_text.front() == '{') {
+    auto parsed = parse_json_text(trimmed_text);
+    if (!parsed) return std::nullopt;
+    if (parsed->contains("packages") && (*parsed)["packages"].is_object() &&
+        (*parsed)["packages"].contains("wpm") &&
+        (*parsed)["packages"]["wpm"].is_array()) {
+      std::vector<std::string> items;
+      for (const auto& item : (*parsed)["packages"]["wpm"]) {
+        if (item.is_string()) items.push_back(item.get<std::string>());
+      }
+      return items;
+    }
+    return std::nullopt;
+  }
+
+  std::vector<std::string> items;
+  bool in_packages = false;
+  bool found = false;
+  bool saw_structure = false;
+  std::string pending_key;
+  std::string pending_value;
+
+  auto finish_array = [&](std::string_view value) -> bool {
+    auto parsed_items = parse_toml_string_array(value);
+    if (!parsed_items) return false;
+    if (pending_key == "wpm" && in_packages) {
+      for (auto& item : *parsed_items) items.push_back(std::move(item));
+      found = true;
+    }
+    pending_key.clear();
+    pending_value.clear();
+    return true;
+  };
+
+  std::istringstream in{std::string(text)};
+  std::string line;
+  while (std::getline(in, line)) {
+    auto content = trim_ascii(std::string(strip_manifest_comment(line)));
+    if (content.empty()) continue;
+
+    if (content.front() == '[' && content.back() == ']' &&
+        pending_key.empty()) {
+      auto section = trim_ascii(content.substr(1, content.size() - 2));
+      in_packages = section == "packages";
+      saw_structure = true;
+      continue;
+    }
+
+    auto eq = content.find('=');
+    if (eq == std::string::npos) continue;
+    saw_structure = true;
+
+    if (!pending_key.empty()) {
+      pending_value += " " + content;
+      if (content.find(']') != std::string::npos) {
+        if (!finish_array(pending_value)) return std::nullopt;
+      }
+      continue;
+    }
+
+    std::string key = trim_ascii(content.substr(0, eq));
+    std::string value = trim_ascii(content.substr(eq + 1));
+    if (value.find('[') == std::string::npos) {
+      if (key == "wpm" && in_packages) {
+        if (auto single = unquote_toml_string(value)) {
+          items.push_back(std::move(*single));
+          found = true;
+        }
+      }
+      continue;
+    }
+    pending_key = key;
+    pending_value = value.substr(value.find('[') + 1);
+    if (pending_value.find(']') != std::string::npos) {
+      if (!finish_array(pending_value)) return std::nullopt;
+    }
+  }
+  if (found) return items;
+  // Plain package list (one name per line, as written by `wpm export
+  // --plain`) is accepted as a fallback when no TOML/JSON structure exists.
+  if (saw_structure) return std::nullopt;
+  for (const auto& raw_line : std::views::split(std::string(text), '\n')) {
+    auto entry = trim_ascii(std::string(raw_line.begin(), raw_line.end()));
+    if (entry.empty() || entry.starts_with('#')) continue;
+    items.push_back(std::move(entry));
+  }
+  return items.empty() ? std::nullopt : std::optional{std::move(items)};
+}
+
+auto install_from_manifest(const Options& opts, const std::string& from)
+    -> int {
+  std::string text;
+  if (starts_with_ci(from, "http://") || starts_with_ci(from, "https://") ||
+      starts_with_ci(from, "file://")) {
+    auto result = http_get(from,
+                           wpm_text("command.wpm.status.fetching_manifest",
+                                    "wpm: fetching manifest from {}", from),
+                           5, user_forced_proxy(opts));
+    if (!result.ok) {
+      safeErrorPrintLn(wpm_text("command.wpm.error.manifest_fetch",
+                                "wpm: failed to fetch manifest '{}': {}", from,
+                                result.error));
+      return 1;
+    }
+    text.assign(reinterpret_cast<const char*>(result.data.data()),
+                result.data.size());
+  } else {
+    std::ifstream in{fs::path(from), std::ios::binary};
+    if (!in.is_open()) {
+      safeErrorPrintLn(wpm_text("command.wpm.error.manifest_open",
+                                "wpm: cannot open manifest '{}'", from));
+      return 1;
+    }
+    text.assign(std::istreambuf_iterator<char>(in),
+                std::istreambuf_iterator<char>());
+  }
+
+  auto packages = parse_wpm_manifest(text);
+  if (!packages || packages->empty()) {
+    safeErrorPrintLn(wpm_text("command.wpm.error.manifest_empty",
+                              "wpm: manifest '{}' has no [packages] wpm list",
+                              from));
+    return 1;
+  }
+
+  std::vector<std::string_view> views;
+  views.reserve(packages->size());
+  for (const auto& package : *packages) views.push_back(package);
+  return install_packages(opts, views);
+}
+
 auto launch_apply_update(const fs::path& staged_exe, const fs::path& root,
                          DWORD parent_pid) -> bool {
   std::wstring cmd = quote(staged_exe) + L" wpm -- __apply-update --root " +
@@ -2491,8 +2755,8 @@ auto update_winuxcmd(const Options& opts) -> int {
 
   auto artifact = artifact_for_current_arch(*pkg);
   if (!artifact) return 1;
-  auto downloaded =
-      download_artifact(opts.root, "winuxcmd", *artifact, opts.verbose);
+  auto downloaded = download_artifact(opts.root, "winuxcmd", *artifact,
+                                      opts.verbose, user_forced_proxy(opts));
   if (!downloaded) return 1;
 
   fs::path extracted = staging_dir(opts.root) / "winuxcmd-update";
@@ -2626,9 +2890,10 @@ auto try_fetch_index(const Options& opts, std::string& used_source)
       if (!url_json.is_string()) continue;
       std::string url = url_json.get<std::string>();
       if (opts.verbose) safePrintLn("wpm: fetching index " + url);
-      auto result =
-          http_get(url, wpm_text("command.wpm.status.fetching_index",
-                                 "wpm: fetching index from {}", name));
+      auto result = http_get(url,
+                             wpm_text("command.wpm.status.fetching_index",
+                                      "wpm: fetching index from {}", name),
+                             5, user_forced_proxy(opts));
       if (!result.ok) {
         safeErrorPrintLn("wpm: index fetch failed from " + name + ": " +
                          result.error);
@@ -3528,6 +3793,13 @@ auto print_usage() -> int {
       "      --json                            print machine-readable JSON\n"
       "      --plain                           print only package names for "
       "export\n"
+      "      --proxy <url>                     use the given HTTP proxy for "
+      "downloads (env: HTTP_PROXY,\n"
+      "                                        HTTPS_PROXY, WPM_HTTP_PROXY, "
+      "WPM_HTTPS_PROXY, NO_PROXY)\n"
+      "      --from <manifest>                 install packages from a manifest "
+      "file or URL\n"
+      "                                        (TOML, JSON, or plain list)\n"
       "      --help                            display this help and exit\n"
       "  -V, --version                         output version information and "
       "exit\n";
@@ -3551,6 +3823,8 @@ auto build_options(const CommandContext<WPM_OPTIONS.size()>& ctx) -> Options {
       ctx.get<bool>("--verbose", false) || ctx.get<bool>("-v", false);
   opts.yes = ctx.get<bool>("--yes", false) || ctx.get<bool>("-y", false);
   opts.category = ctx.get<std::string>("--category", "");
+  opts.proxy = ctx.get<std::string>("--proxy", "");
+  opts.from = ctx.get<std::string>("--from", "");
   opts.json = ctx.get<bool>("--json", false);
   opts.plain = ctx.has("--plain");
   if (!opts.dry_run) (void)ensure_install_layout(opts.root);
@@ -3560,6 +3834,13 @@ auto build_options(const CommandContext<WPM_OPTIONS.size()>& ctx) -> Options {
 auto dispatch(const Options& opts, std::span<const std::string_view> args)
     -> int {
   if (args.empty()) return print_usage();
+
+  if (!opts.proxy.empty() && !user_forced_proxy(opts)) {
+    safeErrorPrintLn(wpm_text("command.wpm.error.invalid_proxy",
+                              "wpm: invalid proxy '{}': use http://host:port",
+                              opts.proxy));
+    return 1;
+  }
 
   if (args[0] == "__apply-update") {
     return apply_update(args.subspan(1));
@@ -3655,15 +3936,23 @@ auto dispatch(const Options& opts, std::span<const std::string_view> args)
     return 1;
   }
   if (args[0] == "install") {
-    if (args.size() >= 2) {
-      std::vector<std::string_view> packages;
-      packages.reserve(args.size() - 1);
-      for (size_t i = 1; i < args.size(); ++i) packages.push_back(args[i]);
-      return install_packages(opts, packages);
+    std::vector<std::string_view> packages;
+    packages.reserve(args.size() - 1);
+    for (size_t i = 1; i < args.size(); ++i) packages.push_back(args[i]);
+    if (!opts.from.empty()) {
+      if (!packages.empty()) {
+        safeErrorPrintLn(winux::i18n::translate(
+            "command.wpm.error.manifest_conflict",
+            "wpm: --from cannot be combined with package arguments"));
+        return 1;
+      }
+      return install_from_manifest(opts, opts.from);
     }
+    if (!packages.empty()) return install_packages(opts, packages);
     safeErrorPrintLn(
         winux::i18n::translate("command.wpm.error.usage.install",
-                               "wpm: usage: wpm install <package>..."));
+                               "wpm: usage: wpm install <package>... "
+                               "[--from <manifest>]"));
     return 1;
   }
   if (args[0] == "update" || args[0] == "upgrade") {

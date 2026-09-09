@@ -2,7 +2,7 @@
 
 <div align="center">
 
-<img src=".github/assets/banner.svg" alt="WinuxCmd — Unix commands, native on Windows. 169 commands, 1855 options, 81% differential pass rate (43 cases / 8 known gaps tracked)." width="100%">
+<img src=".github/assets/banner.svg" alt="WinuxCmd — Unix commands, native on Windows. 176 commands, 1924 options, 93% differential pass rate (178 cases / 13 tracked platform diffs)." width="100%">
 
 **Real Unix commands. Real Windows paths. One ~3 MB executable.**
 No WSL · No Cygwin · No MSYS2 · No path-translation pain
@@ -29,14 +29,14 @@ You're on Windows and you need `grep -rn`, `sed -i`, `find -exec`, `xargs -0` �
 - **GnuWin32** — abandoned in 2012, stuck at 60% compatibility
 - **uutils** — a great Rust project, but ~100 commands and ~600 options
 
-**WinuxCmd skips the compromise.** A single native Win32 executable that speaks GNU syntax on Windows paths: **169 commands, 1,855 options** — with ongoing differential testing against GNU Coreutils 9.11 (43 cases, 35 pass, 8 known gaps tracked in issue-140).
+**WinuxCmd skips the compromise.** A single native Win32 executable that speaks GNU syntax on Windows paths: **176 commands, 1,924 options** — with ongoing differential testing against a GNU coreutils 9.7 oracle (178 cases, 165 pass, 13 tracked platform diffs).
 
 | | | | | |
 |:---:|:---:|:---:|:---:|:---:|
-| **169** | **1,855** | **43 cases** | **2,346** | **~3 MB** |
-| commands | options¹ | GNU diff tests · 81% pass | tests · 99.6% pass | zero-dependency binary |
+| **176** | **1,924** | **178 cases** | **2,420** | **~4 MB** |
+| commands | options¹ | GNU diff · 93% pass | unit tests · 99.6% pass | single binary |
 
-> ¹ 1,855 = `OPTION(` macro count in `src/commands/`. Differential corpus: 43 cases across ~35 commands, 35 pass / 8 known gaps (issue-140). See the [GNU comparison report](DOCS/en/gnu_comparison_report.md).
+> ¹ 1,924 = `OPTION(` macro count in `src/commands/`. Command count excludes the internal `wpm` manager and the `[` bracket alias of `test`. Differential corpus: 178 cases across 84 commands (165 pass / 13 known platform diffs, `tests/differential/baseline.json`). See the [GNU comparison report](DOCS/en/gnu_comparison_report.md).
 
 ---
 
@@ -70,7 +70,7 @@ wpm install jq
 - 🪟 **Native, not emulated** — talks to Win32 APIs directly. Understands `C:\`, UNC paths and NTFS ACLs (with `cygpath` and `getfacl` for bridging). No VM, no runtime DLLs, instant startup.
 - 🧠 **GNU where it counts** — `find` alone implements 88 options (full expression parser, `-exec`/`-execdir`/`-ok`, `-printf`); `grep` ships PCRE2; `sed` supports in-place `-i` editing.
 - 📦 **WPM built in** — a package manager for the tools that shouldn't be reimplemented: jq, ripgrep, fd, fzf, bat, make, neovim, curl, wget…
-- 🧪 **Tested like it matters** — 2,346 unit tests across 178 test files (99.6% pass), plus differential output testing against GNU Coreutils 9.11 (43 cases, 81% pass, 8 known gaps tracked in issue-140).
+- 🧪 **Tested like it matters** — 2,420 unit tests (99.6% pass), plus 178 differential output cases against a GNU coreutils 9.7 oracle (165 pass / 13 tracked platform diffs, 93%).
 - ⚡ **Small and fast** — ~3 MB, zero dependencies, instant startup (Cygwin takes 2–5 s just to boot).
 
 ## 🐂 Better together: the niubash shell
@@ -112,12 +112,12 @@ Details in the [WPM User Guide](DOCS/en/wpm_guide.md).
 
 | Feature | WinuxCmd | uutils (Rust) | GnuWin32 | Cygwin | busybox |
 |---------|:--------:|:-------------:|:--------:|:------:|:-------:|
-| **Commands** | **169** | ~100 | ~90 | ~200 | ~300 |
-| **Options** | **1,855** | ~600 | ~200 | Full | ~500 |
+| **Commands** | **176** | ~100 | ~90 | ~200 | ~300 |
+| **Options** | **1,924** | ~600 | ~200 | Full | ~500 |
 | **GNU compat** | **81% diff pass** | 95% | 60% | 99% | 70% |
 | **Native Win32** | ✅ | ❌ | ✅ | ❌ | ❌ |
 | **Package manager** | ✅ WPM | ❌ | ❌ | apt-cyg | ❌ |
-| **Test cases** | **2,346** | ~2,000 | 0 | — | ~100 |
+| **Test cases** | **2,420** | ~2,000 | 0 | — | ~100 |
 | **Binary size** | **~3 MB** | ~5 MB | — | 1 GB+ | — |
 | **Startup** | **Instant** | Instant | — | 2–5 s | — |
 | **Maintained** | ✅ 2026 | ✅ | ❌ since 2012 | ✅ | ❌ |
@@ -130,8 +130,8 @@ Details in the [WPM User Guide](DOCS/en/wpm_guide.md).
 | Aspect | WinuxCmd | uutils |
 |--------|----------|--------|
 | Language | C++23 | Rust |
-| Commands | 169 | ~100 |
-| Options | 1,855 | ~600 |
+| Commands | 176 | ~100 |
+| Options | 1,924 | ~600 |
 | Binary size | ~3 MB | ~5 MB |
 | Dependencies | None | Rust runtime |
 | Build time | 2 min | 15 min |
@@ -161,7 +161,7 @@ Details in the [WPM User Guide](DOCS/en/wpm_guide.md).
 ## 🧰 Command coverage
 
 <details>
-<summary><b>169 commands — full coverage table (click to expand)</b></summary>
+<summary><b>176 commands — full coverage table (click to expand)</b></summary>
 
 ### GNU Coreutils (83 commands)
 
@@ -227,16 +227,16 @@ Consistently in the same league as uutils — and within ~10–15% of native GNU
 
 ## 🧪 Testing and GNU verification
 
-- **2,346 automated test cases** across 178 test files — **99.6% pass rate**
-- **Differential corpus**: 99 test cases (3 corpus + 43 regressions + 53 expansion cases, covering **71 commands**), executed against GNU Coreutils 9.4 (WSL2) with identical inputs — **95 pass / 4 whitelisted platform-environment differences**, verified on the current build (2026-09)
+- **2,420 automated unit tests** — **99.6% pass rate**
+- **Differential corpus**: 178 test cases (131 corpus + 47 regressions, covering **84 commands**), executed against a GNU coreutils 9.7 oracle with identical inputs — **165 pass / 13 tracked diffs (93%)**, machine-checked in `tests/differential/baseline.json`
 - Automated GNU comparison: `scripts/compare_outputs.sh` and `gnu_comparison_tests.sh`; per-case runner: `tests/differential/runner.sh`
 
-| Whitelisted | Command | Reason |
+| Tracked diffs (13) | Command / case | Reason |
 |-----------|---------|--------|
-| 21 | `id -g` | platform: Windows has no POSIX gid; prints primary-group RID (197121) |
-| 23 | `cp -l` | environment: hardlinks across `\\wsl.localhost` 9p unsupported in the WSL-side runner; verified on native NTFS |
-| 35 | `ln -hard` | environment: same 9p hardlink limitation as `cp -l` |
-| 30 | `mkdir` exists | format: GNU uses locale-dependent curly quotes (U+2018/2019); winuxcmd uses ASCII `'` |
+| `id -g` | regressions/21-id-group | platform: Windows has no POSIX gid; prints primary-group RID (197121) |
+| `cp -l`, `ln` | regressions/23-cp-link-option, ln/35-hard | environment: hardlinks across `\\wsl.localhost` 9p unsupported in the WSL-side runner; verified on native NTFS |
+| `mkdir` exists | mkdir/30-exists | format: GNU uses locale-dependent curly quotes (U+2018/2019); winuxcmd uses ASCII `'` |
+| dd, envsubst, mktemp, namei, readlink, which, seq | 9 remaining cases | output-format/platform differences; per-case state lives in `tests/differential/baseline.json` |
 
 The eight former issue-140 gaps (dd, diff -u, tsort, fmt, stat, sdiff, ptx, stdbuf) all pass; normal-format `diff` hunk-header, hash-family separator, cksum line-ending, realpath forward-slash, and od -c octal-escaping gaps were all found and fixed in 2026-09.
 
@@ -246,8 +246,8 @@ See the [GNU Comparison Report](DOCS/en/gnu_comparison_report.md).
 
 | Document | Description |
 |----------|-------------|
-| [Compatibility Matrix](DOCS/en/command_compatibility_matrix.md) | Support status of all 169 commands |
-| [GNU Comparison Report](DOCS/en/gnu_comparison_report.md) | Differential testing vs GNU Coreutils 9.4 |
+| [Compatibility Matrix](DOCS/en/command_compatibility_matrix.md) | Support status of all 176 commands |
+| [GNU Comparison Report](DOCS/en/gnu_comparison_report.md) | Differential testing vs a GNU coreutils 9.7 oracle |
 | [Windows Features](DOCS/en/windows_features.md) | Windows-specific behavior |
 | [WPM Guide](DOCS/en/wpm_guide.md) | Package manager user guide |
 | [GNU Test Baseline](DOCS/en/gnu_test_baseline.md) | GNU test framework |

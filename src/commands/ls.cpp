@@ -492,7 +492,20 @@ auto get_color_for_entry(const std::wstring &name,
   if (is_executable_name(name)) {
     return COLOR_EXEC;
   }
-  return COLOR_FILE;
+  // [GNU] Plain files carry no color indicator at all: ls emits no escape
+  // sequences for them (Savannah #15043).
+  return {};
+}
+
+// [GNU] ls prints one reset indicator before the first colored entry of a
+// run (the transition from default text), and no leading reset afterwards.
+auto color_prefix_sequence() -> std::wstring_view {
+  static bool used_color = false;
+  if (used_color) {
+    return {};
+  }
+  used_color = true;
+  return COLOR_RESET;
 }
 
 auto get_indicator_suffix(const std::wstring &name,
@@ -896,9 +909,16 @@ auto print_display_name(const std::wstring &name, const std::wstring &full_path,
     return;
   }
 
-  safePrint(get_color_for_entry(name, find_data));
+  const std::wstring entry_color(get_color_for_entry(name, find_data));
+  const bool has_color = color_enabled && !entry_color.empty();
+  if (has_color) {
+    safePrint(color_prefix_sequence());
+    safePrint(entry_color);
+  }
   safePrint(wstring_to_utf8(parts.rendered_name));
-  safePrint(COLOR_RESET);
+  if (has_color) {
+    safePrint(COLOR_RESET);
+  }
 
   if (parts.target) {
     safePrint(" -> ");
@@ -1600,12 +1620,14 @@ auto render_inline_entry(const EntryInfo &entry,
   std::string prefix =
       build_listing_prefix(entry.full_path, display_find_data, ctx);
   std::string text = prefix;
-  if (color_enabled) {
-    text += wstring_to_utf8(
-        std::wstring(get_color_for_entry(metadata_name, display_find_data)));
+  const std::wstring entry_color(
+      get_color_for_entry(metadata_name, display_find_data));
+  if (color_enabled && !entry_color.empty()) {
+    text += wstring_to_utf8(color_prefix_sequence());
+    text += wstring_to_utf8(entry_color);
   }
   text += wstring_to_utf8(display_name);
-  if (color_enabled) {
+  if (color_enabled && !entry_color.empty()) {
     text += wstring_to_utf8(COLOR_RESET);
   }
 
@@ -2526,12 +2548,15 @@ auto print_columns(const std::vector<EntryInfo> &entries,
         const auto &display_name = display_names[index];
 
         safePrint(std::string_view(prefix));
-        if (color_enabled) {
-          safePrint(get_color_for_entry(entry.name, entry.find_data));
+        const std::wstring entry_color(
+            get_color_for_entry(entry.name, entry.find_data));
+        if (color_enabled && !entry_color.empty()) {
+          safePrint(color_prefix_sequence());
+          safePrint(entry_color);
         }
 
         safePrint(wstring_to_utf8(display_name));
-        if (color_enabled) {
+        if (color_enabled && !entry_color.empty()) {
           safePrint(COLOR_RESET);
         }
 

@@ -190,9 +190,13 @@ auto parse_symbolic_mode(std::string_view mode_str)
   clause.op = mode_str[i];
   i++;
 
-  // Parse permissions (r/w/x)
+  // Parse permissions (r/w/x plus s/t/X; GNU accepts the full set).
+  // s (setuid/setgid), t (sticky) and X (conditional execute) parse fine but
+  // have no Windows attribute counterpart: they apply as no-ops (Savannah
+  // #11638).
   while (i < mode_str.size() &&
-         (mode_str[i] == 'r' || mode_str[i] == 'w' || mode_str[i] == 'x')) {
+         (mode_str[i] == 'r' || mode_str[i] == 'w' || mode_str[i] == 'x' ||
+          mode_str[i] == 's' || mode_str[i] == 't' || mode_str[i] == 'X')) {
     clause.perms += mode_str[i];
     i++;
   }

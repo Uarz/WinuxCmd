@@ -34,6 +34,9 @@
 // include other header after pch.h
 #include "core/command_macros.h"
 
+#include <ctime>   // localtime_s (TZ env support)
+#include <cstdlib> // std::getenv
+
 import std;
 import core;
 import utils;
@@ -561,21 +564,46 @@ auto replace_spaces_with_tabs(const std::string& line, int tab_width)
   return result;
 }
 
+// Current wall-clock time honoring the TZ environment variable (GNU pr
+// formats the header timestamp in the TZ-selected timezone). Falls back to
+// the system timezone when TZ is unset. (Savannah #28492)
+auto now_local_st() -> SYSTEMTIME {
+  const char* tz = std::getenv("TZ");
+  if (tz != nullptr && *tz != '\0') {
+    FILETIME now_ft{};
+    GetSystemTimeAsFileTime(&now_ft);
+    ULARGE_INTEGER uli{};
+    uli.LowPart = now_ft.dwLowDateTime;
+    uli.HighPart = now_ft.dwHighDateTime;
+    const time_t t = static_cast<time_t>(uli.QuadPart / 10000000ULL) -
+                     11644473600LL;
+    struct tm tmv {};
+    if (localtime_s(&tmv, &t) == 0) {
+      SYSTEMTIME st{};
+      st.wYear = static_cast<WORD>(tmv.tm_year + 1900);
+      st.wMonth = static_cast<WORD>(tmv.tm_mon + 1);
+      st.wDay = static_cast<WORD>(tmv.tm_mday);
+      st.wHour = static_cast<WORD>(tmv.tm_hour);
+      st.wMinute = static_cast<WORD>(tmv.tm_min);
+      return st;
+    }
+  }
+  SYSTEMTIME st{};
+  GetLocalTime(&st);
+  return st;
+}
+
 // Format a date header
 auto format_date_header(const std::string& date_format) -> std::string {
+  SYSTEMTIME st = now_local_st();
+  char buf[64];
   if (date_format.empty()) {
     // GNU pr's default header uses an ISO-like local timestamp.
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    char buf[64];
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d", st.wYear, st.wMonth,
              st.wDay, st.wHour, st.wMinute);
     return buf;
   }
   // Custom format not fully implemented, return default
-  SYSTEMTIME st;
-  GetLocalTime(&st);
-  char buf[64];
   snprintf(buf, sizeof(buf), "%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
   return buf;
 }

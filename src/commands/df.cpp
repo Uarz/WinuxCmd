@@ -95,32 +95,54 @@ namespace cp = core::pipeline;
 
 /**
  * @brief Format size to human-readable string
+ *
+ * [GNU] Mirrors coreutils human_readable(): values round UP (ceiling) and
+ * roll over to the next unit when the ceiling reaches the base (Savannah
+ * #1154).
+ *
  * @param size Size in bytes
  * @param si Use 1000-based units instead of 1024-based
  * @return Formatted string
  */
 auto format_size(uint64_t size, bool si) -> std::string {
-  const char* units = si ? const_cast<char*>("BKMGTPE")  // 1000-based
-                         : const_cast<char*>("BKMGTP");  // 1024-based
+  const char* units = si ? "BKMGTPE"  // 1000-based
+                         : "BKMGTP";  // 1024-based
+  const uint64_t base = si ? 1000 : 1024;
 
-  double base = si ? 1000.0 : 1024.0;
-  int unit_index = 0;
-  double size_d = static_cast<double>(size);
+  if (size < base) {
+    return std::to_string(size);
+  }
 
-  while (size_d >= base && unit_index < 6) {
-    size_d /= base;
-    unit_index++;
+  // Smallest unit index (1 = K) with size in [base^idx, base^(idx+1)).
+  int idx = 0;
+  uint64_t unit = base;
+  while (idx < 6 && size / unit >= base) {
+    unit *= base;
+    ++idx;
+  }
+  ++idx;
+
+  // Ceiling in tenths of the selected unit (exact integer math; the
+  // remainder-based form avoids overflow for exabyte-scale sizes).
+  const uint64_t q = size / unit;
+  const uint64_t r = size % unit;
+  uint64_t tenths = q * 10 + (r * 10 + unit - 1) / unit;
+
+  // Rollover: 1024.0K displays as 1.0M.
+  while (tenths >= base * 10 && idx < 6) {
+    tenths = (tenths + base - 1) / base;
+    ++idx;
   }
 
   char buf[32];
-  if (unit_index == 0) {
-    snprintf(buf, sizeof(buf), "%.0f", size_d);
-  } else if (size_d < 10.0) {
-    snprintf(buf, sizeof(buf), "%.1f%c", size_d, units[unit_index]);
+  if (tenths < 100) {  // value < 10 units: one decimal digit
+    snprintf(buf, sizeof(buf), "%llu.%llu%c",
+             static_cast<unsigned long long>(tenths / 10),
+             static_cast<unsigned long long>(tenths % 10), units[idx]);
   } else {
-    snprintf(buf, sizeof(buf), "%.0f%c", size_d, units[unit_index]);
+    snprintf(buf, sizeof(buf), "%llu%c",
+             static_cast<unsigned long long>((tenths + 9) / 10), units[idx]);
   }
-
   return std::string(buf);
 }
 
@@ -238,8 +260,10 @@ struct OutputConfig {
   bool si = false;
   bool portability = false;
   bool block_size_explicit = false;
-  uint64_t block_size = 1;
-  std::string block_label = "Total";
+  // [GNU] Default block size is 1K (512 only under POSIX -P), matching
+  // coreutils df.
+  uint64_t block_size = 1024;
+  std::string block_label = "1K-blocks";
   // Suffix appended to scaled output when --block-size used a bare unit
   // suffix (e.g. "df -BM" prints sizes as "1M").
   std::string display_suffix;
@@ -538,12 +562,17 @@ auto print_usage_header(const OutputConfig& output, bool print_type,
     return;
   }
 
+  // [GNU] POSIX -P mode uses the historical "Capacity" header.
+  const char* use_label = output.portability ? "Capacity" : "Use%";
   if (output.human || output.si) {
-    safePrint("     Size    Used  Available Capacity");
+    // [GNU] Header words match coreutils df: "Avail"/"Use%" in human mode
+    // (Savannah #14358).
+    safePrint("     Size   Used     Avail Use%");
   } else {
     char buf[128];
-    snprintf(buf, sizeof(buf), "%16s        Used    Available Capacity",
-             output.block_label.c_str());
+    // [GNU] Block mode keeps "Available" but uses "Use%" (Savannah #14358).
+    snprintf(buf, sizeof(buf), "%16s        Used    Available %s",
+             output.block_label.c_str(), use_label);
     safePrint(buf);
   }
   safePrintLn(L" Mounted on");
@@ -609,8 +638,15 @@ auto configure_output(const CommandContext<DF_OPTIONS.size()>& ctx)
 
     if (meta.short_name == "-P" || meta.long_name == "--portability") {
       output.portability = true;
-      output.block_size = std::getenv("POSIXLY_CORRECT") ? 512 : 1024;
-      output.block_label = std::to_string(output.block_size) + "-blocks";
+      // [GNU] -P uses 1024-blocks with the "Capacity" header; with
+      // POSIXLY_CORRECT it becomes "512-blocks" (no B suffix, unlike the
+      // non-portable "512B-blocks").
+      output.block_size = 1024;
+      output.block_label = "1024-blocks";
+      if (std::getenv("POSIXLY_CORRECT") != nullptr) {
+        output.block_size = 512;
+        output.block_label = "512-blocks";
+      }
       output.block_size_explicit = true;
       output.display_suffix.clear();
       continue;
@@ -646,6 +682,14 @@ auto configure_output(const CommandContext<DF_OPTIONS.size()>& ctx)
       output.block_label = block_label_for(*value);
       output.block_size_explicit = true;
     }
+  }
+
+  // [GNU] POSIXLY_CORRECT changes the default block size to 512B
+  // ("512B-blocks") unless a size mode was requested explicitly.
+  if (!output.block_size_explicit && !output.human && !output.si &&
+      std::getenv("POSIXLY_CORRECT") != nullptr) {
+    output.block_size = 512;
+    output.block_label = "512B-blocks";
   }
 
   return output;

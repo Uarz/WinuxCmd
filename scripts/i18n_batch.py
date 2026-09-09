@@ -120,6 +120,7 @@ MANUAL_MESSAGES = {
         '  search <query>                        search names, commands, categories, licenses\\n'
         '  info <package>                        show package metadata\\n'
         '  install <package>...                  install one or more packages\\n'
+        '  install --from <manifest>             install packages listed in a manifest file or URL\\n'
         '  installed                             list packages present in this root\\n'
         '  export [--plain]                      print installed package names for profiles\\n'
         '  restore <file>                        install packages from a plain list\\n'
@@ -138,6 +139,10 @@ MANUAL_MESSAGES = {
         '      --category <name>                 filter list/search output by category\\n'
         '      --json                            print machine-readable JSON\\n'
         '      --plain                           print only package names for export\\n'
+        '      --proxy <url>                     use the given HTTP proxy for downloads (env: HTTP_PROXY,\\n'
+        '                                        HTTPS_PROXY, WPM_HTTP_PROXY, WPM_HTTPS_PROXY, NO_PROXY)\\n'
+        '      --from <manifest>                 install packages from a manifest file or URL (TOML,\\n'
+        '                                        JSON, or plain list)\\n'
         '      --help                            display this help and exit\\n'
         '  -V, --version                         output version information and exit\\n'
         ''
@@ -226,7 +231,17 @@ MANUAL_MESSAGES = {
     "command.wpm.error.read_package_list": "wpm: failed to read package list: {}",
     "command.wpm.status.restore_empty": "wpm: package list is empty: {}",
     "command.wpm.error.usage.info": "wpm: usage: wpm info <package>",
-    "command.wpm.error.usage.install": "wpm: usage: wpm install <package>...",
+    "command.wpm.error.usage.install": "wpm: usage: wpm install <package>... [--from <manifest>]",
+    "command.wpm.error.invalid_proxy":
+        "wpm: invalid proxy '{}': use http://host:port",
+    "command.wpm.status.fetching_manifest": "wpm: fetching manifest from {}",
+    "command.wpm.error.manifest_fetch":
+        "wpm: failed to fetch manifest '{}': {}",
+    "command.wpm.error.manifest_open": "wpm: cannot open manifest '{}'",
+    "command.wpm.error.manifest_empty":
+        "wpm: manifest '{}' has no [packages] wpm list",
+    "command.wpm.error.manifest_conflict":
+        "wpm: --from cannot be combined with package arguments",
     "command.wpm.error.usage.update": "wpm: usage: wpm update|upgrade winuxcmd",
     "command.wpm.version": "wpm {}",
     "command.wpm.error.unknown_command": "wpm: unknown command: {}",

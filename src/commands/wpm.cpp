@@ -2011,6 +2011,52 @@ auto artifact_destination_paths(const fs::path& root,
   return destinations;
 }
 
+// Install receipts record the packages wpm itself placed on disk. Installed
+// judgments based on destination existence alone misreport same-named
+// commands from other sources (an MSYS-linked gawk assembled into usr\bin,
+// for example) as "already installed", skipping the download and sha256
+// verification entirely. With receipts, only wpm's own installs count.
+auto receipts_dir(const fs::path& root) -> fs::path {
+  return root / ".wpm" / "installed";
+}
+
+auto receipt_path(const fs::path& root, std::string_view package) -> fs::path {
+  return receipts_dir(root) / (std::string(package) + ".json");
+}
+
+auto package_has_receipt(const fs::path& root, std::string_view package)
+    -> bool {
+  std::error_code ec;
+  return fs::is_regular_file(receipt_path(root, package), ec);
+}
+
+auto write_install_receipt(const fs::path& root, const nlohmann::json& pkg,
+                           const nlohmann::json& artifact) -> void {
+  const std::string name = pkg.value("name", "");
+  if (name.empty()) return;
+  auto destinations = artifact_destination_paths(root, artifact, name);
+  if (!destinations) return;
+  nlohmann::json receipt = {{"name", name},
+                            {"version", pkg.value("version", "")},
+                            {"sha256", artifact.value("sha256", "")},
+                            {"layout", artifact_layout(artifact)},
+                            {"destinations", nlohmann::json::array()}};
+  for (const auto& dest : *destinations) {
+    receipt["destinations"].push_back(dest.string());
+  }
+  std::error_code ec;
+  fs::create_directories(receipts_dir(root), ec);
+  std::ofstream out(receipt_path(root, name), std::ios::binary | std::ios::trunc);
+  if (!out.is_open()) return;
+  out << receipt.dump(2) << "\n";
+}
+
+auto remove_install_receipt(const fs::path& root, std::string_view package)
+    -> void {
+  std::error_code ec;
+  fs::remove(receipt_path(root, package), ec);
+}
+
 auto preflight_install_destinations(const fs::path& root,
                                     const nlohmann::json& artifact,
                                     std::string_view package, bool force)
@@ -2042,6 +2088,17 @@ auto preflight_install_destinations(const fs::path& root,
   }
 
   if (already_present == destinations->size() && !destinations->empty()) {
+    if (!package_has_receipt(root, package)) {
+      // Every destination exists, but wpm never installed this package:
+      // the files came from another source. Report honestly instead of
+      // claiming "already installed" (which skipped the download and the
+      // sha256 verification).
+      safeErrorPrintLn(
+          "wpm: '" + std::string(package) +
+          "' destinations exist but are not wpm-managed; use --force to "
+          "replace them with the indexed artifact");
+      return 1;
+    }
     safePrintLn("wpm: already installed " + std::string(package) +
                 "; use --force to reinstall");
     return 0;
@@ -2301,6 +2358,18 @@ auto install_package(const Options& opts, std::string_view package_name)
 
   auto artifact = artifact_for_current_arch(*pkg);
   if (!artifact) return 1;
+  // Packages linked against the MSYS2 runtime need msys-2.0.dll and friends;
+  // in a pure Win32 layout they only run where that runtime is reachable.
+  // Surface the index's runtime annotation before the user downloads.
+  const std::string runtime =
+      artifact->value("runtime", pkg->value("runtime", std::string{}));
+  if (runtime == "msys" || runtime == "msys2") {
+    safeErrorPrintLn(wpm_text(
+        "command.wpm.warn.msys_runtime",
+        "wpm: note: {} is linked against the MSYS2 runtime (msys-2.0.dll); "
+        "it only runs where that runtime is available",
+        pkg->value("name", std::string(package_name))));
+  }
   auto preflight = preflight_install_destinations(
       opts.root, *artifact, pkg->value("name", std::string(package_name)),
       opts.force);
@@ -2355,6 +2424,7 @@ auto install_package(const Options& opts, std::string_view package_name)
                          "wpm: dry-run complete; would install {}",
                          pkg->value("name", std::string(package_name))));
   } else {
+    write_install_receipt(opts.root, *pkg, *artifact);
     safePrintLn(wpm_text("command.wpm.status.installed", "wpm: installed {}",
                          pkg->value("name", std::string(package_name))));
   }
@@ -2844,6 +2914,8 @@ auto package_summary_json(const fs::path& root, const nlohmann::json& pkg)
         {"arch", detect_arch_key()},
         {"type", artifact->value("type", "")},
         {"layout", artifact_layout(*artifact)},
+        {"runtime",
+         artifact->value("runtime", pkg.value("runtime", std::string{}))},
         {"url_count", artifact_urls(*artifact).size()},
         {"sha256_present", !artifact->value("sha256", "").empty()},
         {"file_count",
@@ -3092,6 +3164,9 @@ auto uninstall_package(const Options& opts, const nlohmann::json& pkg)
 
   const std::string status =
       ok ? (opts.dry_run ? "would_remove" : "removed") : "error";
+  if (ok && !opts.dry_run) {
+    remove_install_receipt(opts.root, name);
+  }
   return {{"name", name},
           {"status", status},
           {"removed", removed},
@@ -3380,6 +3455,11 @@ auto show_info(const Options& opts, std::string_view name) -> int {
               std::string(artifact ? detect_arch_key() : "none"));
   if (artifact) {
     safePrintLn("Type: " + artifact->value("type", ""));
+    const std::string runtime =
+        artifact->value("runtime", pkg->value("runtime", std::string{}));
+    if (!runtime.empty()) {
+      safePrintLn("Runtime: " + runtime);
+    }
     safePrintLn("URLs: " + std::to_string(artifact_urls(*artifact).size()));
     if (auto size = artifact_size_bytes(*artifact)) {
       safePrintLn("Size: " + human_size(*size));

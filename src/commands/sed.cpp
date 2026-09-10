@@ -127,7 +127,14 @@ struct Script {
     size_t step = 0;
     portable_regex::Pattern regex;
   } addr1, addr2;
-  std::string literal_pattern;  // for fast literal s/// substitutions
+  struct GroupAddress {
+    Address addr1, addr2;
+    bool invert = false;
+  };
+  std::vector<GroupAddress>
+      group_addresses;            // addresses inherited from { } groups
+  size_t group_state_offset = 0;  // first ctx.states slot owned by this script
+  std::string literal_pattern;    // for fast literal s/// substitutions
   bool literal_substitution = false;
 };
 
@@ -233,6 +240,10 @@ auto has_text_line_continuation(std::string_view text) -> bool {
   }
   return (slash_count % 2) == 1;
 }
+
+// Defined below with the rest of the script splitter; declared here so the
+// a/i/c text commands in parse_simple_cmd can normalize multi-line bodies.
+auto normalize_text_body_full(std::string_view raw) -> std::string;
 
 auto is_literal_substitution_pattern(std::string_view pattern,
                                      portable_regex::Syntax syntax) -> bool {
@@ -377,10 +388,8 @@ auto parse_simple_cmd(std::string_view line) -> cp::Result<Script> {
   if (line.empty()) return std::unexpected("empty script line");
   char c = line[0];
   std::string_view rest = line.substr(1);
-  auto text_body = [](std::string_view v) {
-    v = trim_left_space(v);
-    if (!v.empty() && v.front() == '\\') v.remove_prefix(1);
-    return normalize_text_command_body(v);
+  auto text_body = [](std::string_view v) -> std::string {
+    return normalize_text_body_full(v);
   };
   auto no_extra = [&](std::string_view command_name) -> cp::Result<void> {
     if (!trim_left_space(rest).empty()) {
@@ -834,9 +843,72 @@ auto file_command_index(std::string_view part) -> size_t {
   return std::string_view::npos;
 }
 
-auto split_script_commands(std::string_view text) -> std::vector<std::string> {
-  std::vector<std::string> parts;
+// One command of a sed script, together with the addresses inherited from the
+// brace groups { ... } that enclose it.
+struct ParsedCommand {
+  std::string text;  // command text, including its own address
+  std::vector<std::string>
+      group_prefixes;  // raw address text of each enclosing group
+};
+
+// Normalize the raw body of an a/i/c text command. The body runs from the
+// character after the command to the newline that ends it; a line ending with
+// an odd number of backslashes continues onto the next line.
+auto normalize_text_body_full(std::string_view raw) -> std::string {
+  std::string out;
+  size_t pos = 0;
+  auto next_line = [&]() -> std::optional<std::string_view> {
+    if (pos >= raw.size()) return std::nullopt;
+    size_t eol = raw.find('\n', pos);
+    std::string_view frag;
+    if (eol == std::string_view::npos) {
+      frag = raw.substr(pos);
+      pos = raw.size();
+    } else {
+      frag = raw.substr(pos, eol - pos);
+      pos = eol + 1;
+    }
+    return strip_trailing_cr(frag);
+  };
+
+  auto first = next_line();
+  if (!first) return out;
+  std::string_view body = trim_left_space(*first);
+  bool skip_first = false;
+  if (!body.empty() && body.front() == '\\') {
+    body.remove_prefix(1);
+    skip_first = body.empty();
+  }
+  bool has_prev = false;
+  for (;;) {
+    std::string_view frag;
+    if (has_prev || skip_first) {
+      auto more = next_line();
+      if (!more) return out;
+      frag = *more;
+    } else {
+      frag = body;
+    }
+    bool continues = has_text_line_continuation(frag);
+    if (continues) frag.remove_suffix(1);
+    if (has_prev) out.push_back('\n');
+    out.append(normalize_text_command_body(frag));
+    has_prev = true;
+    if (!continues) break;
+  }
+  return out;
+}
+
+// Split a whole sed script into commands. Semicolons and newlines separate
+// commands; { ... } groups are supported and the address written before a { is
+// inherited by every command in that group, including groups nested inside it.
+auto split_script_commands(std::string_view text)
+    -> cp::Result<std::vector<ParsedCommand>> {
+  std::vector<ParsedCommand> parts;
   std::string cur;
+  std::vector<std::string>
+      group_stack;  // address text of every open brace group
+  bool text_body_closed = false;
   bool escape = false;
   bool in_addr = false;
   bool in_sy = false;
@@ -844,6 +916,53 @@ auto split_script_commands(std::string_view text) -> std::vector<std::string> {
   char sy_delim = '\0';
   int sy_parts = 0;
   int sy_need = 0;
+
+  auto at_command_position = [&]() -> bool {
+    return command_index(cur) == cur.size();
+  };
+
+  auto finish_command = [&]() {
+    if (trim_left_space(cur).empty()) return;
+    if (at_command_position()) return;  // an address with no command
+    ParsedCommand cmd;
+    cmd.text = cur;
+    for (const auto& prefix : group_stack) {
+      if (!trim_left_space(prefix).empty())
+        cmd.group_prefixes.push_back(prefix);
+    }
+    parts.push_back(std::move(cmd));
+  };
+
+  // } closes the innermost brace group. GNU requires a group to end the line,
+  // but a run of } characters closing nested groups is allowed on one line.
+  auto close_groups_until_line_end = [&](size_t& i) -> cp::Result<void> {
+    for (;;) {
+      size_t j = i + 1;
+      // Only horizontal whitespace: the newline itself is the terminator we are
+      // looking for, so it must not be skipped here.
+      while (j < text.size() && (text[j] == ' ' || text[j] == '\t')) {
+        ++j;
+      }
+      if (j >= text.size()) return {};
+      if (text[j] == '#') {
+        while (j < text.size() && text[j] != '\n') ++j;
+        i = j;
+        continue;
+      }
+      if (text[j] == '}') {
+        if (group_stack.empty()) return std::unexpected("unexpected `}'");
+        group_stack.pop_back();
+        i = j;
+        continue;
+      }
+      if (text[j] == '\n') {
+        i = j;
+        return {};
+      }
+      return std::unexpected("extra characters after command");
+    }
+  };
+
   for (size_t i = 0; i < text.size(); ++i) {
     char c = text[i];
     if (escape) {
@@ -851,7 +970,7 @@ auto split_script_commands(std::string_view text) -> std::vector<std::string> {
       escape = false;
       continue;
     }
-    if (c == '\\' && command_index(cur) == cur.size() && i + 1 < text.size()) {
+    if (c == '\\' && at_command_position() && i + 1 < text.size()) {
       cur.push_back(c);
       cur.push_back(text[++i]);
       addr_delim = text[i];
@@ -882,7 +1001,7 @@ auto split_script_commands(std::string_view text) -> std::vector<std::string> {
       in_addr = true;
       continue;
     }
-    if ((c == 's' || c == 'y') && command_index(cur) == cur.size()) {
+    if ((c == 's' || c == 'y') && at_command_position()) {
       cur.push_back(c);
       if (i + 1 < text.size()) {
         sy_delim = text[i + 1];
@@ -892,158 +1011,179 @@ auto split_script_commands(std::string_view text) -> std::vector<std::string> {
       }
       continue;
     }
-    if (c == '#' && trim_left_space(cur).empty()) {
-      break;
-    }
-    if (c == ';' && text_command_index(cur) == std::string_view::npos &&
-        file_command_index(cur) == std::string_view::npos) {
-      if (!cur.empty()) {
-        parts.push_back(cur);
-        cur.clear();
+    if ((c == 'a' || c == 'i' || c == 'c') && at_command_position()) {
+      cur.push_back(c);
+      // The body runs from the character after the command to the end of the
+      // last text line. A line ending with an odd number of backslashes
+      // continues onto the next line. The first line is tested including the
+      // a/i/c command itself, because that is where a "a\" marker lives.
+      size_t body_start = i + 1;
+      size_t body_end = body_start;
+      size_t scan = body_start;
+      for (;;) {
+        size_t eol = text.find('\n', scan);
+        if (eol == std::string_view::npos) {
+          body_end = text.size();
+          break;
+        }
+        std::string_view line = (scan == body_start)
+                                    ? text.substr(i, eol - i)
+                                    : text.substr(scan, eol - scan);
+        body_end = eol;
+        if (!has_text_line_continuation(strip_trailing_cr(line))) break;
+        scan = eol + 1;
       }
+      cur.append(text.substr(body_start, body_end - body_start));
+      // The body is fully consumed here, so emit this command now and start the
+      // next one fresh; otherwise the following characters would be appended
+      // to the text body.
+      finish_command();
+      cur.clear();
+      text_body_closed = false;
+      i = body_end;
+      continue;
+    }
+    if (c == '#' && trim_left_space(cur).empty()) {
+      while (i < text.size() && text[i] != '\n') ++i;
+      continue;
+    }
+    if (c == '{' && at_command_position()) {
+      group_stack.push_back(cur);
+      cur.clear();
+      text_body_closed = false;
+      continue;
+    }
+    if (c == '}' && text_command_index(cur) == std::string_view::npos &&
+        file_command_index(cur) == std::string_view::npos) {
+      finish_command();
+      cur.clear();
+      text_body_closed = false;
+      if (group_stack.empty()) return std::unexpected("unexpected `}'");
+      group_stack.pop_back();
+      auto close = close_groups_until_line_end(i);
+      if (!close) return std::unexpected(close.error());
+      continue;
+    }
+    if (c == ';' && !text_body_closed &&
+        (text_command_index(cur) != std::string_view::npos ||
+         file_command_index(cur) != std::string_view::npos)) {
+      cur.push_back(c);
+      continue;
+    }
+    if (c == ';' || c == '\n') {
+      finish_command();
+      cur.clear();
+      text_body_closed = false;
       continue;
     }
     cur.push_back(c);
   }
-  if (!cur.empty()) parts.push_back(cur);
+  finish_command();
+  if (!group_stack.empty()) return std::unexpected("unmatched `{'");
   return parts;
 }
 
-auto parse_script_line(std::string_view line, portable_regex::Syntax syntax,
-                       ParseContext& parse_context)
-    -> cp::Result<std::vector<Script>> {
-  line = strip_trailing_cr(line);
-  if (line.empty() || split_script_commands(line).empty()) return {};
-
-  std::vector<Script> out;
-  for (const auto& part : split_script_commands(line)) {
-    size_t i = 0;
-    while (i < part.size() && std::isspace(static_cast<unsigned char>(part[i])))
-      ++i;
-    Script::Address a1, a2;
-    auto addr1 = parse_address(part, i, syntax, parse_context);
-    if (!addr1) return std::unexpected(addr1.error());
-    a1 = *addr1;
-    if (i < part.size() && part[i] == ',') {
-      ++i;
-      auto addr2 = parse_address(part, i, syntax, parse_context, true);
-      if (!addr2) return std::unexpected(addr2.error());
-      a2 = *addr2;
-    }
-    while (i < part.size() && std::isspace(static_cast<unsigned char>(part[i])))
-      ++i;
-    bool invert_address = false;
-    if (i < part.size() && part[i] == '!') {
-      invert_address = true;
-      ++i;
-      while (i < part.size() &&
-             std::isspace(static_cast<unsigned char>(part[i]))) {
-        ++i;
-      }
-    }
-    std::string_view cmd = std::string_view(part).substr(i);
-    cp::Result<Script> s;
-    if (!cmd.empty() && cmd[0] == 's')
-      s = parse_subst(cmd, syntax, parse_context);
-    else if (!cmd.empty() && cmd[0] == 'y')
-      s = parse_y_cmd(cmd);
-    else
-      s = parse_simple_cmd(cmd);
-    if (!s) return std::unexpected(s.error());
-    if (s->kind == Script::Kind::Label &&
-        (a1.kind != Script::Address::Kind::None ||
-         a2.kind != Script::Address::Kind::None || invert_address)) {
-      return std::unexpected(": command does not accept addresses");
-    }
-    s->addr1 = a1;
-    s->addr2 = a2;
-    s->invert_address = invert_address;
-    out.push_back(*s);
+auto parse_group_address(std::string_view text, portable_regex::Syntax syntax,
+                         ParseContext& parse_context)
+    -> cp::Result<Script::GroupAddress> {
+  Script::GroupAddress g;
+  size_t i = 0;
+  while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i])))
+    ++i;
+  if (i >= text.size()) return std::unexpected("empty group address");
+  auto a1 = parse_address(text, i, syntax, parse_context);
+  if (!a1) return std::unexpected(a1.error());
+  g.addr1 = *a1;
+  if (i < text.size() && text[i] == ',') {
+    ++i;
+    auto a2 = parse_address(text, i, syntax, parse_context, true);
+    if (!a2) return std::unexpected(a2.error());
+    g.addr2 = *a2;
   }
-  return out;
+  while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i])))
+    ++i;
+  if (i < text.size() && text[i] == '!') {
+    g.invert = true;
+    ++i;
+    while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i])))
+      ++i;
+  }
+  if (i != text.size()) return std::unexpected("invalid group address");
+  return g;
 }
 
-struct TextCommandTail {
-  std::string first_body;
-  bool explicit_backslash = false;
-};
-
-auto trailing_text_command_tail(std::string_view line)
-    -> std::optional<TextCommandTail> {
-  line = strip_trailing_cr(line);
-  auto parts = split_script_commands(line);
-  if (parts.empty()) return std::nullopt;
-
-  std::string_view last = parts.back();
-  auto command_index = text_command_index(last);
-  if (command_index == std::string_view::npos) return std::nullopt;
-
-  std::string_view rest = trim_left_space(last.substr(command_index + 1));
-  bool explicit_backslash = false;
-  if (!rest.empty() && rest.front() == '\\') {
-    explicit_backslash = true;
-    rest.remove_prefix(1);
+auto parse_script_command(const ParsedCommand& part,
+                          portable_regex::Syntax syntax,
+                          ParseContext& parse_context) -> cp::Result<Script> {
+  std::string_view text = part.text;
+  size_t i = 0;
+  while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i])))
+    ++i;
+  Script::Address a1, a2;
+  auto addr1 = parse_address(text, i, syntax, parse_context);
+  if (!addr1) return std::unexpected(addr1.error());
+  a1 = *addr1;
+  if (i < text.size() && text[i] == ',') {
+    ++i;
+    auto addr2 = parse_address(text, i, syntax, parse_context, true);
+    if (!addr2) return std::unexpected(addr2.error());
+    a2 = *addr2;
   }
-  return TextCommandTail{std::string(rest), explicit_backslash};
-}
-
-auto collect_text_command_body(const std::vector<std::string>& lines,
-                               size_t& line_index, const TextCommandTail& tail)
-    -> std::string {
-  std::string out;
-  std::string body = tail.first_body;
-  bool needs_text_line = tail.explicit_backslash && body.empty();
-  bool prepend_newline = false;
-
-  for (;;) {
-    if (needs_text_line) {
-      if (line_index + 1 >= lines.size()) break;
-      ++line_index;
-      body = std::string(strip_trailing_cr(lines[line_index]));
-      needs_text_line = false;
-    }
-
-    bool continues = has_text_line_continuation(body);
-    if (continues) body.pop_back();
-
-    if (prepend_newline) out.push_back('\n');
-    out.append(normalize_text_command_body(body));
-
-    if (!continues) break;
-    if (line_index + 1 >= lines.size()) break;
-    ++line_index;
-    body = std::string(strip_trailing_cr(lines[line_index]));
-    prepend_newline = true;
+  while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i])))
+    ++i;
+  bool invert_address = false;
+  if (i < text.size() && text[i] == '!') {
+    invert_address = true;
+    ++i;
+    while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i])))
+      ++i;
   }
-
-  return out;
+  std::string_view cmd = text.substr(i);
+  cp::Result<Script> s;
+  if (!cmd.empty() && cmd[0] == 's') {
+    s = parse_subst(cmd, syntax, parse_context);
+  } else if (!cmd.empty() && cmd[0] == 'y') {
+    s = parse_y_cmd(cmd);
+  } else {
+    s = parse_simple_cmd(cmd);
+  }
+  if (!s) return std::unexpected(s.error());
+  if (s->kind == Script::Kind::Label &&
+      (a1.kind != Script::Address::Kind::None ||
+       a2.kind != Script::Address::Kind::None || invert_address)) {
+    return std::unexpected(": command does not accept addresses");
+  }
+  s->addr1 = a1;
+  s->addr2 = a2;
+  s->invert_address = invert_address;
+  for (const auto& prefix : part.group_prefixes) {
+    auto g = parse_group_address(prefix, syntax, parse_context);
+    if (!g) return std::unexpected(g.error());
+    s->group_addresses.push_back(std::move(*g));
+  }
+  return *s;
 }
 
 auto parse_script_text(std::string_view script, portable_regex::Syntax syntax,
                        ParseContext& parse_context)
     -> cp::Result<std::vector<Script>> {
   std::vector<Script> out;
+
+  // GNU sed honors the #n magic comment only when it is the first line of the
+  // whole script.
   auto lines = split_script_lines(script);
-  for (size_t line_index = 0; line_index < lines.size(); ++line_index) {
-    auto line = strip_trailing_cr(lines[line_index]);
-    auto trimmed = trim_left_space(line);
-    if (parse_context.at_script_start) {
-      if (trimmed.starts_with("#n")) {
-        parse_context.magic_silent = true;
-      }
-      parse_context.at_script_start = false;
-    }
-    if (trimmed.empty() || trimmed.front() == '#') continue;
+  if (!lines.empty() && parse_context.at_script_start) {
+    auto trimmed = trim_left_space(strip_trailing_cr(lines[0]));
+    if (trimmed.starts_with("#n")) parse_context.magic_silent = true;
+    parse_context.at_script_start = false;
+  }
 
-    auto parsed = parse_script_line(line, syntax, parse_context);
-    if (!parsed) return std::unexpected(parsed.error());
-
-    auto tail = trailing_text_command_tail(line);
-    if (tail && !parsed->empty()) {
-      parsed->back().text = collect_text_command_body(lines, line_index, *tail);
-    }
-
-    out.insert(out.end(), parsed->begin(), parsed->end());
+  auto commands = split_script_commands(script);
+  if (!commands) return std::unexpected(commands.error());
+  for (const auto& part : *commands) {
+    auto s = parse_script_command(part, syntax, parse_context);
+    if (!s) return std::unexpected(s.error());
+    out.push_back(std::move(*s));
   }
   return out;
 }
@@ -1078,6 +1218,12 @@ auto script_is_posix_forbidden(const Script& script) -> bool {
   if (address_uses_gnu_extension(script.addr1) ||
       address_uses_gnu_extension(script.addr2)) {
     return true;
+  }
+  for (const auto& group : script.group_addresses) {
+    if (address_uses_gnu_extension(group.addr1) ||
+        address_uses_gnu_extension(group.addr2)) {
+      return true;
+    }
   }
   return script.kind == Script::Kind::QuitSilent ||
          script.kind == Script::Kind::PrintFilename ||
@@ -1225,6 +1371,13 @@ auto build_config(const CommandContext<SED_OPTIONS.size()>& ctx)
     return std::unexpected(ok.error());
   }
 
+  // Each script owns one range state plus one per inherited group address, so
+  // allocate the states densely and remember each script's first slot.
+  size_t state_slots = 0;
+  for (auto& s : scripts) {
+    s.group_state_offset = state_slots;
+    state_slots += 1 + s.group_addresses.size();
+  }
   for (auto& s : scripts) cfg.scripts.push_back(std::move(s));
 
   for (size_t i = consumed_positional; i < ctx.positionals.size(); ++i) {
@@ -1628,9 +1781,9 @@ auto read_next_input_record(ExecutionContext& ctx, bool append) -> bool {
   return true;
 }
 
-auto evaluate_address(ExecutionContext& ctx, const Script& script,
-                      size_t script_index) -> AddressEval {
-  auto& state = ctx.states[script_index];
+auto evaluate_address_range(ExecutionContext& ctx, const Script::Address& addr1,
+                            const Script::Address& addr2, bool invert_address,
+                            ScriptState& state) -> AddressEval {
   auto addr_match = [&](const Script::Address& a) -> bool {
     if (a.kind == Script::Address::Kind::None) return true;
     if (a.kind == Script::Address::Kind::Line) return ctx.line_no == a.line_no;
@@ -1649,25 +1802,24 @@ auto evaluate_address(ExecutionContext& ctx, const Script& script,
   };
 
   AddressEval result;
-  const bool line_zero_range =
-      script.addr2.kind != Script::Address::Kind::None &&
-      script.addr1.kind == Script::Address::Kind::Line &&
-      script.addr1.line_no == 0;
+  const bool line_zero_range = addr2.kind != Script::Address::Kind::None &&
+                               addr1.kind == Script::Address::Kind::Line &&
+                               addr1.line_no == 0;
   if (line_zero_range && !state.range_closed) {
     // GNU sed treats 0,/RE/ as a range that is active before line 1, so the
     // first matching line can also end the range.
     state.range_active = true;
   }
-  if (script.addr2.kind == Script::Address::Kind::None) {
-    result.apply = addr_match(script.addr1);
+  if (addr2.kind == Script::Address::Kind::None) {
+    result.apply = addr_match(addr1);
   } else {
     if (!state.range_active) {
-      if (addr_match(script.addr1)) {
+      if (addr_match(addr1)) {
         result.apply = true;
-        if (script.addr2.kind == Script::Address::Kind::Line &&
-            ctx.line_no >= script.addr2.line_no) {
+        if (addr2.kind == Script::Address::Kind::Line &&
+            ctx.line_no >= addr2.line_no) {
           result.range_ended = true;
-        } else if (set_dynamic_range_end(state, script.addr2, ctx.line_no)) {
+        } else if (set_dynamic_range_end(state, addr2, ctx.line_no)) {
           if (ctx.line_no >= state.range_end_line) {
             result.range_ended = true;
           } else {
@@ -1680,13 +1832,13 @@ auto evaluate_address(ExecutionContext& ctx, const Script& script,
     } else {
       result.apply = true;
       bool end_matches = false;
-      if (script.addr2.kind == Script::Address::Kind::Line) {
-        end_matches = ctx.line_no >= script.addr2.line_no;
-      } else if (script.addr2.kind == Script::Address::Kind::Relative ||
-                 script.addr2.kind == Script::Address::Kind::Modulo) {
+      if (addr2.kind == Script::Address::Kind::Line) {
+        end_matches = ctx.line_no >= addr2.line_no;
+      } else if (addr2.kind == Script::Address::Kind::Relative ||
+                 addr2.kind == Script::Address::Kind::Modulo) {
         end_matches = ctx.line_no >= state.range_end_line;
       } else {
-        end_matches = addr_match(script.addr2);
+        end_matches = addr_match(addr2);
       }
       if (end_matches) {
         state.range_active = false;
@@ -1696,7 +1848,25 @@ auto evaluate_address(ExecutionContext& ctx, const Script& script,
     }
   }
 
-  if (script.invert_address) result.apply = !result.apply;
+  if (invert_address) result.apply = !result.apply;
+  return result;
+}
+
+// A command's own address is ANDed with the addresses of every brace group that
+// encloses it, which is how GNU sed applies "1 { p; }" and nested groups.
+auto evaluate_address(ExecutionContext& ctx, const Script& script,
+                      size_t script_index) -> AddressEval {
+  auto result =
+      evaluate_address_range(ctx, script.addr1, script.addr2,
+                             script.invert_address, ctx.states[script_index]);
+  for (size_t k = 0; k < script.group_addresses.size(); ++k) {
+    if (!result.apply) break;
+    const auto& group = script.group_addresses[k];
+    auto& group_state = ctx.states[script.group_state_offset + k];
+    auto group_result = evaluate_address_range(ctx, group.addr1, group.addr2,
+                                               group.invert, group_state);
+    if (!group_result.apply) result.apply = false;
+  }
   return result;
 }
 
@@ -2122,7 +2292,9 @@ auto process_files(const Config& cfg) -> int {
   }
 
   bool any_error = false;
-  std::vector<ScriptState> states(cfg.scripts.size());
+  size_t state_slots = 0;
+  for (const auto& s : cfg.scripts) state_slots += 1 + s.group_addresses.size();
+  std::vector<ScriptState> states(state_slots);
   ProcessRuntime runtime;
   size_t line_no = 0;
   for (size_t file_index = 0; file_index < expanded_files.size();
@@ -2149,7 +2321,10 @@ auto process_files(const Config& cfg) -> int {
     }
 
     if (cfg.separate_files || cfg.in_place) {
-      states.assign(cfg.scripts.size(), {});
+      size_t reset_slots = 0;
+      for (const auto& s : cfg.scripts)
+        reset_slots += 1 + s.group_addresses.size();
+      states.assign(reset_slots, {});
       runtime.hold.clear();
       runtime.hold_had_delimiter = false;
       line_no = 0;

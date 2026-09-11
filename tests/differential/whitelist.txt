@@ -35,3 +35,14 @@ corpus/printf/04-rounding-negative.case	oracle: same newlib rounding defect as 0
 corpus/printf/06-overflow-saturate.case	format: same quoting-style-only difference as date/03 (overflow warning). stdout digits, saturated value and rc=1 are byte-identical (#967 uppercase wording verified)
 regressions/37-numfmt-options.case	pre-existing: --to=iec-i prints 1.5K instead of GNU 1.5Ki (issue #140 cluster, out of current batch scope; not a regression of the 2026-09-10 batch)
 regressions/41-stdbuf-line-mode.case	platform: Git Bash oracle stdbuf itself fails (libstdbuf.dll not found, rc=125); WinuxCmd succeeds natively (rc=0)
+
+# PR #996 review follow-up. date/23 pins "invalid relative amount must be
+# invalid date, not a crash"; its stderr differs only in quoting style (same
+# cause as date/03). cat/03 and tee/02 pin the closed-stdin diagnostics: they
+# match GNU 9.4 byte-for-byte under the primary WSL oracle, but the Git Bash
+# 8.32 fallback oracle emits its own MSYS port diagnostic ("failed to set file
+# descriptor text/binary mode: Bad file descriptor") instead of GNU's, so they
+# are only comparable under the WSL oracle.
+corpus/date/23-rel-overflow.case	format: same quoting-style-only difference as date/03 (invalid date); rc=1 and "invalid date" text identical
+corpus/cat/03-closed-stdin.case	oracle: Git Bash 8.32 port reports "failed to set file descriptor text/binary mode: Bad file descriptor"; GNU 9.4/WSL prints "cat: -: Bad file descriptor" as WinuxCmd does
+corpus/tee/02-closed-stdin.case	oracle: same Git Bash port artifact as cat/03; GNU 9.4/WSL prints "tee: read error: Bad file descriptor" as WinuxCmd does

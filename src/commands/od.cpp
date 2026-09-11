@@ -836,9 +836,14 @@ REGISTER_COMMAND(
       // bytes into path conversion previously hung the tool (#339,
       // uutils#12794).
       if (!is_valid_utf8(file_arg)) {
-        safeErrorPrint("od: ");
-        safeErrorPrint(file_arg);
-        safeErrorPrintLn(": No such file or directory");
+        // Build the diagnostic as one message through the shared i18n helper
+        // (the idiom date.cpp uses for the same ENOENT case). Emitting it as
+        // three separate safeErrorPrint calls made each fragment its own
+        // catalog entry — producing a stray "od: " key and leaving the
+        // operand and the reason untranslatable.
+        safeErrorPrintLn(winux::i18n::format(
+            "command.od.error.cannot_open",
+            "od: {}: No such file or directory", file_arg));
         ok = false;
         continue;
       }

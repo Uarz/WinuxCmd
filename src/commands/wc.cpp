@@ -27,10 +27,6 @@
 #include "pch/pch.h"
 // include other header after pch.h
 #include "core/command_macros.h"
-#ifdef _WIN32
-#include <fcntl.h>
-#include <io.h>
-#endif
 import std;
 import core;
 import utils;

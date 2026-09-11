@@ -136,6 +136,39 @@ auto parse_int(std::string_view s) -> std::optional<int> {
   return value;
 }
 
+// [GNU] Relative magnitudes are parsed without exceptions: a value that does
+// not fit must yield "invalid date" (gnulib parse-datetime.y reports an
+// overflow through ckd_* and fails the parse), never std::out_of_range from
+// the throwing std::stoll family, which would abort the process.
+auto parse_amount(std::string_view s) -> std::optional<long long> {
+  if (s.starts_with('+')) s.remove_prefix(1);
+  long long value = 0;
+  auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), value);
+  if (ec != std::errc() || ptr != s.data() + s.size()) return std::nullopt;
+  return value;
+}
+
+// Checked accumulation mirroring gnulib's ckd_add / ckd_mul usage.
+auto add_checked(long long &total, long long amount) -> bool {
+  constexpr auto lo = std::numeric_limits<long long>::min();
+  constexpr auto hi = std::numeric_limits<long long>::max();
+  if (amount > 0 && total > hi - amount) return false;
+  if (amount < 0 && total < lo - amount) return false;
+  total += amount;
+  return true;
+}
+
+auto mul_checked(long long a, long long b, long long &out) -> bool {
+  constexpr auto lo = std::numeric_limits<long long>::min();
+  if (a == 0 || b == 0) {
+    out = 0;
+    return true;
+  }
+  if ((a == -1 && b == lo) || (b == -1 && a == lo)) return false;
+  out = a * b;
+  return out / b == a;
+}
+
 auto days_in_month(int year, int month) -> int {
   static constexpr int days[] = {31, 28, 31, 30, 31, 30,
                                  31, 31, 30, 31, 30, 31};
@@ -390,7 +423,21 @@ auto parse_fixed_date_time(std::string input, bool use_utc)
     // space: "03:04:05 PM" and "03:04:05PM"). 12 AM = 00:xx, 12 PM = 12:xx,
     // and hour values above 12 combined with AM/PM are rejected
     // (uutils#9253 / WinuxCmd#264).
+    // gnulib's meridian_table also spells these "A.M." and "P.M.", which are
+    // valid for date(1) ("2026-01-02 03:04:05 P.M." -> 15:04). Drop a trailing
+    // period and the period between the letters so all four spellings reach
+    // one suffix test.
     std::string tp = time_part;
+    if (auto last = tp.find_last_not_of(' ');
+        last != std::string::npos && tp[last] == '.') {
+      tp.erase(last);
+      auto space = tp.find_last_of(' ');
+      auto begin = space == std::string::npos ? size_t{0} : space + 1;
+      tp.erase(std::remove(tp.begin() + static_cast<std::ptrdiff_t>(begin),
+                           tp.end(), '.'),
+               tp.end());
+      tp = trim_copy(tp);
+    }
     std::string tp_lower = lower_copy(tp);
     bool has_pm = false;
     bool has_am = false;
@@ -838,8 +885,11 @@ struct RelativeItem {
 };
 
 // Strip trailing relative items from the end of the string, returning them
-// in encounter order. Leaves the remainder (base date) in place.
-auto strip_relative_items(std::string &s) -> std::vector<RelativeItem> {
+// in encounter order. Leaves the remainder (base date) in place. Returns
+// nullopt when an amount does not fit in the relative accumulator, which the
+// caller turns into GNU's "invalid date" (see parse_amount).
+auto strip_relative_items(std::string &s)
+    -> std::optional<std::vector<RelativeItem>> {
   static const std::regex item_re(
       R"(([+-]?[0-9]+)\s*(fortnights|fortnight|seconds|second|secs|sec|minutes|minute|mins|min|hours|hour|days|day|weeks|week|months|month|years|year)\s*$)",
       std::regex::icase);
@@ -848,6 +898,8 @@ auto strip_relative_items(std::string &s) -> std::vector<RelativeItem> {
   std::smatch m;
   while (std::regex_search(work, m, item_re) &&
          m.position(0) + m.length(0) == work.size()) {
+    const auto amount = parse_amount(m[1].str());
+    if (!amount) return std::nullopt;
     std::string unit = lower_copy(m[2].str());
     bool is_year = unit.starts_with("year");
     bool is_month = unit.starts_with("month");
@@ -862,8 +914,8 @@ auto strip_relative_items(std::string &s) -> std::vector<RelativeItem> {
       unit_seconds = 3600;
     else if (unit.starts_with("min"))
       unit_seconds = 60;
-    items.push_back({std::stoll(m[1].str()), is_month || is_year,
-                     is_year ? 12 : 1, unit_seconds});
+    items.push_back({*amount, is_month || is_year, is_year ? 12 : 1,
+                     unit_seconds});
     work = trim_copy(work.substr(0, m.position(0)));
   }
   s = work;
@@ -876,10 +928,13 @@ auto apply_relative_items(const FILETIME &base,
   long long delta_seconds = 0;
   long long delta_months = 0;
   for (const auto &item : items) {
-    if (item.calendar)
-      delta_months += item.amount * item.months_per_unit;
-    else
-      delta_seconds += item.amount * item.unit_seconds;
+    long long scaled = 0;
+    if (!mul_checked(item.amount,
+                     item.calendar ? item.months_per_unit : item.unit_seconds,
+                     scaled))
+      return std::nullopt;
+    if (!add_checked(item.calendar ? delta_months : delta_seconds, scaled))
+      return std::nullopt;
   }
 
   FILETIME result = base;
@@ -935,7 +990,10 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
   {
     std::string work = value;
     auto rel_items = strip_relative_items(work);
-    if (!rel_items.empty()) {
+    // An unrepresentable amount is an invalid date, exactly like GNU's
+    // overflow check in parse-datetime.y — never a thrown exception.
+    if (!rel_items) return std::nullopt;
+    if (!rel_items->empty()) {
       std::string rest = trim_copy(std::move(work));
       std::optional<FILETIME> base;
       if (rest.empty()) {
@@ -944,7 +1002,7 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
         base = parse_date_argument(rest, use_utc);
       }
       if (!base) return std::nullopt;
-      auto applied = apply_relative_items(*base, rel_items, use_utc);
+      auto applied = apply_relative_items(*base, *rel_items, use_utc);
       if (!applied) return std::nullopt;
       return *applied;
     }

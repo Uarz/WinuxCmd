@@ -35,7 +35,6 @@
 #include "pch/pch.h"
 // include other header after pch.h
 #include <cerrno>
-
 #include "core/command_macros.h"
 import std;
 import core;
@@ -147,7 +146,11 @@ REGISTER_COMMAND(cat, "cat",
     if (reads_stdin) {
       errno = 0;
       if (_lseek(0, 0, SEEK_CUR) == -1 && errno == EBADF) {
-        safeErrorPrintLn("cat: standard input: Bad file descriptor");
+        // GNU cat.c names the failing stream through its operand, and stdin
+        // is always the operand "-" (cat.c: infile = "-" before the operand
+        // loop), so the diagnostic is "cat: -: Bad file descriptor" — not
+        // tee's "standard input", which belongs to tee_files' close path.
+        safeErrorPrintLn("cat: -: Bad file descriptor");
         return 1;
       }
     }

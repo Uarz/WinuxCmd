@@ -27,6 +27,10 @@
 #include "pch/pch.h"
 // include other header after pch.h
 #include "core/command_macros.h"
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 import std;
 import core;
 import utils;
@@ -681,6 +685,13 @@ REGISTER_COMMAND(
     /* options */
     WC_OPTIONS) {
   using namespace wc_pipeline;
+
+#ifdef _WIN32
+  // [GNU] stdin must be counted in binary mode: redirected Windows stdin in
+  // text mode treats 0x1A (Ctrl-Z) as EOF and silently truncates the count
+  // (e.g. `wc -c < random.bin`). cat.cpp does the same at its entry.
+  _setmode(_fileno(stdin), _O_BINARY);
+#endif
 
   // Determine which counts to print
   bool print_lines =

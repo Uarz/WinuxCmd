@@ -830,6 +830,18 @@ REGISTER_COMMAND(
   } else {
     bool ok = true;
     for (const auto& file_arg : cfg.files) {
+      // [GNU] Operands that are not well-formed UTF-8 (e.g. a lone 0xFF
+      // byte) cannot name a real file through the wide-char Windows API.
+      // GNU reports "No such file or directory" and exits 1; routing such
+      // bytes into path conversion previously hung the tool (#339,
+      // uutils#12794).
+      if (!is_valid_utf8(file_arg)) {
+        safeErrorPrint("od: ");
+        safeErrorPrint(file_arg);
+        safeErrorPrintLn(": No such file or directory");
+        ok = false;
+        continue;
+      }
       if (max_input_bytes && data.size() >= *max_input_bytes) break;
       std::vector<std::string> expanded;
       if (contains_wildcard(file_arg)) {

@@ -38,11 +38,17 @@ regressions/41-stdbuf-line-mode.case	platform: Git Bash oracle stdbuf itself fai
 
 # PR #996 review follow-up. date/23 pins "invalid relative amount must be
 # invalid date, not a crash"; its stderr differs only in quoting style (same
-# cause as date/03). cat/03 and tee/02 pin the closed-stdin diagnostics: they
-# match GNU 9.4 byte-for-byte under the primary WSL oracle, but the Git Bash
-# 8.32 fallback oracle emits its own MSYS port diagnostic ("failed to set file
-# descriptor text/binary mode: Bad file descriptor") instead of GNU's, so they
-# are only comparable under the WSL oracle.
+# cause as date/03). It does execute under an MSYS2 oracle, so it is whitelisted
+# as a genuine output difference.
+#
+# cat/03 and tee/02 are deliberately NOT whitelisted. Their expected GNU text
+# ("cat: -: Bad file descriptor" / "tee: read error: Bad file descriptor") comes
+# from coreutils' own read-error path, which an MSYS2 oracle never reaches: the
+# runtime's read() shim fails first and prints "failed to set file descriptor
+# text/binary mode: Bad file descriptor". That message is emitted identically
+# for cat, wc, od, head and tee, so it is a runtime artifact, not a utility
+# difference, and no coreutils version bump changes it (8.32 and 9.4 are
+# byte-identical on this path). Recording it here would have disguised an
+# unrunnable case as a known product difference. They now carry
+# `oracle: linux` and are SKIPped under a non-Linux oracle instead.
 corpus/date/23-rel-overflow.case	format: same quoting-style-only difference as date/03 (invalid date); rc=1 and "invalid date" text identical
-corpus/cat/03-closed-stdin.case	oracle: Git Bash 8.32 port reports "failed to set file descriptor text/binary mode: Bad file descriptor"; GNU 9.4/WSL prints "cat: -: Bad file descriptor" as WinuxCmd does
-corpus/tee/02-closed-stdin.case	oracle: same Git Bash port artifact as cat/03; GNU 9.4/WSL prints "tee: read error: Bad file descriptor" as WinuxCmd does

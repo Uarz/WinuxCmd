@@ -37,8 +37,16 @@
 
 #include <ctime>   // _tzset, localtime_s, mktime (TZ env support)
 #include <cstdlib> // std::getenv
-#include <regex>   // date token / relative item parsing
-#include <sstream> // std::istringstream
+
+// Standard library symbols (std::regex, std::istringstream, ...) come from the
+// `import std;` below. Do NOT also #include standard C++ headers in a
+// translation unit that imports std: the unity build merges this file with the
+// other commands, and the MSVC STL headers then define std:: symbols a second
+// time, failing with C2995/C2011/C2953 redefinitions raised from
+// __msvc_heap_algorithms.hpp, __msvc_bit_utils.hpp and <limits>.
+// pgrep.cpp/pkill.cpp use std::regex, and a dozen other commands use
+// std::stringstream, all without including <regex>/<sstream> - which is the
+// established convention here.
 
 #pragma comment(lib, "advapi32.lib")
 import std;

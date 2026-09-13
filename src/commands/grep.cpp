@@ -2317,15 +2317,17 @@ auto append_search_path(Config& cfg, std::string_view input,
     for (; it != end; ++it) {
       const auto& e = *it;
       if (e.is_directory()) {
-        std::string dirname = e.path().filename().string();
+        std::string dirname = wstring_to_utf8(e.path().filename().wstring());
         if (matches_any_glob(cfg.exclude_dir_patterns, dirname)) {
           it.disable_recursion_pending();
         }
         continue;
       }
       if (e.is_regular_file()) {
-        std::string filepath = e.path().generic_string();
-        std::string filename = e.path().filename().string();
+        // UTF-8, not ACP bytes: these strings feed both the printed file
+        // header and the wide path rebuilt for opening the file (#88).
+        std::string filepath = wstring_to_utf8(e.path().generic_wstring());
+        std::string filename = wstring_to_utf8(e.path().filename().wstring());
         if (!should_search_file(cfg, filename)) continue;
         out.push_back(filepath);
       }

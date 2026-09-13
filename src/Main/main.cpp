@@ -234,10 +234,17 @@ static int printHelp() noexcept {
 /**
  * @brief Main function for WinuxCmd
  * @param argc Number of command-line arguments
- * @param argv Array of command-line arguments
+ * @param wargv Array of command-line arguments (UTF-16)
  * @return Exit code from the executed command (0 = success, non-zero = error)
+ *
+ * Wide entry point (niubash #88): the narrow CRT main hands out argv decoded
+ * with the system ACP (e.g. GBK on zh-CN installs), which downstream code
+ * misreads as UTF-8 and turns non-ASCII arguments into U+FEBF-style mojibake
+ * even when the caller passed a perfect UTF-16 command line. Decoding the
+ * wide argv with wstring_to_utf8 at this single boundary makes argv valid
+ * UTF-8 regardless of the process code page.
  */
-int main(int argc, char* argv[]) noexcept {
+int wmain(int argc, wchar_t* wargv[]) noexcept {
   if (argc < 1) {
     return printHelp();
   }
@@ -246,14 +253,22 @@ int main(int argc, char* argv[]) noexcept {
   applyInheritedStdbuf("WINUX_STDBUF_I", stdin);
   applyInheritedStdbuf("WINUX_STDBUF_O", stdout);
   applyInheritedStdbuf("WINUX_STDBUF_E", stderr);
+
+  // Own the UTF-8 copies for the whole run; args below only borrow views.
+  std::vector<std::string> owned_args;
+  owned_args.reserve(static_cast<size_t>(argc));
+  for (int i = 0; i < argc; ++i) {
+    owned_args.emplace_back(wstring_to_utf8(wargv[i]));
+  }
+
   // Get the executable name (stem only)
-  std::string self_name = path::get_executable_name(argv[0]);
+  std::string self_name = path::get_executable_name(owned_args[0].c_str());
 
   // Convert command-line arguments to string_views for efficiency
   std::vector<std::string_view> args;
-  args.reserve(argc - 1);
-  for (int i = 1; i < argc; ++i) {
-    args.emplace_back(argv[i]);
+  args.reserve(owned_args.size() - 1);
+  for (size_t i = 1; i < owned_args.size(); ++i) {
+    args.emplace_back(owned_args[i]);
   }
 
   if (self_name == "winuxcmd") {

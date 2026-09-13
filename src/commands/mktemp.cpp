@@ -212,9 +212,23 @@ auto expand_user_profile_short_name(std::filesystem::path path)
   return std::filesystem::path(profile_norm + actual.substr(short_norm.size()));
 }
 
+// UTF-8 boundary helpers (#88): paths crossing the Win32 API must be built
+// from the wide form (the narrow path ctor decodes via the system ACP) and
+// displayed as UTF-8, matching every other command's argv contract.
+auto utf8_path(const std::string& p) -> std::filesystem::path {
+  return std::filesystem::path(utf8_to_wstring(p));
+}
+
+auto path_utf8(const std::filesystem::path& p) -> std::string {
+  return wstring_to_utf8(p.generic_wstring());
+}
+
 auto native_display_path(const std::filesystem::path& path) -> std::string {
-  return expand_user_profile_short_name(long_existing_prefix_path(path))
-      .generic_string();
+  // generic_wstring(): forward slashes, matching the historical
+  // generic_string() output shape, but encoded as UTF-8 (#88).
+  return wstring_to_utf8(
+      expand_user_profile_short_name(long_existing_prefix_path(path))
+          .generic_wstring());
 }
 
 auto random_index(size_t limit) -> size_t {
@@ -326,7 +340,7 @@ auto build_config(const CommandContext<MKTEMP_OPTIONS.size()>& ctx)
   // to $TMPDIR (or default temp dir). Strip any directory from template.
   if (cfg.use_tmpdir_flag) {
     cfg.template_str =
-        std::filesystem::path(cfg.template_str).filename().string();
+        path_utf8(utf8_path(cfg.template_str).filename());
     if (cfg.template_str.empty()) {
       cfg.template_str = "tmp.XXXXXXXXXX";
     }
@@ -344,9 +358,7 @@ auto build_config(const CommandContext<MKTEMP_OPTIONS.size()>& ctx)
   {
     std::string full = cfg.template_str + cfg.suffix;
     std::string component =
-        std::filesystem::path(normalize_win_shell_path(full))
-            .filename()
-            .string();
+        path_utf8(utf8_path(normalize_win_shell_path(full)).filename());
     if (component.empty()) {
       component = full;
     }
@@ -394,16 +406,15 @@ auto run(const Config& cfg) -> int {
   std::string template_component = cfg.template_str;
 
   if (!cfg.tmpdir.empty()) {
-    base_dir = std::filesystem::path(normalize_win_shell_path(cfg.tmpdir));
+    base_dir = utf8_path(normalize_win_shell_path(cfg.tmpdir));
     template_component =
-        std::filesystem::path(normalize_win_shell_path(cfg.template_str))
-            .filename()
-            .string();
+        path_utf8(utf8_path(normalize_win_shell_path(cfg.template_str))
+                      .filename());
   } else {
     std::filesystem::path template_path =
-        std::filesystem::path(normalize_win_shell_path(cfg.template_str));
+        utf8_path(normalize_win_shell_path(cfg.template_str));
     base_dir = template_path.parent_path();
-    template_component = template_path.filename().string();
+    template_component = path_utf8(template_path.filename());
   }
 
   if (template_component.empty()) {
@@ -437,14 +448,15 @@ auto run(const Config& cfg) -> int {
 
     // Build full path
     std::filesystem::path candidate_path =
-        base_dir.empty() ? std::filesystem::path(filename)
-                         : (base_dir / std::filesystem::path(filename));
+        base_dir.empty() ? utf8_path(filename)
+                         : (base_dir / utf8_path(filename));
     temp_file = candidate_path.is_absolute()
                     ? native_display_path(candidate_path)
-                    : candidate_path.generic_string();
+                    : path_utf8(candidate_path);
 
     // Check if file/directory already exists
-    DWORD attrs = GetFileAttributesA(temp_file.c_str());
+    DWORD attrs =
+        GetFileAttributesW(utf8_to_wstring(temp_file).c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES) {
       // File doesn't exist, we can use this name
       break;
@@ -466,7 +478,7 @@ auto run(const Config& cfg) -> int {
   // Create file or directory (unless dry-run)
   if (!cfg.dry_run) {
     if (cfg.make_directory) {
-      if (!CreateDirectoryA(temp_file.c_str(), NULL)) {
+      if (!CreateDirectoryW(utf8_to_wstring(temp_file).c_str(), NULL)) {
         if (!cfg.quiet) {
           cp::Result<int> result2 =
               std::unexpected("failed to create temporary directory");
@@ -476,7 +488,7 @@ auto run(const Config& cfg) -> int {
       }
     } else {
       // Create file
-      std::ofstream f(temp_file, std::ios::binary);
+      std::ofstream f(utf8_path(temp_file), std::ios::binary);
       if (!f) {
         if (!cfg.quiet) {
           cp::Result<int> result2 =

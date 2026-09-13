@@ -212,16 +212,8 @@ auto expand_user_profile_short_name(std::filesystem::path path)
   return std::filesystem::path(profile_norm + actual.substr(short_norm.size()));
 }
 
-// UTF-8 boundary helpers (#88): paths crossing the Win32 API must be built
-// from the wide form (the narrow path ctor decodes via the system ACP) and
-// displayed as UTF-8, matching every other command's argv contract.
-auto utf8_path(const std::string& p) -> std::filesystem::path {
-  return std::filesystem::path(utf8_to_wstring(p));
-}
-
-auto path_utf8(const std::filesystem::path& p) -> std::string {
-  return wstring_to_utf8(p.generic_wstring());
-}
+// utf8_path()/path_utf8() now live in utils:utf8 so every command shares
+// one implementation (niubash #88).
 
 auto native_display_path(const std::filesystem::path& path) -> std::string {
   // generic_wstring(): forward slashes, matching the historical

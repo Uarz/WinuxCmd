@@ -98,3 +98,24 @@ export auto is_valid_utf8(const std::string_view& text) -> bool {
   }
   return true;
 }
+
+/**
+ * @brief Build a std::filesystem::path from UTF-8 bytes.
+ *
+ * The narrow path ctor decodes through the system ANSI code page, so it must
+ * never be fed non-ASCII operand bytes directly. Always go through here
+ * (niubash #88 class of bugs). Note: once the embedded activeCodePage=UTF-8
+ * manifest applies (Windows 10 1903+), the narrow ctor decodes UTF-8 anyway;
+ * these helpers keep the code correct on older hosts and self-documenting.
+ */
+export auto utf8_path(const std::string_view& utf8) -> std::filesystem::path {
+  return std::filesystem::path(utf8_to_wstring(utf8));
+}
+
+/**
+ * @brief Render a std::filesystem::path as UTF-8 (forward slashes preserved
+ *        exactly like generic_string(), but encoded as UTF-8 instead of ACP).
+ */
+export auto path_utf8(const std::filesystem::path& path) -> std::string {
+  return wstring_to_utf8(path.generic_wstring());
+}

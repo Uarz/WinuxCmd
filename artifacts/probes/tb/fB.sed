@@ -1,4 +1,0 @@
-a\
-hello
-world
-p;

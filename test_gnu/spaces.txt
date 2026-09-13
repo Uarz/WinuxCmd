@@ -1,4 +1,0 @@
-  leading space
-trailing space  
-  both spaces  
-no spaces

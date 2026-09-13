@@ -232,6 +232,10 @@ set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 if (WIN32)
     set(WINUXCMD_RESOURCE_RC "${CMAKE_CURRENT_SOURCE_DIR}/resources/winuxcmd.rc")
+    # activeCodePage=UTF-8: pin the process ACP so narrow-char boundaries
+    # (argv, narrow path ctors, path::string(), *A Win32 APIs) speak UTF-8
+    # regardless of the system locale (niubash#88 class of bugs).
+    set(WINUXCMD_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/resources/winuxcmd.manifest")
 endif ()
 
 # ===================== Unity Build Implementation =====================
@@ -316,6 +320,7 @@ endif()
 # Main executable: winuxcmd.exe - includes all commands
 add_executable(winuxcmd
         src/Main/main.cpp
+        ${WINUXCMD_MANIFEST}
 )
 
 if (WIN32)
@@ -521,7 +526,7 @@ endif ()
 
 # Helper macro to create command executables
 macro(create_command_executable CMD)
-    add_executable(${CMD} src/Main/main.cpp)
+    add_executable(${CMD} src/Main/main.cpp ${WINUXCMD_MANIFEST})
 
     if (WIN32)
         target_sources(${CMD} PRIVATE "${WINUXCMD_RESOURCE_RC}")
@@ -708,7 +713,10 @@ if(BUILD_STANDALONE)
         )
 
         if (WIN32)
-            target_sources(${CMD_TARGET_NAME} PRIVATE "${WINUXCMD_RESOURCE_RC}")
+            target_sources(${CMD_TARGET_NAME} PRIVATE
+                "${WINUXCMD_RESOURCE_RC}"
+                "${WINUXCMD_MANIFEST}"
+            )
         endif ()
 
         # Add core module interfaces directly for reliable module partition resolution

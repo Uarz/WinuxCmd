@@ -121,13 +121,17 @@ auto join_target_path(const std::string &directory, const std::string &source)
 auto relative_symlink_target(const std::string &source,
                              const std::string &target) -> std::string {
   std::error_code ec;
-  auto source_path = std::filesystem::absolute(source, ec);
+  // Build paths from the wide form: the narrow path ctor decodes via the
+  // system ACP, which mangles non-ASCII UTF-8 sources/targets (#88).
+  auto source_path =
+      std::filesystem::absolute(utf8_to_wstring(source), ec);
   if (ec) return source;
-  auto target_path = std::filesystem::absolute(target, ec);
+  auto target_path =
+      std::filesystem::absolute(utf8_to_wstring(target), ec);
   if (ec) return source;
-  auto relative =
-      std::filesystem::relative(source_path, target_path.parent_path(), ec);
-  return ec ? source : relative.string();
+  auto relative = std::filesystem::relative(source_path,
+                                            target_path.parent_path(), ec);
+  return ec ? source : wstring_to_utf8(relative.wstring());
 }
 
 auto ln_windows_error_text(DWORD error) -> std::string {
@@ -409,8 +413,9 @@ REGISTER_COMMAND(
     std::string source = job_source;
     if (!symbolic && logical) {
       std::error_code source_ec;
-      auto resolved = std::filesystem::canonical(source, source_ec);
-      if (!source_ec) source = resolved.string();
+      auto resolved =
+          std::filesystem::canonical(utf8_to_wstring(source), source_ec);
+      if (!source_ec) source = wstring_to_utf8(resolved.wstring());
     }
     if (symbolic && relative) source = relative_symlink_target(source, target);
 

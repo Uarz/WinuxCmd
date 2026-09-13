@@ -2009,8 +2009,16 @@ auto depth_from_root(const std::filesystem::path& root,
   return d;
 }
 
+// Convert a filesystem path to UTF-8 explicitly (niubash #88). On MSVC,
+// path::string()/generic_string() convert through the system ACP (e.g. GBK
+// on zh-CN installs), so non-ASCII filenames leak as ACP bytes instead of
+// UTF-8, both in printed output and in -name/-path pattern matching.
+auto path_to_utf8(const std::filesystem::path& p) -> std::string {
+  return wstring_to_utf8(p.generic_wstring());
+}
+
 auto path_display(const std::filesystem::path& p) -> std::string {
-  auto s = p.generic_string();
+  auto s = path_to_utf8(p);
   if (s.empty()) return ".";
   std::replace(s.begin(), s.end(), '\\', '/');
   return s;
@@ -2135,25 +2143,25 @@ auto evaluate_expression(const ExprNode& expr, const std::filesystem::path& p,
       return true;
 
     case ExprKind::Name: {
-      auto filename = p.filename().string();
-      if (filename.empty()) filename = p.generic_string();
+      auto filename = path_to_utf8(p.filename());
+      if (filename.empty()) filename = path_to_utf8(p);
       return wildcard_match(expr.text, filename, true);
     }
 
     case ExprKind::IName: {
-      auto filename = p.filename().string();
-      if (filename.empty()) filename = p.generic_string();
+      auto filename = path_to_utf8(p.filename());
+      if (filename.empty()) filename = path_to_utf8(p);
       return wildcard_match(expr.text, filename, false);
     }
 
     case ExprKind::Path: {
-      auto full_path = p.generic_string();
+      auto full_path = path_to_utf8(p);
       if (full_path.empty()) full_path = ".";
       return wildcard_match(expr.text, full_path, true);
     }
 
     case ExprKind::IPath: {
-      auto full_path = p.generic_string();
+      auto full_path = path_to_utf8(p);
       if (full_path.empty()) full_path = ".";
       return wildcard_match(expr.text, full_path, false);
     }
@@ -2161,7 +2169,7 @@ auto evaluate_expression(const ExprNode& expr, const std::filesystem::path& p,
     case ExprKind::Regex:
     case ExprKind::IRegex: {
       if (!expr.regex) return false;
-      auto full_path = p.generic_string();
+      auto full_path = path_to_utf8(p);
       if (full_path.empty()) full_path = ".";
       return expr.regex->matches_entire(full_path);
     }
@@ -2406,8 +2414,8 @@ auto entry_matches(Config& cfg, const std::filesystem::path& p,
     return evaluate_expression(*cfg.expression, p, e, depth, root, cfg);
   }
 
-  auto filename = p.filename().string();
-  if (filename.empty()) filename = p.generic_string();
+  auto filename = path_to_utf8(p.filename());
+  if (filename.empty()) filename = path_to_utf8(p);
 
   if (!cfg.name_pattern.empty() &&
       !wildcard_match(cfg.name_pattern, filename, true)) {
@@ -2419,7 +2427,7 @@ auto entry_matches(Config& cfg, const std::filesystem::path& p,
     return false;
   }
 
-  auto full_path = p.generic_string();
+  auto full_path = path_to_utf8(p);
   if (full_path.empty()) full_path = ".";
 
   if (!cfg.path_pattern.empty() &&
@@ -2557,7 +2565,7 @@ auto file_size_bytes(const std::filesystem::directory_entry& e)
     ec.clear();
     auto target = std::filesystem::read_symlink(e.path(), ec);
     if (ec) return 0;
-    return static_cast<unsigned long long>(target.generic_string().size());
+    return static_cast<unsigned long long>(path_to_utf8(target).size());
   }
   ec.clear();
   if (!e.is_regular_file(ec) || ec) return 0;
@@ -3287,13 +3295,13 @@ auto append_file_time_printf(std::string& out, std::string_view format,
 }
 
 auto basename_display(const std::filesystem::path& p) -> std::string {
-  auto filename = p.filename().generic_string();
+  auto filename = path_to_utf8(p.filename());
   if (!filename.empty()) return filename;
   return path_display(p);
 }
 
 auto dirname_display(const std::filesystem::path& p) -> std::string {
-  auto parent = p.parent_path().generic_string();
+  auto parent = path_to_utf8(p.parent_path());
   if (parent.empty()) return ".";
   return parent;
 }
@@ -3308,7 +3316,7 @@ auto link_target_display(const std::filesystem::directory_entry& e)
   ec.clear();
   auto target = std::filesystem::read_symlink(e.path(), ec);
   if (ec) return "";
-  return target.generic_string();
+  return path_to_utf8(target);
 }
 
 auto root_path_display(const std::filesystem::path& root) -> std::string {
@@ -3321,7 +3329,7 @@ auto path_below_root_display(const std::filesystem::path& root,
   auto rel = std::filesystem::relative(p, root, ec);
   if (ec) return path_display(p);
   if (rel.empty() || rel == ".") return "";
-  return rel.generic_string();
+  return path_to_utf8(rel);
 }
 
 auto format_printf(std::string_view format, const std::filesystem::path& p,
@@ -3843,7 +3851,9 @@ auto scan_one_root(const std::filesystem::path& root, Config& cfg,
 auto process(Config& cfg) -> int {
   bool matched_any = false;
   for (const auto& r : cfg.roots) {
-    auto root = std::filesystem::path(r);
+    // Roots arrive as UTF-8 from the argv boundary; build the path from the
+    // wide form because the narrow path ctor would decode via the ACP.
+    auto root = std::filesystem::path(utf8_to_wstring(r));
     if (cfg.delete_action) {
       std::error_code ec;
       bool exists = std::filesystem::exists(root, ec);

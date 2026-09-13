@@ -1708,7 +1708,8 @@ auto external_sort(const Config& cfg) -> cp::Result<int> {
   std::filesystem::path temp_dir =
       cfg.temporary_directory_hint.empty()
           ? std::filesystem::temp_directory_path()
-          : std::filesystem::path(cfg.temporary_directory_hint);
+          // Wide form: the narrow path ctor decodes via the system ACP (#88).
+          : std::filesystem::path(utf8_to_wstring(cfg.temporary_directory_hint));
   auto make_run = [&](std::vector<std::string>& records) -> cp::Result<bool> {
     if (records.empty()) return true;
     auto before = [&](const std::string& a, const std::string& b) {
@@ -1722,7 +1723,7 @@ auto external_sort(const Config& cfg) -> cp::Result<int> {
     const auto path =
         temp_dir / ("winuxcmd-sort-" + std::to_string(GetCurrentProcessId()) +
                     "-" + std::to_string(run_number++) + ".tmp");
-    auto output = file_io::create_binary_file(path.string());
+    auto output = file_io::create_binary_file(wstring_to_utf8(path.wstring()));
     if (!output.is_open())
       return std::unexpected("cannot create temporary file");
     for (const auto& record : records) {
@@ -1787,7 +1788,7 @@ auto external_sort(const Config& cfg) -> cp::Result<int> {
   }
 
   for (auto& path : temporary_paths) {
-    ExternalRun run{path, file_io::open_binary_file(path.string())};
+    ExternalRun run{path, file_io::open_binary_file(wstring_to_utf8(path.wstring()))};
     if (!run.input.is_open())
       return std::unexpected("cannot open temporary file");
     run.has_current =

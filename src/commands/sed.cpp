@@ -2178,8 +2178,10 @@ auto apply_literal_stream_fast_path(std::string_view input, const Config& cfg)
 auto make_in_place_backup_path(const std::string& path,
                                const std::string& suffix)
     -> std::filesystem::path {
+  // Build from the wide form: the narrow path ctor decodes via the system
+  // ACP, which mangles non-ASCII UTF-8 paths (#88).
   if (suffix.find('*') == std::string::npos) {
-    return std::filesystem::path(path + suffix);
+    return std::filesystem::path(utf8_to_wstring(path + suffix));
   }
 
   std::string backup;
@@ -2191,19 +2193,21 @@ auto make_in_place_backup_path(const std::string& path,
       backup.push_back(ch);
     }
   }
-  return std::filesystem::path(backup);
+  return std::filesystem::path(utf8_to_wstring(backup));
 }
 
 auto preserve_in_place_backup(const std::filesystem::path& original,
                               const std::string& suffix) -> bool {
   if (suffix.empty()) return true;
 
-  auto backup = make_in_place_backup_path(original.string(), suffix);
+  auto backup = make_in_place_backup_path(
+      wstring_to_utf8(original.wstring()), suffix);
   std::error_code ec;
   std::filesystem::copy_file(
       original, backup, std::filesystem::copy_options::overwrite_existing, ec);
   if (ec) {
-    safeErrorPrint("sed: cannot create backup '" + backup.string() + "'\n");
+    safeErrorPrint("sed: cannot create backup '" +
+                   wstring_to_utf8(backup.wstring()) + "'\n");
     return false;
   }
   return true;
@@ -2212,12 +2216,12 @@ auto preserve_in_place_backup(const std::filesystem::path& original,
 auto replace_file_atomically(const std::string& path,
                              const std::string& backup_suffix,
                              const std::string& content) -> bool {
-  auto original = std::filesystem::path(path);
+  auto original = std::filesystem::path(utf8_to_wstring(path));
   DWORD original_attrs = GetFileAttributesW(utf8_to_wstring(path).c_str());
   auto suffix =
       std::string(".winuxtmp.") + std::to_string(GetCurrentProcessId());
-  auto temp = std::filesystem::path(path + suffix);
-  auto backup = std::filesystem::path(path + suffix + ".bak");
+  auto temp = std::filesystem::path(utf8_to_wstring(path + suffix));
+  auto backup = std::filesystem::path(utf8_to_wstring(path + suffix + ".bak"));
 
   {
     std::ofstream out(temp, std::ios::binary | std::ios::trunc);

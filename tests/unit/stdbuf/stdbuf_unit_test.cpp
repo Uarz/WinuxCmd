@@ -18,7 +18,7 @@ TEST(stdbuf, stdbuf_basic) {
 
 TEST(stdbuf, stdbuf_preserves_argument_with_spaces) {
   Pipeline p;
-  p.add(L"stdbuf.exe", {L"printf.exe", L"<%s>", L"a b"});
+  p.add(L"stdbuf.exe", {L"-o0", L"printf.exe", L"<%s>", L"a b"});
 
   auto r = p.run();
 
@@ -38,8 +38,24 @@ TEST(stdbuf, stdbuf_missing_command_reports_help_hint_on_stderr) {
 
   EXPECT_EQ(r.exit_code, 125);
   EXPECT_TRUE(r.stdout_text.empty());
+  // [GNU] stdbuf with no COMMAND reports "missing operand".
   EXPECT_EQ_TEXT(r.stderr_text,
-                 "stdbuf: missing command\n"
+                 "stdbuf: missing operand\n"
+                 "Try 'stdbuf --help' for more information.\n");
+}
+
+// [GNU] stdbuf COMMAND without any -i/-o/-e buffering mode option is a
+// usage error, checked after the missing-operand diagnostic.
+TEST(stdbuf, stdbuf_command_without_mode_option_returns_125) {
+  Pipeline p;
+  p.add(L"stdbuf.exe", {L"echo.exe", L"test"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 125);
+  EXPECT_TRUE(r.stdout_text.empty());
+  EXPECT_EQ_TEXT(r.stderr_text,
+                 "stdbuf: you must specify a buffering mode option\n"
                  "Try 'stdbuf --help' for more information.\n");
 }
 
@@ -122,6 +138,5 @@ TEST(stdbuf, stdbuf_rejects_zero_sized_buffer_mode) {
   TEST_LOG("stdbuf stderr", r.stderr_text);
 
   EXPECT_EQ(r.exit_code, 125);
-  EXPECT_TRUE(r.stderr_text.find("invalid mode for standard output") !=
-              std::string::npos);
+  EXPECT_TRUE(r.stderr_text.find("invalid mode '0KiB'") != std::string::npos);
 }

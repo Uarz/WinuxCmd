@@ -94,8 +94,13 @@ auto constexpr SORT_OPTIONS = std::array{
     // [GNU] --files0-from: read input from the file specified
     OPTION("", "--files0-from", "read input from the file specified",
            STRING_TYPE),
-    // [GNU] -c, --check
-    OPTION("-c", "--check", "check whether input is sorted"),
+    // [GNU] -c takes no argument (a glued "-cquiet" is an invalid option);
+    // --check accepts the optional =diagnose-first|quiet|silent argument.
+    OPTION("-c", "", "check whether input is sorted; diagnose-first"),
+    OPTION("", "--check",
+           "check whether input is sorted; accepts =diagnose-first|quiet|"
+           "silent",
+           OPTIONAL_STRING_TYPE),
     // [GNU] -C, --check-silent
     OPTION("-C", "--check-silent", "check whether input is sorted quietly"),
     // [GNU] --debug
@@ -1330,15 +1335,72 @@ auto build_config(const CommandContext<SORT_OPTIONS.size()>& ctx)
   cfg.stable = ctx.get<bool>("--stable", false) || ctx.get<bool>("-s", false);
   cfg.unique = ctx.get<bool>("--unique", false) || ctx.get<bool>("-u", false);
   cfg.debug = ctx.get<bool>("--debug", false);
-  if (ctx.get<bool>("--check", false) || ctx.get<bool>("-c", false)) {
-    cfg.mode = OperationMode::Check;
+  // [GNU] -c and --check select the diagnose-first check mode, while -C,
+  // --check-silent and --check=quiet/silent select the quiet mode. Mixing
+  // the two modes is rejected at parse time ("options '-cC' are
+  // incompatible"). --check values follow argmatch rules: unique prefixes
+  // of {quiet, silent, diagnose-first} are accepted, an explicitly empty
+  // "--check=" is an ambiguity, and anything else is an invalid argument.
+  bool want_check = false;
+  bool want_check_quiet = false;
+  bool check_inline_empty = false;
+  for (std::string_view raw : ctx.raw_args) {
+    if (raw == "--") break;
+    if (raw == "--check=") check_inline_empty = true;
   }
-  if (ctx.get<bool>("-C", false) || ctx.get<bool>("--check-silent", false)) {
-    // [GNU] -c and -C are mutually exclusive (GNU: options '-cC' are
-    // incompatible).
-    if (cfg.mode == OperationMode::Check) {
-      return std::unexpected("options '-cC' are incompatible");
+  for (const auto& occurrence : ctx.options.occurrences()) {
+    if (!ctx.metas || occurrence.index >= SORT_OPTIONS.size()) continue;
+    const auto& meta = (*ctx.metas)[occurrence.index];
+    if (option_matches(meta, "-C", "--check-silent")) {
+      want_check_quiet = true;
+      continue;
     }
+    if (meta.short_name == "-c" && meta.long_name.empty()) {
+      want_check = true;
+      continue;
+    }
+    if (meta.long_name != "--check") continue;
+
+    const auto* value = std::get_if<std::string>(&occurrence.value);
+    const std::string text = value != nullptr ? *value : std::string();
+    if (text.empty()) {
+      if (check_inline_empty) {
+        // Printed specially by the command entry point.
+        return std::unexpected("ambiguous argument '' for '--check'");
+      }
+      want_check = true;
+      continue;
+    }
+    static constexpr std::array<std::string_view, 3> kCheckArgs{
+        "quiet", "silent", "diagnose-first"};
+    std::string_view matched;
+    size_t match_count = 0;
+    for (const auto candidate : kCheckArgs) {
+      if (candidate.starts_with(text)) {
+        matched = candidate;
+        ++match_count;
+      }
+    }
+    if (match_count > 1) {
+      return std::unexpected("ambiguous argument '" + text +
+                             "' for '--check'");
+    }
+    if (match_count == 0) {
+      // Printed specially by the command entry point.
+      return std::unexpected("invalid argument '" + text + "' for '--check'");
+    }
+    if (matched == "diagnose-first") {
+      want_check = true;
+    } else {
+      want_check_quiet = true;
+    }
+  }
+  if (want_check && want_check_quiet) {
+    return std::unexpected("options '-cC' are incompatible");
+  }
+  if (want_check) {
+    cfg.mode = OperationMode::Check;
+  } else if (want_check_quiet) {
     cfg.mode = OperationMode::CheckQuiet;
   }
   cfg.delimiter =
@@ -1354,10 +1416,18 @@ auto build_config(const CommandContext<SORT_OPTIONS.size()>& ctx)
   cfg.output_file = ctx.get<std::string>("--output", "");
   if (cfg.output_file.empty()) cfg.output_file = ctx.get<std::string>("-o", "");
   if (cfg.mode != OperationMode::Sort && !cfg.output_file.empty()) {
-    return std::unexpected("options '-co' are incompatible");
+    // [GNU] quotes the effective check option letter: "-co" for -c/--check
+    // and "-Co" for -C/--check-silent/--check=quiet|silent.
+    return std::unexpected(
+        std::string("options '-") +
+        (cfg.mode == OperationMode::CheckQuiet ? "Co" : "co") +
+        "' are incompatible");
   }
   if (cfg.debug && cfg.mode != OperationMode::Sort) {
-    return std::unexpected("options '-c --debug' are incompatible");
+    return std::unexpected(
+        std::string("options '-") +
+        (cfg.mode == OperationMode::CheckQuiet ? "C" : "c") +
+        " --debug' are incompatible");
   }
   if (cfg.debug && !cfg.output_file.empty()) {
     return std::unexpected("options '-o --debug' are incompatible");
@@ -1460,8 +1530,10 @@ auto build_config(const CommandContext<SORT_OPTIONS.size()>& ctx)
   }
 
   if (cfg.mode != OperationMode::Sort && cfg.files.size() > 1) {
+    // [GNU] reports the extra operand as "not allowed with -c" for every
+    // check-mode variant, including -C and --check=quiet.
     return std::unexpected("extra operand '" + cfg.files[1] +
-                           "' not allowed with check mode");
+                           "' not allowed with -c");
   }
 
   return cfg;
@@ -1961,6 +2033,21 @@ REGISTER_COMMAND(sort, "sort", "sort [OPTION]... [FILE]...",
 
   auto cfg = build_config(ctx);
   if (!cfg) {
+    // [GNU] argmatch-style diagnostic for a bad --check=ARG: the rejected
+    // value, the valid-arguments list and the help hint. GNU sort exits 1
+    // here (usage(EXIT_FAILURE)), unlike the exit 2 used for other usage
+    // errors.
+    const std::string& err = cfg.error();
+    if ((err.starts_with("invalid argument '") ||
+         err.starts_with("ambiguous argument '")) &&
+        err.ends_with("' for '--check'")) {
+      safeErrorPrintLn("sort: " + err);
+      safeErrorPrintLn("Valid arguments are:");
+      safeErrorPrintLn("  - 'quiet', 'silent'");
+      safeErrorPrintLn("  - 'diagnose-first'");
+      safeErrorPrintLn("Try 'sort --help' for more information.");
+      return 1;
+    }
     cp::report_error(cfg, L"sort");
     return 2;
   }

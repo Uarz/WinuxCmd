@@ -42,13 +42,15 @@ import container;
 using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
-auto constexpr EXPAND_OPTIONS = std::array{
-    // [GNU]
-    OPTION("-t", "--tabs", "specify tab stop positions (default: 8)",
-           STRING_TYPE),
-    // [GNU]
-    OPTION("-i", "--initial", "only convert tabs at the beginning of lines",
-           BOOL_TYPE)};
+auto constexpr EXPAND_OPTIONS =
+    std::array{// [GNU]
+               OPTION("-t", "--tabs", "specify tab stop positions (default: 8)",
+                      STRING_TYPE),
+               // [GNU]
+               OPTION("-i", "--initial",
+                      "only convert tabs at the beginning of lines", BOOL_TYPE),
+               // [GNU] obsolescent -NUM is an alias for --tabs=NUM
+               OPTION("-NUM", "", "same as --tabs=NUM", INT_TYPE)};
 
 namespace expand_pipeline {
 namespace cp = core::pipeline;
@@ -191,6 +193,12 @@ auto build_config(const CommandContext<EXPAND_OPTIONS.size()>& ctx)
   auto tabs_opt = ctx.get<std::string>("--tabs", "");
   if (tabs_opt.empty()) {
     tabs_opt = ctx.get<std::string>("-t", "");
+  }
+
+  // [GNU] obsolescent -NUM operands add to the tab-stop list.
+  for (const int stop : ctx.get_all<int>("-NUM")) {
+    if (!tabs_opt.empty()) tabs_opt += ' ';
+    tabs_opt += std::to_string(stop);
   }
 
   if (!tabs_opt.empty()) {

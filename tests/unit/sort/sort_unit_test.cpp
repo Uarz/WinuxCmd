@@ -950,8 +950,8 @@ TEST(sort, sort_check_rejects_extra_operands) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 2);
-  EXPECT_TRUE(r.stderr_text.find("extra operand 'b.txt' not allowed with "
-                                 "check mode") != std::string::npos);
+  EXPECT_TRUE(r.stderr_text.find("extra operand 'b.txt' not allowed with -c") !=
+              std::string::npos);
 }
 
 TEST(sort, sort_check_rejects_output_file) {
@@ -991,4 +991,97 @@ TEST(sort, sort_debug_rejects_check_and_output_file) {
   EXPECT_TRUE(
       output_result.stderr_text.find("options '-o --debug' are incompatible") !=
       std::string::npos);
+}
+
+// [GNU] --check=quiet and --check=silent behave like -C: disorder is
+// detected with exit status 1 but no diagnostic reaches stderr (#1034).
+TEST(sort, sort_check_quiet_silent_arguments_suppress_disorder) {
+  TempDir tmp;
+  tmp.write("bad.txt", "b\na\n");
+  tmp.write("good.txt", "a\nb\n");
+
+  for (const wchar_t* opt : {L"--check=quiet", L"--check=silent"}) {
+    Pipeline p;
+    p.set_cwd(tmp.wpath());
+    p.add(L"sort.exe", {opt, L"bad.txt"});
+    auto r = p.run();
+
+    EXPECT_EQ(r.exit_code, 1);
+    EXPECT_EQ_TEXT(r.stdout_text, "");
+    EXPECT_EQ_TEXT(r.stderr_text, "");
+  }
+
+  Pipeline sorted;
+  sorted.set_cwd(tmp.wpath());
+  sorted.add(L"sort.exe", {L"--check=quiet", L"good.txt"});
+  auto sorted_result = sorted.run();
+
+  EXPECT_EQ(sorted_result.exit_code, 0);
+  EXPECT_EQ_TEXT(sorted_result.stdout_text, "");
+  EXPECT_EQ_TEXT(sorted_result.stderr_text, "");
+}
+
+// [GNU] sort.c argmatch: --check accepts unique prefixes of
+// {quiet, silent, diagnose-first}; an invalid or ambiguous value reports
+// the valid-arguments list and exits 1 (#1035).
+TEST(sort, sort_check_argument_matching_follows_argmatch_rules) {
+  TempDir tmp;
+  tmp.write("bad.txt", "b\na\n");
+
+  Pipeline prefix;
+  prefix.set_cwd(tmp.wpath());
+  prefix.add(L"sort.exe", {L"--check=q", L"bad.txt"});
+  auto prefix_result = prefix.run();
+  EXPECT_EQ(prefix_result.exit_code, 1);
+  EXPECT_EQ_TEXT(prefix_result.stderr_text, "");
+
+  Pipeline invalid;
+  invalid.set_cwd(tmp.wpath());
+  invalid.add(L"sort.exe", {L"--check=foo", L"bad.txt"});
+  auto invalid_result = invalid.run();
+  EXPECT_EQ(invalid_result.exit_code, 1);
+  EXPECT_TRUE(invalid_result.stderr_text.find(
+                  "invalid argument 'foo' for '--check'") != std::string::npos);
+  EXPECT_TRUE(invalid_result.stderr_text.find("Valid arguments are:") !=
+              std::string::npos);
+  EXPECT_TRUE(invalid_result.stderr_text.find("- 'quiet', 'silent'") !=
+              std::string::npos);
+
+  Pipeline ambiguous;
+  ambiguous.set_cwd(tmp.wpath());
+  ambiguous.add(L"sort.exe", {L"--check=", L"bad.txt"});
+  auto ambiguous_result = ambiguous.run();
+  EXPECT_EQ(ambiguous_result.exit_code, 1);
+  EXPECT_TRUE(ambiguous_result.stderr_text.find(
+                  "ambiguous argument '' for '--check'") != std::string::npos);
+}
+
+// [GNU] usage errors exit 2; the diagnose-first and quiet check modes are
+// incompatible even when spelled through --check=quiet (#1035).
+TEST(sort, sort_check_usage_error_statuses) {
+  TempDir tmp;
+  tmp.write("a.txt", "a\n");
+
+  Pipeline bad_option;
+  bad_option.add(L"sort.exe", {L"--bogus"});
+  auto bad_option_result = bad_option.run();
+  EXPECT_EQ(bad_option_result.exit_code, 2);
+  EXPECT_TRUE(bad_option_result.stderr_text.find("unrecognized option") !=
+              std::string::npos);
+
+  Pipeline mixed;
+  mixed.set_cwd(tmp.wpath());
+  mixed.add(L"sort.exe", {L"-c", L"--check=quiet", L"a.txt"});
+  auto mixed_result = mixed.run();
+  EXPECT_EQ(mixed_result.exit_code, 2);
+  EXPECT_TRUE(mixed_result.stderr_text.find("options '-cC' are incompatible") !=
+              std::string::npos);
+
+  Pipeline quiet_output;
+  quiet_output.set_cwd(tmp.wpath());
+  quiet_output.add(L"sort.exe", {L"-C", L"-o", L"out.txt", L"a.txt"});
+  auto quiet_output_result = quiet_output.run();
+  EXPECT_EQ(quiet_output_result.exit_code, 2);
+  EXPECT_TRUE(quiet_output_result.stderr_text.find(
+                  "options '-Co' are incompatible") != std::string::npos);
 }

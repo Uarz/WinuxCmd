@@ -141,30 +141,13 @@ REGISTER_COMMAND(
   // Open output files
   SmallVector<std::ofstream, 32> file_streams;
   for (const auto& filename : output_files) {
-    std::ofstream file;
-    // Resolve through the shared operand boundary so MSYS-style paths and
-    // POSIX pseudo-devices (/dev/null -> NUL) work like other tools (#276).
-    // Error messages keep echoing the user-visible operand verbatim.
-    // A trailing separator requires a directory target (ENOTDIR on regular
-    // files); silently stripping it would truncate the file (#1052).
-    const auto operand = native_path::make_api_path_operand(filename);
-    if (const int open_err =
-            native_path::operand_file_open_error(operand, true)) {
-      encountered_error = true;
-      safeErrorPrint("tee: '");
-      safeErrorPrint(filename);
-      safeErrorPrint("': ");
-      safeErrorPrint(strerror(open_err));
-      safeErrorPrint("\n");
-      continue;
-    }
-    const std::string resolved = wstring_to_utf8(operand.extended);
-    if (append) {
-      file.open(resolved, std::ios::out | std::ios::app | std::ios::binary);
-    } else {
-      file.open(resolved, std::ios::out | std::ios::trunc | std::ios::binary);
-    }
-
+    // Resolve through the shared operand boundary so MSYS-style paths,
+    // POSIX pseudo-devices (/dev/null -> NUL), and the /dev/std{out,err}
+    // fd bindings work like other tools (#276/#1056). Error messages keep
+    // echoing the user-visible operand verbatim. A trailing separator
+    // requires a directory target (ENOTDIR on regular files); silently
+    // stripping it would truncate the file (#1052).
+    std::ofstream file = file_io::create_binary_file(filename, append);
     if (!file.is_open()) {
       // Capture errno before printing: output helpers can clobber it.
       const int saved_errno = errno;

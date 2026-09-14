@@ -143,6 +143,18 @@ export auto normalize_api_operand_w(std::wstring_view path) -> std::wstring {
 export auto resolve_pseudo_device_w(std::wstring_view path)
     -> std::optional<std::wstring>;
 
+// [GNU] Standard-stream pseudo paths: /dev/std{in,out,err} plus the
+// /dev/fd/N and /proc/*/fd/N spellings. MSYS/Git-Bash expands /dev/std* in
+// native argv to /proc/self/fd/N (sometimes already resolved to
+// /proc/<pid>/fd/N), so every spelling is recognized here (#1056).
+// Returns the CRT file descriptor (0, 1, 2) the operand refers to.
+export auto pseudo_device_std_fd_w(std::wstring_view path)
+    -> std::optional<int>;
+
+export auto pseudo_device_std_fd(std::string_view path) -> std::optional<int> {
+  return pseudo_device_std_fd_w(from_utf8(path));
+}
+
 export auto normalize_api_operand(std::string_view path) -> std::string {
   // Delegate to the wide implementation so MSYS/Git-Bash style operands such
   // as "/d/repo/file" are converted to "D:\repo\file" exactly like
@@ -185,13 +197,70 @@ export struct ApiPathOperand {
 // boundary (instead of relying on an external runtime directory such as
 // niubash's dev/) keeps tools like dd/tee/cat/pr working when they receive
 // literal /dev/* operands (#276 follow-up, uutils#9745).
+export auto pseudo_device_std_fd_w(std::wstring_view path)
+    -> std::optional<int> {
+  if (path == L"/dev/stdin") return 0;
+  if (path == L"/dev/stdout") return 1;
+  if (path == L"/dev/stderr") return 2;
+
+  const auto fd_of_tail = [](std::wstring_view tail) -> std::optional<int> {
+    if (tail.size() == 1 && tail[0] >= L'0' && tail[0] <= L'2') {
+      return static_cast<int>(tail[0] - L'0');
+    }
+    return std::nullopt;
+  };
+
+  if (path.starts_with(L"/dev/fd/")) {
+    return fd_of_tail(path.substr(8));
+  }
+  // /proc/self/fd/N and the MSYS-resolved /proc/<pid>/fd/N form.
+  if (path.starts_with(L"/proc/")) {
+    const std::wstring_view rest = path.substr(6);
+    const auto fd_pos = rest.find(L"/fd/");
+    if (fd_pos != std::wstring_view::npos) {
+      const std::wstring_view pid = rest.substr(0, fd_pos);
+      const bool valid_pid =
+          !pid.empty() &&
+          (pid == L"self" || std::ranges::all_of(pid, [](wchar_t ch) {
+             return ch >= L'0' && ch <= L'9';
+           }));
+      if (valid_pid) return fd_of_tail(rest.substr(fd_pos + 4));
+    }
+  }
+  return std::nullopt;
+}
+
 export auto resolve_pseudo_device_w(std::wstring_view path)
     -> std::optional<std::wstring> {
   if (path == L"/dev/null") return std::wstring(L"NUL");
-  if (path == L"/dev/stdin") return std::wstring(L"CONIN$");
-  if (path == L"/dev/stdout") return std::wstring(L"CONOUT$");
-  if (path == L"/dev/stderr") return std::wstring(L"CONOUT$");
   if (path == L"/dev/tty") return std::wstring(L"CONIN$");
+  if (auto fd = pseudo_device_std_fd_w(path)) {
+    return *fd == 0 ? std::wstring(L"CONIN$") : std::wstring(L"CONOUT$");
+  }
+  // Bare DOS device names: MSYS/Git-Bash rewrites /dev/null to "nul" in
+  // native argv, and users may type NUL/CON directly. They resolve only in
+  // the Win32 device namespace, so they must pass through without the \\?\
+  // prefix (#1055).
+  static constexpr std::wstring_view kDosDevices[] = {
+      L"NUL",  L"CON",  L"PRN",  L"AUX",  L"CONIN$", L"CONOUT$",
+      L"COM1", L"COM2", L"COM3", L"COM4", L"COM5",   L"COM6",
+      L"COM7", L"COM8", L"COM9", L"LPT1", L"LPT2",   L"LPT3",
+      L"LPT4", L"LPT5", L"LPT6", L"LPT7", L"LPT8",   L"LPT9"};
+  for (const auto device : kDosDevices) {
+    if (path.size() != device.size()) continue;
+    bool equal = true;
+    for (size_t i = 0; i < path.size(); ++i) {
+      wchar_t a = path[i];
+      wchar_t b = device[i];
+      if (a >= L'a' && a <= L'z') a = static_cast<wchar_t>(a - L'a' + L'A');
+      if (b >= L'a' && b <= L'z') b = static_cast<wchar_t>(b - L'a' + L'A');
+      if (a != b) {
+        equal = false;
+        break;
+      }
+    }
+    if (equal) return std::wstring(path);
+  }
   return std::nullopt;
 }
 
@@ -359,7 +428,10 @@ export auto create_directory_w(std::wstring_view path) -> bool {
 
 export auto create_directories_w(std::wstring_view path) -> bool {
   std::error_code ec;
-  if (std::filesystem::create_directories(std::filesystem::path(path), ec)) {
+  // Use the extended-path form so `mkdir -p` and other recursive creators
+  // work beyond MAX_PATH like the rest of the API boundary (#1061).
+  const std::wstring native = to_extended_path(path);
+  if (std::filesystem::create_directories(std::filesystem::path(native), ec)) {
     return true;
   }
   if (!ec) return is_directory_w(path);
@@ -384,6 +456,217 @@ export auto join_w(std::wstring_view base, std::wstring_view relative)
 export auto join(std::string_view base, std::string_view relative)
     -> std::string {
   return to_utf8(join_w(from_utf8(base), from_utf8(relative)));
+}
+
+// [GNU] canonicalize_filename_mode() existence rules shared by realpath and
+// readlink (-f/-e/-m).
+export enum class CanonMode {
+  all_but_last,  // every component but the last must exist (realpath, -f)
+  existing,      // every component must exist (realpath -e, readlink -e)
+  missing,       // no component needs to exist (realpath -m, readlink -m)
+};
+
+namespace canonicalize_detail {
+// Split the relative part of a path into components, keeping "." and ".."
+// entries so they can be applied against the resolved stack.
+inline auto components_of(const std::filesystem::path& path)
+    -> std::deque<std::filesystem::path> {
+  std::deque<std::filesystem::path> parts;
+  for (const auto& part : path.relative_path()) {
+    parts.push_back(part);
+  }
+  return parts;
+}
+
+// Read the substitution text of a symlink component.  Returns nullopt for
+// non-symlink reparse points (mount points carry a \\??\Volume{GUID} target
+// that cannot be re-expressed as a Win32 path; leaving the component in
+// place still lets the kernel resolve it).
+inline auto symlink_target(const std::filesystem::path& path)
+    -> std::optional<std::filesystem::path> {
+  std::error_code ec;
+  const auto status = std::filesystem::symlink_status(path, ec);
+  if (ec || !std::filesystem::is_symlink(status)) {
+    return std::nullopt;
+  }
+  auto target = std::filesystem::read_symlink(path, ec);
+  if (ec) {
+    return std::nullopt;
+  }
+  std::wstring text = target.wstring();
+  if (text.rfind(L"\\??\\", 0) == 0 || text.rfind(L"\\\\?\\", 0) == 0) {
+    // UNC device form: "\\??\UNC\server\share" -> "\\server\share".
+    if (text.size() > 8 && (text.compare(4, 4, L"UNC\\") == 0)) {
+      text = L"\\\\" + text.substr(8);
+    } else {
+      text = text.substr(4);
+    }
+  }
+  if (text.rfind(L"Volume{", 0) == 0) {
+    return std::nullopt;  // mount point: keep the component verbatim
+  }
+  return std::filesystem::path(text);
+}
+}  // namespace canonicalize_detail
+
+// [GNU] Resolve PATH component-wise, substituting symlink targets as each
+// component is reached (realpath/readlink -f/-e/-m semantics).  Returns the
+// resolved absolute path, or an errno value (ENOENT when a required
+// component does not exist, ELOOP on a symlink cycle, ENOTDIR when a
+// trailing separator names a non-directory).  When the resolved path fully
+// exists it is re-expressed with on-disk casing via the file handle.
+export auto canonicalize_path_w(std::wstring_view path, CanonMode mode,
+                                bool expand_symlinks = true,
+                                bool logical = false)
+    -> std::expected<std::wstring, int> {
+  std::filesystem::path input{std::wstring(path)};
+  const bool needs_directory =
+      strip_trailing_separators(path).size() != path.size();
+
+  std::filesystem::path current;
+  std::deque<std::filesystem::path> pending;
+  if (input.is_absolute()) {
+    current = input.root_path();
+    pending = canonicalize_detail::components_of(input);
+  } else {
+    current = std::filesystem::path(current_directory_w());
+    pending = canonicalize_detail::components_of(input);
+  }
+  if (current.empty()) {
+    return std::unexpected(ENOENT);
+  }
+
+  // -L/--logical folds "." and ".." lexically before symlink substitution.
+  if (logical) {
+    std::filesystem::path folded = (current / input.relative_path());
+    folded = folded.lexically_normal();
+    current = folded.root_path();
+    pending = canonicalize_detail::components_of(folded);
+  }
+
+  int symlink_budget = 40;  // POSIX MAXSYMLINKS
+  while (!pending.empty()) {
+    const std::filesystem::path part = pending.front();
+    pending.pop_front();
+
+    const auto& native = part.native();
+    if (native.empty() || native == L".") {
+      continue;
+    }
+    if (native == L"..") {
+      // Physical mode pops the *resolved* stack so "linkdir/../x" ascends
+      // inside the link target's parent.
+      if (current != current.root_path()) {
+        current = current.parent_path();
+      }
+      continue;
+    }
+
+    std::filesystem::path candidate = current / part;
+    const DWORD attrs = attributes_w(candidate.wstring());
+    if (!valid_attributes(attrs)) {
+      if (mode == CanonMode::missing) {
+        current = candidate;  // keep appending; ".."-handling still works
+        continue;
+      }
+      // [GNU] Traversing through a component that exists but is not a
+      // directory reports ENOTDIR (readlink("file/x") fails ENOTDIR, not
+      // ENOENT), in every mode that probes components.
+      const DWORD parent_attrs = attributes_w(current.wstring());
+      if (valid_attributes(parent_attrs) &&
+          !attributes_are_directory(parent_attrs)) {
+        return std::unexpected(ENOTDIR);
+      }
+      // [GNU] A component longer than NAME_MAX fails the per-component
+      // lookup with ENAMETOOLONG; the CAN_ALL_BUT_LAST exemption only
+      // covers ENOENT, and CAN_MISSING never probes (#370).
+      constexpr size_t kMaxComponentLength = 255;  // NTFS NAME_MAX
+      if (part.native().size() > kMaxComponentLength) {
+        return std::unexpected(ENAMETOOLONG);
+      }
+      // [GNU] The CAN_ALL_BUT_LAST exemption applies when nothing but
+      // separators follows the component (a trailing separator still
+      // counts as the last component).  std::filesystem iteration yields
+      // an empty element for a trailing separator.
+      const bool only_separators_remain =
+          std::ranges::all_of(pending, [](const std::filesystem::path& rem) {
+            return rem.native().empty();
+          });
+      if (mode == CanonMode::all_but_last && only_separators_remain) {
+        current = candidate;  // the last component may be missing
+        continue;
+      }
+      return std::unexpected(ENOENT);
+    }
+
+    if (expand_symlinks) {
+      if (auto target = canonicalize_detail::symlink_target(candidate)) {
+        if (--symlink_budget <= 0) {
+          return std::unexpected(ELOOP);
+        }
+        auto target_parts = canonicalize_detail::components_of(*target);
+        if (target->is_absolute()) {
+          current = target->root_path();
+        }
+        pending.insert(pending.begin(), target_parts.begin(),
+                       target_parts.end());
+        continue;
+      }
+    }
+    current = candidate;
+  }
+
+  if (needs_directory) {
+    // [GNU] A trailing separator makes the leaf require a directory, but a
+    // *missing* leaf is still exempt under CAN_ALL_BUT_LAST (the ENOENT
+    // exemption ignores trailing slashes).  Only an existing non-directory
+    // reports ENOTDIR.
+    const DWORD final_attrs = attributes_w(current.wstring());
+    if (valid_attributes(final_attrs) &&
+        !attributes_are_directory(final_attrs)) {
+      return std::unexpected(ENOTDIR);
+    }
+  }
+
+  // Prefer the kernel-canonical spelling (resolves 8.3 names and restores
+  // on-disk casing) whenever the whole path exists.
+  const std::wstring finished = current.wstring();
+  if (mode != CanonMode::missing && valid_attributes(attributes_w(finished))) {
+    const std::wstring native = to_extended_path(finished);
+    HANDLE handle = CreateFileW(
+        native.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle != INVALID_HANDLE_VALUE) {
+      std::wstring buffer(32768, L'\0');
+      DWORD written = GetFinalPathNameByHandleW(
+          handle, buffer.data(), static_cast<DWORD>(buffer.size()),
+          FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+      CloseHandle(handle);
+      if (written > 0 && written < buffer.size()) {
+        buffer.resize(written);
+        if (buffer.rfind(L"\\\\?\\UNC\\", 0) == 0) {
+          return L"\\\\" + buffer.substr(8);
+        }
+        if (buffer.rfind(L"\\\\?\\", 0) == 0) {
+          return buffer.substr(4);
+        }
+        return buffer;
+      }
+    }
+  }
+  return finished;
+}
+
+export auto canonicalize_path(std::string_view path, CanonMode mode,
+                              bool expand_symlinks = true, bool logical = false)
+    -> std::expected<std::string, int> {
+  auto resolved =
+      canonicalize_path_w(from_utf8(path), mode, expand_symlinks, logical);
+  if (!resolved) {
+    return std::unexpected(resolved.error());
+  }
+  return to_utf8(*resolved);
 }
 
 }  // namespace native_path

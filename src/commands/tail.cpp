@@ -344,9 +344,10 @@ auto same_identity(const FileIdentity& lhs, const FileIdentity& rhs) -> bool {
 }
 
 auto read_file_status(const std::string& file) -> std::optional<FileStatus> {
-  auto wfile = utf8_to_wstring(file);
+  // Extended API path: pseudo-devices and >MAX_PATH operands (#1061).
+  const auto operand = native_path::make_api_path_operand(file);
   HANDLE handle =
-      CreateFileW(wfile.c_str(), FILE_READ_ATTRIBUTES,
+      CreateFileW(operand.extended.c_str(), FILE_READ_ATTRIBUTES,
                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                   nullptr, OPEN_EXISTING, 0, nullptr);
   if (handle == INVALID_HANDLE_VALUE) return std::nullopt;
@@ -1086,6 +1087,13 @@ REGISTER_COMMAND(
 
     if (file == "-") {
       emit_header();
+      // [GNU] A closed standard input (<&-) is an error, not EOF (#973).
+      if (file_io::stdin_is_bad()) {
+        safeErrorPrint(
+            "tail: cannot fstat 'standard input': Bad file descriptor\n");
+        any_error = true;
+        continue;
+      }
       config.stdin_mode = true;
       if (config.by_bytes || config.delimiter == '\0') {
         output_tail(std::cin, config);

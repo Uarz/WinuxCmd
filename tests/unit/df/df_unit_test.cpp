@@ -470,3 +470,17 @@ TEST(df, df_block_size_env_falls_through_to_blocksize) {
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_NE(r.stdout_text.find("512B-blocks"), std::string::npos);
 }
+
+// [GNU] -F is an obsolete hidden synonym for -t/--type (issue #1078).
+TEST(df, df_obsolete_F_synonym_for_type) {
+  Pipeline pf;
+  pf.add(L"df.exe", {L"-F", L"NTFS"});
+  Pipeline pt;
+  pt.add(L"df.exe", {L"-t", L"NTFS"});
+
+  auto rf = pf.run();
+  auto rt = pt.run();
+  EXPECT_EQ(rf.exit_code, 0);
+  EXPECT_EQ(rt.exit_code, 0);
+  EXPECT_EQ(rf.stdout_text.empty(), rt.stdout_text.empty());
+}

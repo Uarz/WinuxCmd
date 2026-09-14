@@ -220,3 +220,17 @@ TEST(rmdir, rmdir_file_with_trailing_separator_reports_not_directory) {
                  "rmdir: failed to remove 'file.txt/': Not a directory\n");
   EXPECT_TRUE(std::filesystem::exists(tmp.path / "file.txt"));
 }
+
+// [GNU] --path is a deprecated hidden alias for -p/--parents (issue #1075).
+TEST(rmdir, rmdir_deprecated_path_alias_removes_ancestors) {
+  TempDir tmp;
+  std::filesystem::create_directories(tmp.path / "a" / "b");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"rmdir.exe", {L"--path", L"a/b"});
+
+  auto r = p.run();
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_FALSE(std::filesystem::exists(tmp.path / "a"));
+}

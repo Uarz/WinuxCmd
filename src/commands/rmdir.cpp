@@ -42,6 +42,8 @@ auto constexpr RMDIR_OPTIONS =
     std::array{OPTION("", "--ignore-fail-on-non-empty",
                       "ignore each failure to remove a non-empty directory"),
                OPTION("-p", "--parents", "remove DIRECTORY and its ancestors"),
+               // [GNU] --path: deprecated alias for -p/--parents; hidden
+               OPTION("", "--path", "", BOOL_TYPE),
                OPTION("-v", "--verbose",
                       "output a diagnostic for every directory processed")};
 
@@ -69,11 +71,11 @@ auto parent_path(std::string path) -> std::string {
 auto win32_error_text(DWORD error) -> std::wstring {
   LPWSTR raw = nullptr;
   const DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER |
-                      FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
-  DWORD len =
-      FormatMessageW(flags, nullptr, error,
-                     MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US),
-                     reinterpret_cast<LPWSTR>(&raw), 0, nullptr);
+                      FORMAT_MESSAGE_FROM_SYSTEM |
+                      FORMAT_MESSAGE_IGNORE_INSERTS;
+  DWORD len = FormatMessageW(flags, nullptr, error,
+                             MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US),
+                             reinterpret_cast<LPWSTR>(&raw), 0, nullptr);
   if (len == 0 || raw == nullptr) {
     len = FormatMessageW(flags, nullptr, error,
                          MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
@@ -137,10 +139,9 @@ auto remove_one(const std::string& utf8_path, bool ignore_non_empty,
   // RemoveDirectoryW would silently delete the reparse point itself, so
   // refuse before calling it (uutils#9980, issue 279/1062).
   if (native_path::attributes_are_reparse_point(attrs)) {
-    return report_remove_failure(
-        utf8_path, operand.had_trailing_separator
-                       ? "Symbolic link not followed"
-                       : "Not a directory");
+    return report_remove_failure(utf8_path, operand.had_trailing_separator
+                                                ? "Symbolic link not followed"
+                                                : "Not a directory");
   }
 
   if (RemoveDirectoryW(wpath.c_str())) {
@@ -167,16 +168,15 @@ auto remove_one(const std::string& utf8_path, bool ignore_non_empty,
     return report_remove_failure(utf8_path, "Permission denied");
   }
 
-  return report_remove_failure(utf8_path,
-                               wstring_to_utf8(win32_error_text(e)));
+  return report_remove_failure(utf8_path, wstring_to_utf8(win32_error_text(e)));
 }
 
 auto process_command(const CommandContext<RMDIR_OPTIONS.size()>& ctx)
     -> cp::Result<bool> {
   if (ctx.positionals.empty()) return std::unexpected("missing operand");
 
-  bool parents =
-      ctx.get<bool>("--parents", false) || ctx.get<bool>("-p", false);
+  bool parents = ctx.get<bool>("--parents", false) ||
+                 ctx.get<bool>("-p", false) || ctx.get<bool>("--path", false);
   bool verbose =
       ctx.get<bool>("--verbose", false) || ctx.get<bool>("-v", false);
   bool ignore_non_empty = ctx.get<bool>("--ignore-fail-on-non-empty", false);

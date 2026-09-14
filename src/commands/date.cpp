@@ -96,6 +96,10 @@ auto constexpr DATE_OPTIONS = std::array{
            STRING_TYPE),
     // [DIFFERS]
     OPTION("", "--universal", "alias for --utc"),
+    // [GNU] --uct: deprecated alias for --utc; hidden like GNU
+    OPTION("", "--uct", "", BOOL_TYPE),
+    // [GNU] --rfc-822: deprecated alias for -R/--rfc-email; hidden like GNU
+    OPTION("", "--rfc-822", "", BOOL_TYPE),
     // [GNU] --debug: annotate the parsed date, and warn about dubious usage
     OPTION("", "--debug",
            "annotate the parsed date, and warn about dubious usage to stderr"),
@@ -408,9 +412,9 @@ auto parse_epoch_time(std::string_view s) -> std::optional<FILETIME> {
 }
 
 // [GNU] parse-datetime.y time_zone_table: named fixed-offset zones. Values
-// are minutes EAST of UTC; the daylight (*DT/*ST, tDAYZONE) entries already
-// include the DST hour (standard offset + 60). Single letters are handled
-// by the military table instead, so they are absent here.
+// are minutes EAST of UTC; the *DT/*ST summer entries already include the
+// DST hour (tDAYZONE = standard offset + 60). J is intentionally absent
+// (military table handles it).
 auto named_zone_offset_minutes(std::string_view name) -> std::optional<int> {
   static const std::pair<std::string_view, int> table[] = {
       {"GMT", 0},     {"UT", 0},     {"UTC", 0},     {"WET", 0},
@@ -450,17 +454,16 @@ auto parse_timezone_suffix(std::string &s) -> std::optional<int> {
     size_t end = s.find_last_not_of(' ');
     if (end != std::string::npos) {
       size_t begin = s.find_last_of(' ', end);
-      if (begin != std::string::npos) {
-        std::string_view word =
-            std::string_view(s).substr(begin + 1, end - begin);
-        bool alpha = std::ranges::all_of(word, [](char c) {
-          return std::isalpha(static_cast<unsigned char>(c)) != 0;
-        });
-        if (alpha) {
-          if (auto off = named_zone_offset_minutes(word)) {
-            s = trim_copy(s.substr(0, begin));
-            return *off;
-          }
+      std::string_view word = std::string_view(s).substr(
+          begin == std::string::npos ? 0 : begin + 1,
+          end - (begin == std::string::npos ? 0 : begin + 1) + 1);
+      bool alpha = !word.empty() && std::ranges::all_of(word, [](char c) {
+        return std::isalpha(static_cast<unsigned char>(c)) != 0;
+      });
+      if (alpha && begin != std::string::npos) {
+        if (auto off = named_zone_offset_minutes(word)) {
+          s = trim_copy(s.substr(0, begin));
+          return *off;
         }
       }
     }
@@ -1802,7 +1805,7 @@ auto debug_st_to_filetime(const SYSTEMTIME &st, const DateDebugInfo &dbg,
 // Message shapes follow lib/parse-datetime.y's debugging block
 // (uutils#7342 / WinuxCmd#239).
 auto emit_date_debug(const DateDebugInfo &dbg, const FILETIME &result,
-                     bool use_utc) -> void {
+                     bool use_utc, const std::string &format) -> void {
   auto items = dbg.items;
   std::ranges::sort(
       items, [](const auto &a, const auto &b) { return a.first < b.first; });
@@ -1945,6 +1948,9 @@ auto emit_date_debug(const DateDebugInfo &dbg, const FILETIME &result,
     safeErrorPrintLn("date: final: " + debug_datetime_str(*local_st, false, 0) +
                      " (UTC" + debug_zone_str(local_off * 60) + ")");
   }
+
+  // [GNU] The debug dump ends with the effective output format string.
+  safeErrorPrintLn("date: output format: '" + format + "'");
 }
 
 auto normalize_timespec(std::string spec, bool default_date) -> std::string {
@@ -2094,12 +2100,13 @@ REGISTER_COMMAND(
     return 1;
   }
 
-  // [GNU] --universal: alias for --utc
+  // [GNU] --universal/--uct: aliases for --utc
   bool use_utc = ctx.get<bool>("-u", false) || ctx.get<bool>("--utc", false) ||
-                 ctx.get<bool>("--universal", false);
-  bool rfc2822 = ctx.get<bool>("-R", false) ||
-                 ctx.get<bool>("--rfc-email", false) ||
-                 ctx.get<bool>("--rfc-2822", false);
+                 ctx.get<bool>("--universal", false) ||
+                 ctx.get<bool>("--uct", false);
+  bool rfc2822 =
+      ctx.get<bool>("-R", false) || ctx.get<bool>("--rfc-email", false) ||
+      ctx.get<bool>("--rfc-2822", false) || ctx.get<bool>("--rfc-822", false);
 
   // [GNU] -R/-I/--rfc-3339 all set the output format; a '+' operand may not
   // override them ("multiple output formats specified").
@@ -2199,7 +2206,7 @@ REGISTER_COMMAND(
       safeErrorPrintLn("'");
       return 1;
     }
-    if (debug) emit_date_debug(dbg, *parsed, use_utc);
+    if (debug) emit_date_debug(dbg, *parsed, use_utc, format);
 
     // SetSystemTime expects a UTC SYSTEMTIME; the parsed value is already
     // an absolute UTC FILETIME, so no local-time conversion is needed here.
@@ -2243,7 +2250,7 @@ REGISTER_COMMAND(
       return 1;
     }
     selected_time = *parsed;
-    if (debug) emit_date_debug(dbg, *parsed, use_utc);
+    if (debug) emit_date_debug(dbg, *parsed, use_utc, format);
   } else if (has_resolution) {
     // [GNU] date --resolution prints the available timestamp resolution;
     // FILETIME ticks are 100 ns wide.
@@ -2369,7 +2376,7 @@ REGISTER_COMMAND(
         ok = false;
         continue;
       }
-      if (debug) emit_date_debug(line_dbg, *parsed, use_utc);
+      if (debug) emit_date_debug(line_dbg, *parsed, use_utc, format);
       if (debug) {
         safeErrorPrintLn("date: output format: '" + format + "'");
       }

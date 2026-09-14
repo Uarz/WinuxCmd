@@ -60,7 +60,9 @@ auto constexpr TR_OPTIONS = std::array{
            BOOL_TYPE),
     // [GNU] -t, --truncate-set1
     OPTION("-t", "--truncate-set1", "first truncate SET1 to length of SET2",
-           BOOL_TYPE)};
+           BOOL_TYPE),
+    // [GNU] -A: undocumented historical no-op, accepted and ignored
+    OPTION("-A", "", "", BOOL_TYPE)};
 
 namespace tr_pipeline {
 namespace cp = core::pipeline;

@@ -289,3 +289,14 @@ TEST(tr, tr_delete_carriage_returns_from_binary_stdin) {
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_EQ_TEXT(r.stdout_text, "ab\nc");
 }
+
+// [GNU] -A is an undocumented hidden flag accepted as a no-op (issue #1079).
+TEST(tr, tr_undocumented_A_flag_is_noop) {
+  Pipeline p;
+  p.set_stdin("abc");
+  p.add(L"tr.exe", {L"-A", L"a", L"b"});
+
+  auto r = p.run();
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "bbc");
+}

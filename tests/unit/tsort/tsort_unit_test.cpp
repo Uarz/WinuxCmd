@@ -59,3 +59,13 @@ TEST(tsort, tsort_empty_input_is_not_an_error) {
   EXPECT_EQ_TEXT(r.stdout_text, "");
   EXPECT_TRUE(r.stderr_text.empty());
 }
+
+// [GNU] -w is accepted and ignored (POSIX.1-2024) (issue #1085).
+TEST(tsort, tsort_w_flag_is_noop) {
+  Pipeline p;
+  p.set_stdin("a b\nb c\n");
+  p.add(L"tsort.exe", {L"-w"});
+  auto r = p.run();
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "a\nb\nc\n");
+}

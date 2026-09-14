@@ -9,8 +9,9 @@ import utils;
 import container;
 
 auto constexpr TSORT_OPTIONS =
-    // [GNU] option
-    std::array{OPTION("", "", "topological sort", STRING_TYPE)};
+    std::array{OPTION("", "", "topological sort", STRING_TYPE),
+               // [GNU] -w: accepted and ignored (POSIX.1-2024); hidden
+               OPTION("-w", "", "", BOOL_TYPE)};
 
 REGISTER_COMMAND(tsort,
                  /* cmd_name */ "tsort",

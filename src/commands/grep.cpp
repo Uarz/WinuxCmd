@@ -164,6 +164,8 @@ auto constexpr GREP_OPTIONS = std::array{
     OPTION("-P", "--perl-regexp", "PATTERNS are Perl regular expressions"),
     OPTION("-e", "--regexp", "use PATTERNS for matching", STRING_TYPE),
     OPTION("-f", "--file", "take PATTERNS from FILE", STRING_TYPE),
+    // [GNU] -y: obsolete synonym for -i; hidden like GNU
+    OPTION("-y", "", "", BOOL_TYPE),
     OPTION("-i", "--ignore-case",
            "ignore case distinctions in patterns and data"),
     OPTION("", "--no-ignore-case", "do not ignore case distinctions (default)"),
@@ -979,7 +981,8 @@ auto build_config(const CommandContext<GREP_OPTIONS.size()>& ctx,
       cfg.mode = PatternMode::PerlRegex;
       continue;
     }
-    if (option_matches(meta, "-i", "--ignore-case")) {
+    if (option_matches(meta, "-i", "--ignore-case") ||
+        option_matches(meta, "-y", "")) {
       cfg.ignore_case = true;
       continue;
     }

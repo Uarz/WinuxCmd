@@ -465,3 +465,30 @@ TEST(date, date_case_flags_dangling_percent) {
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_EQ(r.stdout_text, "%^|100%|1|1\n");
 }
+
+// [GNU] --uct and --rfc-822 are deprecated hidden aliases accepted for
+// back-compat: --uct == --utc, --rfc-822 == -R/--rfc-email (issue #1073).
+TEST(date, date_deprecated_uct_and_rfc822_aliases) {
+  TempDir tmp;
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"date.exe", {L"--uct", L"--date", L"@0", L"+%s"});
+
+  auto r = p.run();
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "0\n");
+
+  Pipeline p2;
+  p2.set_cwd(tmp.wpath());
+  p2.add(L"date.exe", {L"--rfc-822", L"--date", L"@0"});
+
+  Pipeline p3;
+  p3.set_cwd(tmp.wpath());
+  p3.add(L"date.exe", {L"-R", L"--date", L"@0"});
+
+  auto r2 = p2.run();
+  auto r3 = p3.run();
+  EXPECT_EQ(r2.exit_code, 0);
+  EXPECT_EQ_TEXT(r2.stdout_text, r3.stdout_text);
+}

@@ -77,6 +77,8 @@ auto constexpr DF_OPTIONS = std::array{
     OPTION("-T", "--print-type", "print file system type"),
     OPTION("-t", "--type", "limit listing to file systems of type TYPE",
            STRING_TYPE),
+    // [GNU] -F: obsolete Solaris synonym for -t/--type; hidden
+    OPTION("-F", "", "", STRING_TYPE),
     OPTION("-x", "--exclude-type",
            "limit listing to file systems not of type TYPE", STRING_TYPE),
     OPTION("", "--total", "produce a grand total"),
@@ -950,6 +952,7 @@ auto print_disk_usage(const CommandContext<DF_OPTIONS.size()>& ctx)
       !all_fs;
   std::string include_type = ctx.get<std::string>("--type", "");
   if (include_type.empty()) include_type = ctx.get<std::string>("-t", "");
+  if (include_type.empty()) include_type = ctx.get<std::string>("-F", "");
   std::string exclude_type = ctx.get<std::string>("--exclude-type", "");
   if (exclude_type.empty()) exclude_type = ctx.get<std::string>("-x", "");
 

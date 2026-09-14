@@ -1822,13 +1822,14 @@ auto print_tab_aligned_padding(size_t current_column, size_t target_column,
     tab_size = ls_constants::DEFAULT_TAB_SIZE;
   }
 
+  // [GNU] indent(): use a TAB instead of two or more spaces, but
+  // only when the tab lands strictly inside the pad run
+  // (to / tabsize > (from + 1) / tabsize in ls.c).
+  const auto ts = static_cast<size_t>(tab_size);
   while (current_column < target_column) {
-    size_t next_tab_stop =
-        ((current_column / static_cast<size_t>(tab_size)) + 1) *
-        static_cast<size_t>(tab_size);
-    if (next_tab_stop <= target_column && next_tab_stop > current_column) {
+    if (target_column / ts > (current_column + 1) / ts) {
       safePrint("\t");
-      current_column = next_tab_stop;
+      current_column += ts - current_column % ts;
       continue;
     }
 

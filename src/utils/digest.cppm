@@ -40,7 +40,16 @@ import :native_path;
 
 export namespace portable_digest {
 
-enum class HashAlgorithm { Sha224, Sha256, Sha384, Sha512, Blake2b };
+enum class HashAlgorithm {
+  Md5,
+  Sha1,
+  Sha224,
+  Sha256,
+  Sha384,
+  Sha512,
+  Blake2b,
+  Sm3
+};
 
 struct PosixCksumResult {
   uint32_t checksum = 0;
@@ -99,6 +108,24 @@ WINUXCMD_DIGEST_FORCEINLINE auto load_be32(const uint8_t* p) -> uint32_t {
   return (static_cast<uint32_t>(p[0]) << 24) |
          (static_cast<uint32_t>(p[1]) << 16) |
          (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+}
+
+WINUXCMD_DIGEST_FORCEINLINE auto load_le32(const uint8_t* p) -> uint32_t {
+  return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+         (static_cast<uint32_t>(p[2]) << 16) |
+         (static_cast<uint32_t>(p[3]) << 24);
+}
+
+WINUXCMD_DIGEST_FORCEINLINE auto store_le32(uint8_t* p, uint32_t v) -> void {
+  p[0] = static_cast<uint8_t>(v);
+  p[1] = static_cast<uint8_t>(v >> 8);
+  p[2] = static_cast<uint8_t>(v >> 16);
+  p[3] = static_cast<uint8_t>(v >> 24);
+}
+
+WINUXCMD_DIGEST_FORCEINLINE auto rotl32(uint32_t value, unsigned bits)
+    -> uint32_t {
+  return (value << bits) | (value >> (32 - bits));
 }
 
 WINUXCMD_DIGEST_FORCEINLINE auto load_be64(const uint8_t* p) -> uint64_t {
@@ -591,6 +618,338 @@ class Blake2b {
   size_t buffered_ = 0;
   size_t out_bytes_ = 64;
 };
+
+class Md5 {
+ public:
+  Md5() = default;
+
+  auto update(std::span<const uint8_t> input) -> void {
+    total_bytes_ += input.size();
+    if (buffered_ != 0) {
+      size_t take = std::min(input.size(), block_.size() - buffered_);
+      std::copy_n(input.data(), take, block_.data() + buffered_);
+      buffered_ += take;
+      input = input.subspan(take);
+      if (buffered_ == block_.size()) {
+        compress(block_.data());
+        buffered_ = 0;
+      }
+    }
+
+    while (input.size() >= block_.size()) {
+      compress(input.data());
+      input = input.subspan(block_.size());
+    }
+
+    if (!input.empty()) {
+      std::copy_n(input.data(), input.size(), block_.data());
+      buffered_ = input.size();
+    }
+  }
+
+  auto final() -> std::vector<uint8_t> {
+    uint64_t bit_len = total_bytes_ * 8;
+    block_[buffered_++] = 0x80;
+    if (buffered_ > 56) {
+      std::fill(block_.begin() + buffered_, block_.end(), 0);
+      compress(block_.data());
+      buffered_ = 0;
+    }
+    std::fill(block_.begin() + buffered_, block_.begin() + 56, 0);
+    store_le64(block_.data() + 56, bit_len);
+    compress(block_.data());
+
+    std::array<uint8_t, 16> out{};
+    for (size_t i = 0; i < state_.size(); ++i) {
+      store_le32(out.data() + i * 4, state_[i]);
+    }
+    return {out.begin(), out.end()};
+  }
+
+ private:
+  static auto round_constants() -> const std::array<uint32_t, 64>& {
+    static const auto table = [] {
+      std::array<uint32_t, 64> generated{};
+      for (size_t i = 0; i < generated.size(); ++i) {
+        generated[i] = static_cast<uint32_t>(
+            std::fabs(std::sin(static_cast<double>(i) + 1.0)) * 4294967296.0);
+      }
+      return generated;
+    }();
+    return table;
+  }
+
+  auto compress(const uint8_t* block) -> void {
+    static constexpr std::array<uint8_t, 64> shifts{
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9,  14, 20, 5, 9,  14, 20, 5, 9,  14, 20, 5, 9,  14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
+
+    std::array<uint32_t, 16> m{};
+    for (size_t i = 0; i < m.size(); ++i) {
+      m[i] = load_le32(block + i * 4);
+    }
+
+    uint32_t a = state_[0];
+    uint32_t b = state_[1];
+    uint32_t c = state_[2];
+    uint32_t d = state_[3];
+
+    const auto& k = round_constants();
+    for (size_t i = 0; i < 64; ++i) {
+      uint32_t f;
+      size_t g;
+      if (i < 16) {
+        f = (b & c) | (~b & d);
+        g = i;
+      } else if (i < 32) {
+        f = (d & b) | (~d & c);
+        g = (5 * i + 1) % 16;
+      } else if (i < 48) {
+        f = b ^ c ^ d;
+        g = (3 * i + 5) % 16;
+      } else {
+        f = c ^ (b | ~d);
+        g = (7 * i) % 16;
+      }
+      uint32_t tmp = d;
+      d = c;
+      c = b;
+      b = b + rotl32(a + f + k[i] + m[g], shifts[i]);
+      a = tmp;
+    }
+
+    state_[0] += a;
+    state_[1] += b;
+    state_[2] += c;
+    state_[3] += d;
+  }
+
+  std::array<uint32_t, 4> state_{0x67452301U, 0xefcdab89U, 0x98badcfeU,
+                                 0x10325476U};
+  std::array<uint8_t, 64> block_{};
+  size_t buffered_ = 0;
+  uint64_t total_bytes_ = 0;
+};
+
+class Sha1 {
+ public:
+  Sha1() = default;
+
+  auto update(std::span<const uint8_t> input) -> void {
+    total_bytes_ += input.size();
+    if (buffered_ != 0) {
+      size_t take = std::min(input.size(), block_.size() - buffered_);
+      std::copy_n(input.data(), take, block_.data() + buffered_);
+      buffered_ += take;
+      input = input.subspan(take);
+      if (buffered_ == block_.size()) {
+        compress(block_.data());
+        buffered_ = 0;
+      }
+    }
+
+    while (input.size() >= block_.size()) {
+      compress(input.data());
+      input = input.subspan(block_.size());
+    }
+
+    if (!input.empty()) {
+      std::copy_n(input.data(), input.size(), block_.data());
+      buffered_ = input.size();
+    }
+  }
+
+  auto final() -> std::vector<uint8_t> {
+    uint64_t bit_len = total_bytes_ * 8;
+    block_[buffered_++] = 0x80;
+    if (buffered_ > 56) {
+      std::fill(block_.begin() + buffered_, block_.end(), 0);
+      compress(block_.data());
+      buffered_ = 0;
+    }
+    std::fill(block_.begin() + buffered_, block_.begin() + 56, 0);
+    store_be64(block_.data() + 56, bit_len);
+    compress(block_.data());
+
+    std::array<uint8_t, 20> out{};
+    for (size_t i = 0; i < state_.size(); ++i) {
+      store_be32(out.data() + i * 4, state_[i]);
+    }
+    return {out.begin(), out.end()};
+  }
+
+ private:
+  auto compress(const uint8_t* block) -> void {
+    std::array<uint32_t, 80> w{};
+    for (size_t i = 0; i < 16; ++i) {
+      w[i] = load_be32(block + i * 4);
+    }
+    for (size_t i = 16; i < 80; ++i) {
+      w[i] = rotl32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    }
+
+    uint32_t a = state_[0];
+    uint32_t b = state_[1];
+    uint32_t c = state_[2];
+    uint32_t d = state_[3];
+    uint32_t e = state_[4];
+
+    for (size_t i = 0; i < 80; ++i) {
+      uint32_t f;
+      uint32_t k;
+      if (i < 20) {
+        f = (b & c) | (~b & d);
+        k = 0x5a827999U;
+      } else if (i < 40) {
+        f = b ^ c ^ d;
+        k = 0x6ed9eba1U;
+      } else if (i < 60) {
+        f = (b & c) | (b & d) | (c & d);
+        k = 0x8f1bbcdcU;
+      } else {
+        f = b ^ c ^ d;
+        k = 0xca62c1d6U;
+      }
+      uint32_t tmp = rotl32(a, 5) + f + e + k + w[i];
+      e = d;
+      d = c;
+      c = rotl32(b, 30);
+      b = a;
+      a = tmp;
+    }
+
+    state_[0] += a;
+    state_[1] += b;
+    state_[2] += c;
+    state_[3] += d;
+    state_[4] += e;
+  }
+
+  std::array<uint32_t, 5> state_{0x67452301U, 0xefcdab89U, 0x98badcfeU,
+                                 0x10325476U, 0xc3d2e1f0U};
+  std::array<uint8_t, 64> block_{};
+  size_t buffered_ = 0;
+  uint64_t total_bytes_ = 0;
+};
+
+// SM3 (GB/T 32905-2016), as used by GNU cksum -a sm3.
+class Sm3 {
+ public:
+  Sm3() = default;
+
+  auto update(std::span<const uint8_t> input) -> void {
+    total_bytes_ += input.size();
+    if (buffered_ != 0) {
+      size_t take = std::min(input.size(), block_.size() - buffered_);
+      std::copy_n(input.data(), take, block_.data() + buffered_);
+      buffered_ += take;
+      input = input.subspan(take);
+      if (buffered_ == block_.size()) {
+        compress(block_.data());
+        buffered_ = 0;
+      }
+    }
+
+    while (input.size() >= block_.size()) {
+      compress(input.data());
+      input = input.subspan(block_.size());
+    }
+
+    if (!input.empty()) {
+      std::copy_n(input.data(), input.size(), block_.data());
+      buffered_ = input.size();
+    }
+  }
+
+  auto final() -> std::vector<uint8_t> {
+    uint64_t bit_len = total_bytes_ * 8;
+    block_[buffered_++] = 0x80;
+    if (buffered_ > 56) {
+      std::fill(block_.begin() + buffered_, block_.end(), 0);
+      compress(block_.data());
+      buffered_ = 0;
+    }
+    std::fill(block_.begin() + buffered_, block_.begin() + 56, 0);
+    store_be64(block_.data() + 56, bit_len);
+    compress(block_.data());
+
+    std::array<uint8_t, 32> out{};
+    for (size_t i = 0; i < state_.size(); ++i) {
+      store_be32(out.data() + i * 4, state_[i]);
+    }
+    return {out.begin(), out.end()};
+  }
+
+ private:
+  static auto p0(uint32_t x) -> uint32_t {
+    return x ^ rotl32(x, 9) ^ rotl32(x, 17);
+  }
+  static auto p1(uint32_t x) -> uint32_t {
+    return x ^ rotl32(x, 15) ^ rotl32(x, 23);
+  }
+
+  auto compress(const uint8_t* block) -> void {
+    std::array<uint32_t, 68> w{};
+    std::array<uint32_t, 64> w1{};
+    for (size_t i = 0; i < 16; ++i) {
+      w[i] = load_be32(block + i * 4);
+    }
+    for (size_t j = 16; j < 68; ++j) {
+      w[j] = p1(w[j - 16] ^ w[j - 9] ^ rotl32(w[j - 3], 15)) ^
+             rotl32(w[j - 13], 7) ^ w[j - 6];
+    }
+    for (size_t j = 0; j < 64; ++j) {
+      w1[j] = w[j] ^ w[j + 4];
+    }
+
+    uint32_t a = state_[0];
+    uint32_t b = state_[1];
+    uint32_t c = state_[2];
+    uint32_t d = state_[3];
+    uint32_t e = state_[4];
+    uint32_t f = state_[5];
+    uint32_t g = state_[6];
+    uint32_t h = state_[7];
+
+    for (size_t j = 0; j < 64; ++j) {
+      const uint32_t tj = j < 16 ? 0x79cc4519U : 0x7a879d8aU;
+      const uint32_t ss1 = rotl32(
+          rotl32(a, 12) + e + rotl32(tj, static_cast<unsigned>(j % 32)), 7);
+      const uint32_t ss2 = ss1 ^ rotl32(a, 12);
+      const uint32_t ff = j < 16 ? (a ^ b ^ c) : ((a & b) | (a & c) | (b & c));
+      const uint32_t gg = j < 16 ? (e ^ f ^ g) : ((e & f) | (~e & g));
+      const uint32_t tt1 = ff + d + ss2 + w1[j];
+      const uint32_t tt2 = gg + h + ss1 + w[j];
+      d = c;
+      c = rotl32(b, 9);
+      b = a;
+      a = tt1;
+      h = g;
+      g = rotl32(f, 19);
+      f = e;
+      e = p0(tt2);
+    }
+
+    state_[0] ^= a;
+    state_[1] ^= b;
+    state_[2] ^= c;
+    state_[3] ^= d;
+    state_[4] ^= e;
+    state_[5] ^= f;
+    state_[6] ^= g;
+    state_[7] ^= h;
+  }
+
+  std::array<uint32_t, 8> state_{0x7380166fU, 0x4914b2b9U, 0x172442d7U,
+                                 0xda8a0600U, 0xa96f30bcU, 0x163138aaU,
+                                 0xe38dee4dU, 0xb0fb0e4eU};
+  std::array<uint8_t, 64> block_{};
+  size_t buffered_ = 0;
+  uint64_t total_bytes_ = 0;
+};
+
 template <typename Hasher>
 auto feed_stream(std::istream& in, Hasher& hasher) -> bool {
   std::array<char, 65536> buffer{};
@@ -728,6 +1087,18 @@ auto hash_file_hex(HashAlgorithm algorithm, const std::string& filename,
   }
 
   switch (algorithm) {
+    case HashAlgorithm::Md5: {
+      auto hasher = detail::Md5();
+      return detail::hash_stream_to_hex(*input, hasher);
+    }
+    case HashAlgorithm::Sha1: {
+      auto hasher = detail::Sha1();
+      return detail::hash_stream_to_hex(*input, hasher);
+    }
+    case HashAlgorithm::Sm3: {
+      auto hasher = detail::Sm3();
+      return detail::hash_stream_to_hex(*input, hasher);
+    }
     case HashAlgorithm::Sha224: {
       auto hasher = detail::make_sha224();
       return detail::hash_stream_to_hex(*input, hasher);
@@ -1070,11 +1441,11 @@ auto sum_digest_check(const std::string& program, const std::string& algo_tag,
       std::error_code ec;
       // [GNU] fopen() succeeds on a directory and the first getline() then
       // fails: GNU reports "<file>: read error", not "Is a directory".
-      if (std::filesystem::is_directory(
-              std::filesystem::u8path(checkfile_name), ec) &&
+      if (std::filesystem::is_directory(std::filesystem::u8path(checkfile_name),
+                                        ec) &&
           !ec) {
-        safeErrorPrintLn(program + ": " +
-                         detail::sum_quotef(checkfile_name) + ": read error");
+        safeErrorPrintLn(program + ": " + detail::sum_quotef(checkfile_name) +
+                         ": read error");
       } else {
         safeErrorPrintLn(program + ": " + detail::sum_quotef(checkfile_name) +
                          ": " + detail::sum_open_reason(checkfile_name));

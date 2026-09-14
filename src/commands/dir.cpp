@@ -217,9 +217,11 @@ auto build_dir_command_line(std::span<const std::wstring> args)
 }
 
 auto run(const CommandContext<DIR_OPTIONS.size()>& ctx) -> int {
-  // Build ls arguments with -C (columns) as default
+  // [GNU] dir is equivalent to `ls -C -b': list entries in columns and
+  // quote nongraphic characters with C-style escapes by default.
   std::vector<std::string> ls_arg_storage;
-  ls_arg_storage.push_back("-C");  // Default to columns
+  ls_arg_storage.push_back("-C");
+  ls_arg_storage.push_back("-b");
 
   // Preserve the original argv surface so GNU dir options actually reach ls.
   for (const auto& arg : ctx.raw_args) {

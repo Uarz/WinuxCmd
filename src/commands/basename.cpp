@@ -101,8 +101,10 @@ auto get_basename(std::string_view path, std::string_view suffix)
     result.pop_back();
   }
 
-  // Preserve a single root separator for slash-only roots such as "/",
-  // "//", or "///".
+  // Preserve a root separator for separator-only roots such as "/" or
+  // "///".  [GNU] base_len(): without DOUBLE_SLASH_IS_DISTINCT_ROOT (the
+  // GNU/Linux behavior) a separator-only name collapses to a single
+  // separator, so "//" becomes "/".
   if (result.empty() && !path.empty()) {
     return std::string(1, path.back());
   }

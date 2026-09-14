@@ -1706,7 +1706,7 @@ TEST(ls, ls_horizontal_layout_honors_custom_tabsize) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_EQ_TEXT(r.stdout_text, "aa\t bb  cc\tdd\t ee\n");
+  EXPECT_EQ_TEXT(r.stdout_text, "aa  bb  cc\tdd  ee\n");
 }
 
 TEST(ls, ls_column_layout_honors_custom_tabsize) {
@@ -1724,7 +1724,7 @@ TEST(ls, ls_column_layout_honors_custom_tabsize) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_EQ_TEXT(r.stdout_text, "aa  bb  cc  dd\t ee\n");
+  EXPECT_EQ_TEXT(r.stdout_text, "aa  bb  cc  dd  ee\n");
 }
 
 TEST(ls, ls_horizontal_layout_tabsize_last_occurrence_wins_across_aliases) {
@@ -1742,7 +1742,7 @@ TEST(ls, ls_horizontal_layout_tabsize_last_occurrence_wins_across_aliases) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_EQ_TEXT(r.stdout_text, "aa\t bb  cc\tdd\t ee\n");
+  EXPECT_EQ_TEXT(r.stdout_text, "aa  bb  cc\tdd  ee\n");
 }
 
 TEST(ls, ls_column_layout_tabsize_last_occurrence_wins_across_aliases) {
@@ -1760,7 +1760,7 @@ TEST(ls, ls_column_layout_tabsize_last_occurrence_wins_across_aliases) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_EQ_TEXT(r.stdout_text, "aa  bb  cc  dd\t ee\n");
+  EXPECT_EQ_TEXT(r.stdout_text, "aa  bb  cc  dd  ee\n");
 }
 
 TEST(ls, ls_column_layout_counts_cjk_names_by_display_width) {

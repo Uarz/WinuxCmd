@@ -50,10 +50,8 @@ REGISTER_COMMAND(tsort,
     input.resize(bytesRead);
   }
 
-  if (input.empty()) {
-    safeErrorPrintLn("tsort: missing input");
-    return 1;
-  }
+  // [GNU] Empty input is not an error: tsort simply prints nothing and
+  // exits 0 (e.g. "tsort /dev/null").
 
   // [GNU] tsort reads whitespace-separated pairs; an odd token count is
   // an error (uutils #7077).
@@ -77,9 +75,17 @@ REGISTER_COMMAND(tsort,
   for (size_t i = 0; i + 1 < tokens.size(); i += 2) {
     const std::string& node = tokens[i];
     const std::string& dep = tokens[i + 1];
-    // [GNU] Duplicate pairs are ignored with a warning on stderr.
+    // [GNU] record_relation() ignores a relation whose two members are
+    // identical, so a self-pair like "a a" registers the node but is not a
+    // loop (uutils #8743).
+    if (node == dep) {
+      nodes.insert(node);
+      continue;
+    }
+    // [GNU] Duplicate pairs are recorded silently (each adds a redundant
+    // edge that decrements exactly as often as it was counted); dropping
+    // the extra edge here is equivalent and produces no diagnostic.
     if (!seen_pairs.insert({node, dep}).second) {
-      safeErrorPrintLn("tsort: " + input_name + ": duplicate input pair");
       continue;
     }
     graph[node].push_back(dep);

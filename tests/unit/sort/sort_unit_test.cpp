@@ -347,7 +347,27 @@ TEST(sort, sort_rejects_invalid_batch_size_hint) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 2);
-  EXPECT_TRUE(r.stderr_text.find("invalid batch size") != std::string::npos);
+  EXPECT_TRUE(r.stderr_text.find("invalid --batch-size argument '1'") !=
+              std::string::npos);
+  // [GNU] below-minimum values get a second diagnostic line.
+  EXPECT_TRUE(r.stderr_text.find("minimum --batch-size argument is '2'") !=
+              std::string::npos);
+}
+
+TEST(sort, sort_rejects_batch_size_above_rlimit) {
+  // [GNU] --batch-size may not exceed the open-file budget (RLIMIT_NOFILE-3,
+  // 3197 on the MSYS2/Cygwin GNU build) (uutils #10632).
+  Pipeline p;
+  p.add(L"sort.exe", {L"--batch-size=99999"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 2);
+  EXPECT_TRUE(r.stderr_text.find("--batch-size argument '99999' too large") !=
+              std::string::npos);
+  EXPECT_TRUE(
+      r.stderr_text.find(
+          "maximum --batch-size argument with current rlimit is 3197") !=
+      std::string::npos);
 }
 
 TEST(sort, sort_accepts_compress_program_hint) {

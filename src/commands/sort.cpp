@@ -197,8 +197,9 @@ struct Config {
 auto read_all(std::istream& in) -> std::string { return read_text_stream(in); }
 
 auto describe_input_open_failure(std::string_view path) -> std::string {
-  std::wstring wpath = utf8_to_wstring(std::string(path));
-  DWORD attrs = GetFileAttributesW(wpath.c_str());
+  // Probe through the extended API path so >MAX_PATH operands and DOS
+  // device names resolve like the open itself (#1061).
+  DWORD attrs = native_path::attributes_w(utf8_to_wstring(std::string(path)));
   if (attrs == INVALID_FILE_ATTRIBUTES) {
     return "No such file or directory";
   }
@@ -209,7 +210,14 @@ auto describe_input_open_failure(std::string_view path) -> std::string {
 }
 
 auto read_source(std::string_view path) -> cp::Result<std::string> {
-  if (path == "-") return read_all(std::cin);
+  // [GNU] A closed standard input (<&-) is a stat/read error, not EOF
+  // (#973). GNU reports "sort: stat failed: -: Bad file descriptor".
+  if (path == "-") {
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected("stat failed: -: Bad file descriptor");
+    }
+    return read_all(std::cin);
+  }
 
   auto in = file_io::open_binary_file(path);
   if (!in.is_open()) {
@@ -251,6 +259,9 @@ auto read_simple_lexical_source(std::string_view path)
 
 auto read_binary_source(std::string_view path) -> cp::Result<std::string> {
   if (path == "-") {
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected("stat failed: -: Bad file descriptor");
+    }
     return std::string{std::istreambuf_iterator<char>{std::cin},
                        std::istreambuf_iterator<char>{}};
   }
@@ -269,9 +280,12 @@ auto read_files0_from(const std::string& path)
   std::istream* input = nullptr;
   std::ifstream file;
   if (path == "-") {
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected("stat failed: -: Bad file descriptor");
+    }
     input = &std::cin;
   } else {
-    file.open(path, std::ios::binary);
+    file = file_io::open_binary_file(path);
     if (!file.is_open()) {
       return std::unexpected("cannot open file list '" + path + "'");
     }
@@ -1256,16 +1270,32 @@ auto parse_parallel_hint(std::string_view text) -> bool {
   return value > 0;
 }
 
-auto parse_batch_size_hint(std::string_view text) -> bool {
-  if (text.empty()) return false;
+// [GNU] --batch-size is bounded by the number of files that can be open at
+// once: RLIMIT_NOFILE - 3 (stdin/stdout/stderr). Windows has no rlimit; the
+// MSYS2/Cygwin builds of GNU sort report a 3200 fd budget (OPEN_MAX), so the
+// same cap keeps the diagnostics identical on this platform.
+inline constexpr unsigned int MAX_BATCH_SIZE_HINT = 3200 - 3;
 
-  unsigned int value = 0;
+// Returns an empty string when the hint is valid, otherwise the GNU-style
+// diagnostic to print.
+auto validate_batch_size_hint(std::string_view text) -> std::string {
+  uintmax_t value = 0;
   auto [ptr, ec] =
       std::from_chars(text.data(), text.data() + text.size(), value);
-  if (ec != std::errc() || ptr != text.data() + text.size()) {
-    return false;
+  if (text.empty() || ec != std::errc() || ptr != text.data() + text.size()) {
+    return "invalid --batch-size argument '" + std::string(text) + "'";
   }
-  return value >= 2;
+  if (value < 2) {
+    return "invalid --batch-size argument '" + std::string(text) +
+           "'\nsort: minimum --batch-size argument is '2'";
+  }
+  if (value > MAX_BATCH_SIZE_HINT) {
+    return "--batch-size argument '" + std::string(text) +
+           "' too large\nsort: maximum --batch-size argument with current "
+           "rlimit is " +
+           std::to_string(MAX_BATCH_SIZE_HINT);
+  }
+  return {};
 }
 
 auto validate_compress_program_hint(std::string_view text) -> bool {
@@ -1356,8 +1386,9 @@ auto build_config(const CommandContext<SORT_OPTIONS.size()>& ctx)
                            "'");
   }
 
-  if (ctx.has("--batch-size") && !parse_batch_size_hint(cfg.batch_size_hint)) {
-    return std::unexpected("invalid batch size");
+  if (ctx.has("--batch-size")) {
+    auto batch_error = validate_batch_size_hint(cfg.batch_size_hint);
+    if (!batch_error.empty()) return std::unexpected(batch_error);
   }
 
   if (ctx.has("--compress-program") &&

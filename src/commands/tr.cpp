@@ -71,6 +71,12 @@ auto make_dynamic_error(std::string message) -> cp::Error {
   return storage;
 }
 
+// [GNU] tr.c unquote diagnoses a lone backslash at the end of an operand:
+//   tr: warning: an unescaped backslash at end of string is not portable
+// Set by parse_atomic_token when it consumes a trailing unescaped
+// backslash; reset per operand in parse_set and reported by build_config.
+thread_local bool g_saw_trailing_backslash = false;
+
 // Parse escape sequences
 auto parse_escape_sequence(std::string_view& str) -> char {
   if (str.empty()) return '\\';
@@ -160,7 +166,12 @@ auto parse_atomic_token(std::string_view& str) -> cp::Result<std::string> {
 
   if (str[0] == '\\') {
     str = str.substr(1);
-    if (str.empty()) return std::string("\\");
+    if (str.empty()) {
+      // [GNU] A backslash with nothing left to escape is taken literally
+      // but is diagnosed as non-portable.
+      g_saw_trailing_backslash = true;
+      return std::string("\\");
+    }
     return std::string(1, parse_escape_sequence(str));
   }
 
@@ -303,6 +314,7 @@ struct SetParseResult {
 };
 
 auto parse_set(std::string_view str) -> cp::Result<SetParseResult> {
+  g_saw_trailing_backslash = false;
   SetParseResult out;
   std::string& result = out.chars;
 
@@ -495,7 +507,20 @@ auto build_config(const CommandContext<TR_OPTIONS.size()>& ctx)
     return std::unexpected("extra operand after delete");
   }
 
+  // [GNU] warn for a lone backslash at the end of each SET operand; the
+  // warning is emitted even when a later operand fails to parse.
+  auto warn_trailing_backslash = [] {
+    if (g_saw_trailing_backslash) {
+      g_saw_trailing_backslash = false;
+      safeErrorPrintLn(winux::i18n::format(
+          "command.tr.warn.trailing_backslash",
+          "tr: warning: an unescaped backslash at end of string is not "
+          "portable"));
+    }
+  };
+
   auto set1 = parse_set(ctx.positionals[0]);
+  warn_trailing_backslash();
   if (!set1) return std::unexpected(set1.error());
   if (set1->indefinite_count > 0) {
     return std::unexpected(make_dynamic_error(
@@ -507,6 +532,7 @@ auto build_config(const CommandContext<TR_OPTIONS.size()>& ctx)
   // (translation)
   if (ctx.positionals.size() > 1) {
     auto set2 = parse_set(ctx.positionals[1]);
+    warn_trailing_backslash();
     if (!set2) return std::unexpected(set2.error());
     if (set2->indefinite_count > 1) {
       return std::unexpected(make_dynamic_error(

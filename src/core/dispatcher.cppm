@@ -777,9 +777,68 @@ auto rewrite_echo_posix_args(std::string_view cmdName,
   return rewritten;
 }
 
+// [GNU] echo.c never uses getopt: it scans leading arguments made solely
+// of 'e', 'E', 'n' characters and stops option processing at the first
+// argument outside that set, echoing it as data along with the rest of the
+// line (just_echo). "--" is not an option terminator for GNU echo, so
+// `echo -- --` prints "-- --" and `echo --help x` prints "--help x".
+// The WinuxCmd -u/--upper and -r/--repeat extensions keep working by
+// counting them as option arguments during the scan.
+auto rewrite_echo_gnu_args(std::span<std::string_view> args)
+    -> std::optional<std::vector<std::string>> {
+  // [GNU] --help/--version are honored only as the sole argument.
+  if (args.size() == 1 && (args[0] == "--help" || args[0] == "--version")) {
+    return std::nullopt;
+  }
+
+  auto is_nEe_option = [](std::string_view arg) {
+    return arg.size() > 1 && arg[0] == '-' && arg[1] != '-' &&
+           std::ranges::all_of(arg.substr(1), [](char c) {
+             return c == 'n' || c == 'e' || c == 'E';
+           });
+  };
+
+  size_t options_end = 0;
+  while (options_end < args.size()) {
+    const std::string_view arg = args[options_end];
+    if (is_nEe_option(arg) || arg == "-u" || arg == "--upper" ||
+        arg.starts_with("--repeat=") ||
+        (arg.size() > 2 && arg.starts_with("-r"))) {
+      ++options_end;
+      continue;
+    }
+    if (arg == "-r" || arg == "--repeat") {
+      // The repeat count occupies the next argument; keep them together.
+      options_end += 2;
+      continue;
+    }
+    break;
+  }
+
+  if (options_end >= args.size()) {
+    return std::nullopt;
+  }
+
+  // Everything from options_end on is literal data; guard it behind a "--"
+  // terminator so the generic parser keeps "--" and "-x" as positionals.
+  std::vector<std::string> rewritten;
+  rewritten.reserve(args.size() + 1);
+  for (size_t i = 0; i < options_end; ++i) {
+    rewritten.emplace_back(args[i]);
+  }
+  rewritten.emplace_back("--");
+  for (size_t i = options_end; i < args.size(); ++i) {
+    rewritten.emplace_back(args[i]);
+  }
+  return rewritten;
+}
+
 auto rewrite_echo_args(std::span<std::string_view> args)
     -> std::optional<std::vector<std::string>> {
-  return rewrite_echo_posix_args("echo", args);
+  if (echo_posixly_correct_literal_mode("echo", args)) {
+    return rewrite_echo_posix_args("echo", args);
+  }
+  return rewrite_echo_gnu_args(args);
 }
 
 auto echo_standard_interception_enabled(std::span<std::string_view> args)
@@ -1026,10 +1085,15 @@ class RegistryImpl {
       }
     }
 
-    // Check if it contains help
+    // Check if it contains help. [GNU] "--" ends option processing, so a
+    // "--help" after it is data (e.g. `echo -- --help` must print
+    // "--help", not show help) — same rule wants_standard_version uses.
     bool wants_help = false;
     if (behavior.standard_interception_enabled(args)) {
       for (const auto &arg : effective_args) {
+        if (arg == "--") {
+          break;
+        }
         if (arg == "--help") {
           wants_help = true;
           break;

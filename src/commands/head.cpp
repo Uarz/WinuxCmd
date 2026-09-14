@@ -184,8 +184,15 @@ auto parse_numeric_with_suffix(std::string_view text)
 
 auto parse_count_spec(std::string spec_text, std::string_view opt_name)
     -> cp::Result<CountSpec> {
+  // [GNU] invalid-number diagnostics quote the offending operand:
+  //   head: invalid number of lines: 'bogus'
+  const std::string original = spec_text;
+  auto invalid = [&]() {
+    return std::unexpected("invalid number of " + std::string(opt_name) +
+                           ": '" + original + "'");
+  };
   if (spec_text.empty()) {
-    return std::unexpected("invalid number of " + std::string(opt_name));
+    return invalid();
   }
 
   CountSpec spec;
@@ -193,19 +200,19 @@ auto parse_count_spec(std::string spec_text, std::string_view opt_name)
     spec.all_but_last = true;
     spec_text = spec_text.substr(1);  // Avoid modifying original string
     if (spec_text.empty()) {
-      return std::unexpected("invalid number of " + std::string(opt_name));
+      return invalid();
     }
   } else if (spec_text[0] == '+') {
     spec.plus_form = true;
     spec_text = spec_text.substr(1);
     if (spec_text.empty()) {
-      return std::unexpected("invalid number of " + std::string(opt_name));
+      return invalid();
     }
   }
 
   auto parsed = parse_numeric_with_suffix(spec_text);
   if (!parsed.has_value()) {
-    return std::unexpected("invalid number of " + std::string(opt_name));
+    return invalid();
   }
   spec.value = *parsed;
   return spec;
@@ -595,6 +602,13 @@ REGISTER_COMMAND(
 
     if (file == "-") {
       emit_header();
+      // [GNU] A closed standard input (<&-) is a read error, not EOF (#973).
+      if (file_io::stdin_is_bad()) {
+        safeErrorPrint(
+            "head: error reading 'standard input': Bad file descriptor\n");
+        any_error = true;
+        continue;
+      }
       // stdin may be a live pipe.  Do not decode the whole stream before
       // applying the head limit: an unbounded producer such as `yes` must be
       // able to stop once the requested records have been emitted.

@@ -165,6 +165,24 @@ auto build_config(const CommandContext<PTX_OPTIONS.size()>& ctx)
   cfg.sentence_regexp = option_value(ctx, "--sentence-regexp", "-S");
   cfg.word_regexp = option_value(ctx, "--word-regexp", "-W");
   cfg.break_file = option_value(ctx, "--break-file", "-b");
+
+  // [GNU] the -S/-W operands are compiled as regular expressions; an invalid
+  // one is a fatal "Invalid regular expression (for regexp 'X')" error before
+  // any file is read (ptx.c compile_regex, uutils #12790).
+  {
+    auto flags = std::regex_constants::basic;
+    if (cfg.ignore_case) flags |= std::regex_constants::icase;
+    for (const auto* pattern : {&cfg.sentence_regexp, &cfg.word_regexp}) {
+      if (pattern->empty()) continue;
+      try {
+        std::regex compiled(*pattern, flags);
+        (void)compiled;
+      } catch (const std::regex_error&) {
+        return std::unexpected(make_error(
+            "Invalid regular expression (for regexp '" + *pattern + "')"));
+      }
+    }
+  }
   cfg.ignore_file = option_value(ctx, "--ignore-file", "-i");
   cfg.only_file = option_value(ctx, "--only-file", "-o");
 
@@ -305,8 +323,16 @@ auto load_sources(const Config& cfg) -> cp::Result<std::vector<SourceText>> {
     auto data = read_all(file);
     if (!data) {
       std::string q(1, static_cast<char>(39));
-      return std::unexpected(
-          make_error("cannot open " + q + file + q + " for reading"));
+      // [GNU] cannot-open diagnostics carry the errno text; directories
+      // are reported GNU-style ("<path>: Is a directory").
+      auto operand = native_path::make_api_path_operand(file);
+      const DWORD attrs = native_path::operand_target_attributes_w(operand);
+      if (native_path::attributes_are_directory(attrs)) {
+        return std::unexpected(make_error(file + ": Is a directory"));
+      }
+      return std::unexpected(make_error("cannot open " + q + file + q +
+                                      " for reading: No such file or "
+                                      "directory"));
     }
     SourceText source;
     source.name = file == "-" ? "" : file;

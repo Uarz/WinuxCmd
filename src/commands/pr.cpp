@@ -464,8 +464,15 @@ auto read_lines(const std::string& filename)
   } else {
     auto f = file_io::open_binary_file(filename);
     if (!f) {
+      // [GNU] cannot-open diagnostics carry the errno text; directories
+      // are reported GNU-style ("<path>: Is a directory").
+      auto operand = native_path::make_api_path_operand(filename);
+      const DWORD attrs = native_path::operand_target_attributes_w(operand);
+      if (native_path::attributes_are_directory(attrs)) {
+        return std::unexpected(filename + ": Is a directory");
+      }
       return std::unexpected(std::string("cannot open '") + filename +
-                             "' for reading");
+                             "' for reading: No such file or directory");
     }
 
     std::string line;
@@ -596,9 +603,36 @@ auto now_local_st() -> SYSTEMTIME {
   return st;
 }
 
+// [GNU] init_header uses the file's last-modified time as the header date
+// for regular files and the current time for standard input.
+auto file_header_time(const std::string& filename) -> SYSTEMTIME {
+  if (filename != "-") {
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (GetFileAttributesExW(utf8_to_wstring(filename).c_str(),
+                             GetFileExInfoStandard, &data)) {
+      ULARGE_INTEGER uli{};
+      uli.LowPart = data.ftLastWriteTime.dwLowDateTime;
+      uli.HighPart = data.ftLastWriteTime.dwHighDateTime;
+      const time_t t =
+          static_cast<time_t>(uli.QuadPart / 10000000ULL) - 11644473600LL;
+      struct tm tmv{};
+      if (localtime_s(&tmv, &t) == 0) {
+        SYSTEMTIME st{};
+        st.wYear = static_cast<WORD>(tmv.tm_year + 1900);
+        st.wMonth = static_cast<WORD>(tmv.tm_mon + 1);
+        st.wDay = static_cast<WORD>(tmv.tm_mday);
+        st.wHour = static_cast<WORD>(tmv.tm_hour);
+        st.wMinute = static_cast<WORD>(tmv.tm_min);
+        return st;
+      }
+    }
+  }
+  return now_local_st();
+}
+
 // Format a date header
-auto format_date_header(const std::string& date_format) -> std::string {
-  SYSTEMTIME st = now_local_st();
+auto format_date_header(const std::string& date_format, const SYSTEMTIME& st)
+    -> std::string {
   char buf[64];
   if (date_format.empty()) {
     // GNU pr's default header uses an ISO-like local timestamp.
@@ -620,10 +654,10 @@ auto get_separator(const Config& cfg) -> std::string {
 
 // Print page header
 auto print_page_header(const Config& cfg, int page_num,
-                       const std::string& filename) -> void {
+                       const std::string& filename, const std::string& date_str)
+    -> void {
   if (cfg.omit_header || cfg.omit_pagination) return;
 
-  std::string date_str = format_date_header(cfg.date_format);
   std::string header_text = cfg.header.empty() ? filename : cfg.header;
 
   // Build header line: date  header  page
@@ -673,27 +707,12 @@ auto print_page_trailer(const Config& cfg) -> void {
   }
 }
 
-auto run(const Config& cfg) -> int {
-  SmallVector<std::string, 64> files = cfg.files;
-  if (files.empty()) {
-    files.push_back("-");
-  }
-
-  // Read all files
-  SmallVector<std::string, 1024> all_lines;
-  for (const auto& file : files) {
-    auto lines_result = read_lines(file);
-    if (!lines_result) {
-      if (!cfg.no_file_warnings) {
-        cp::report_error(lines_result, L"pr");
-      }
-      continue;
-    }
-    for (const auto& line : *lines_result) {
-      all_lines.push_back(line);
-    }
-  }
-
+// [GNU] Paginate one file's lines. Every file is printed by a separate
+// print_files(1, &file_names[i]) call in pr.c, so page numbering, line
+// numbering, and the header (which names that file) restart per file.
+auto paginate_file(const Config& cfg, SmallVector<std::string, 1024> all_lines,
+                   const std::string& header_name, const std::string& date_str)
+    -> void {
   // Join lines if requested (-J/--join-lines)
   if (cfg.join_lines && all_lines.size() > 1) {
     SmallVector<std::string, 1024> joined_lines;
@@ -710,42 +729,6 @@ auto run(const Config& cfg) -> int {
     all_lines = std::move(joined_lines);
   }
 
-  // Merge mode: print all files in parallel columns
-  if (cfg.merge) {
-    // Read each file separately for merge mode
-    SmallVector<SmallVector<std::string, 1024>, 16> file_lines;
-    size_t max_lines = 0;
-    for (const auto& file : files) {
-      auto lines_result = read_lines(file);
-      if (!lines_result) {
-        if (!cfg.no_file_warnings) {
-          cp::report_error(lines_result, L"pr");
-        }
-        file_lines.push_back({});
-        continue;
-      }
-      file_lines.push_back(*lines_result);
-      if (lines_result->size() > max_lines) {
-        max_lines = lines_result->size();
-      }
-    }
-
-    std::string sep = get_separator(cfg);
-    std::string indent_str(cfg.indent, ' ');
-
-    for (size_t i = 0; i < max_lines; ++i) {
-      std::string output = indent_str;
-      for (size_t f = 0; f < file_lines.size(); ++f) {
-        if (f > 0) output += sep;
-        if (i < file_lines[f].size()) {
-          output += file_lines[f][i];
-        }
-      }
-      safePrintLn(output);
-    }
-    return 0;
-  }
-
   // Apply start_page: skip lines before the start page
   // [GNU] Paging counts body lines only; the header block is part of the
   // page length. (Savannah #1728)
@@ -753,18 +736,27 @@ auto run(const Config& cfg) -> int {
   const int page_lines_total =
       cfg.omit_header || cfg.omit_pagination ? lines_per_page : cfg.page_length;
 
-  // [GNU] a start page beyond the total page count is reported and nothing
-  // is printed (uutils #13557)
+  // [GNU] a start page beyond the file's page count is reported and the
+  // file is skipped (uutils #13557). pr.c reports this via error(0, ...),
+  // so the exit status is unaffected and later files are still printed.
   if (cfg.start_page > 1) {
     const size_t total_lines = all_lines.size();
-    const int total_pages =
-        static_cast<int>((total_lines + lines_per_page - 1) / lines_per_page);
+    int total_pages;
+    if (cfg.columns > 1) {
+      const size_t rows = (total_lines + cfg.columns - 1) / cfg.columns;
+      total_pages =
+          static_cast<int>((rows + lines_per_page - 1) / lines_per_page);
+    } else {
+      total_pages =
+          static_cast<int>((total_lines + lines_per_page - 1) / lines_per_page);
+    }
+    if (total_pages < 1) total_pages = 1;
     if (cfg.start_page > total_pages) {
       safeErrorPrintLn(winux::i18n::format(
           "command.pr.error.page_exceeds",
           "pr: starting page number {} exceeds page count {}", cfg.start_page,
           total_pages));
-      return 0;
+      return;
     }
   }
 
@@ -792,8 +784,21 @@ auto run(const Config& cfg) -> int {
     }
 
     for (size_t row = 0; row < lines_per_col; ++row) {
-      if (!in_page && started) {
-        print_page_header(cfg, page_num, files.empty() ? "" : files[0]);
+      if (!started) {
+        // Skip rows until we reach start_page
+        ++lines_on_page;
+        if (lines_on_page >= lines_per_page) {
+          lines_on_page = 0;
+          ++page_num;
+          if (page_num >= cfg.start_page) {
+            started = true;
+          }
+        }
+        continue;
+      }
+
+      if (!in_page) {
+        print_page_header(cfg, page_num, header_name, date_str);
         in_page = true;
       }
 
@@ -872,7 +877,7 @@ auto run(const Config& cfg) -> int {
       }
 
       if (!in_page) {
-        print_page_header(cfg, page_num, files.empty() ? "" : files[0]);
+        print_page_header(cfg, page_num, header_name, date_str);
         in_page = true;
       }
 
@@ -944,8 +949,75 @@ auto run(const Config& cfg) -> int {
     }
     print_page_trailer(cfg);
   }
+}
 
-  return 0;
+auto run(const Config& cfg) -> int {
+  SmallVector<std::string, 64> files = cfg.files;
+  if (files.empty()) {
+    files.push_back("-");
+  }
+
+  // [GNU] failed_opens in pr.c: any file that cannot be opened makes the
+  // process exit nonzero, even when -r suppresses the diagnostic.
+  bool all_ok = true;
+
+  // Merge mode: print all files in parallel columns
+  if (cfg.merge) {
+    // Read each file separately for merge mode
+    SmallVector<SmallVector<std::string, 1024>, 16> file_lines;
+    size_t max_lines = 0;
+    for (const auto& file : files) {
+      auto lines_result = read_lines(file);
+      if (!lines_result) {
+        all_ok = false;
+        if (!cfg.no_file_warnings) {
+          cp::report_error(lines_result, L"pr");
+        }
+        file_lines.push_back({});
+        continue;
+      }
+      file_lines.push_back(*lines_result);
+      if (lines_result->size() > max_lines) {
+        max_lines = lines_result->size();
+      }
+    }
+
+    std::string sep = get_separator(cfg);
+    std::string indent_str(cfg.indent, ' ');
+
+    for (size_t i = 0; i < max_lines; ++i) {
+      std::string output = indent_str;
+      for (size_t f = 0; f < file_lines.size(); ++f) {
+        if (f > 0) output += sep;
+        if (i < file_lines[f].size()) {
+          output += file_lines[f][i];
+        }
+      }
+      safePrintLn(output);
+    }
+    return all_ok ? 0 : 1;
+  }
+
+  // [GNU] Without -m each file is paginated independently: it gets its own
+  // header, its own Page 1, and the start-page selection applies per file
+  // (pr.c calls print_files(1, &file_names[i]) per input file).
+  for (const auto& file : files) {
+    auto lines_result = read_lines(file);
+    if (!lines_result) {
+      all_ok = false;
+      if (!cfg.no_file_warnings) {
+        cp::report_error(lines_result, L"pr");
+      }
+      continue;
+    }
+    // [GNU] Standard input uses the current date and an empty header name.
+    const std::string header_name = (file == "-") ? "" : file;
+    const std::string date_str =
+        format_date_header(cfg.date_format, file_header_time(file));
+    paginate_file(cfg, *lines_result, header_name, date_str);
+  }
+
+  return all_ok ? 0 : 1;
 }
 
 }  // namespace pr_pipeline

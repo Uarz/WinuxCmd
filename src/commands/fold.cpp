@@ -46,7 +46,7 @@ using cmd::meta::OptionType;
 auto constexpr FOLD_OPTIONS = std::array{
     // [GNU]
     OPTION("-b", "--bytes", "count bytes rather than columns", BOOL_TYPE),
-    // [EXT] -c/--characters: not in GNU fold, WinuxCmd extension
+    // [GNU] -c/--characters (added in coreutils 9.5)
     OPTION("-c", "--characters", "count characters rather than columns",
            BOOL_TYPE),
     // [GNU]

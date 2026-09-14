@@ -525,6 +525,14 @@ auto run(const Config& cfg) -> int {
     return 1;
   };
 
+  // [GNU] csplit parses the whole pattern list before splitting: a bad
+  // pattern or regexp aborts before any output file is created.
+  struct BoundPattern {
+    std::string text;
+    ParsedPattern pattern;
+    RepeatSpec repeat;
+  };
+  std::vector<BoundPattern> plan;
   for (size_t i = 0; i < cfg.patterns.size(); ++i) {
     std::string pattern_text = cfg.patterns[i];
     auto pattern_result = parse_pattern(pattern_text);
@@ -533,9 +541,23 @@ auto run(const Config& cfg) -> int {
       cp::report_error(error, L"csplit");
       return 1;
     }
-    ParsedPattern pattern = *pattern_result;
+    BoundPattern bound;
+    bound.text = pattern_text;
+    bound.pattern = *pattern_result;
 
-    RepeatSpec repeat;
+    if (bound.pattern.kind == ParsedPattern::Kind::Regex) {
+      auto re = portable_regex::compile(portable_regex::Syntax::Basic,
+                                        bound.pattern.regex_text);
+      if (!re) {
+        std::string message =
+            "'" + pattern_text + "': invalid regular expression";
+        if (!re.error.empty()) message += ": " + re.error;
+        cp::Result<int> error = std::unexpected(message);
+        cp::report_error(error, L"csplit");
+        return 1;
+      }
+    }
+
     if (i + 1 < cfg.patterns.size()) {
       auto repeat_result = parse_repeat(cfg.patterns[i + 1]);
       if (!repeat_result) {
@@ -543,9 +565,16 @@ auto run(const Config& cfg) -> int {
         cp::report_error(error, L"csplit");
         return 1;
       }
-      repeat = *repeat_result;
-      if (repeat.has_repeat) ++i;
+      bound.repeat = *repeat_result;
+      if (bound.repeat.has_repeat) ++i;
     }
+    plan.push_back(std::move(bound));
+  }
+
+  for (const auto& bound : plan) {
+    const std::string& pattern_text = bound.text;
+    const ParsedPattern& pattern = bound.pattern;
+    const RepeatSpec& repeat = bound.repeat;
 
     size_t applications =
         repeat.has_repeat && !repeat.until_exhausted ? repeat.count + 1 : 1;
@@ -554,14 +583,18 @@ auto run(const Config& cfg) -> int {
       auto applied =
           apply_pattern(lines, pattern, pattern_text, current, repeated);
       if (!applied) {
-        // GNU flushes its in-progress output file before dying: line-number
-        // patterns stream lines out as they scan, so everything after the
-        // previous boundary is already written; a regex with a bad offset
-        // keeps the lines buffered, so nothing is flushed.
+        // GNU flushes its in-progress output file before dying:
+        // line-number patterns and regexes with a non-negative offset
+        // stream scanned lines straight into the file, so an out-of-range
+        // error still prints everything read so far; a regex with a
+        // negative offset buffers the scanned lines, leaving the file
+        // empty (size 0) on the same error.
         if (!pattern.skip) {
+          const bool stream_to_file =
+              pattern.kind == ParsedPattern::Kind::LineNumber ||
+              pattern.offset >= 0;
           auto in_progress = writer.materialize_in_progress(
-              Segment{current, lines.size()},
-              pattern.kind == ParsedPattern::Kind::LineNumber);
+              Segment{current, lines.size()}, stream_to_file);
           if (!in_progress) {
             return finish_with_error(in_progress.error());
           }

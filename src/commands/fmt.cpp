@@ -46,13 +46,13 @@ auto constexpr FMT_OPTIONS = std::array{
     // [GNU]
     OPTION("-c", "--crown-margin",
            "preserve indentation of the first two lines", BOOL_TYPE),
-    // [GNU]
+    // [EXT] -m/--preserve-headers: not in GNU fmt
     OPTION("-m", "--preserve-headers",
            "attempt to detect and preserve mail headers", BOOL_TYPE),
     // [GNU]
     OPTION("-p", "--prefix", "reformat only lines beginning with STRING",
            STRING_TYPE),
-    // [GNU]
+    // [EXT] -P/--skip-prefix: not in GNU fmt
     OPTION("-P", "--skip-prefix", "do not reformat lines beginning with STRING",
            STRING_TYPE),
     // [GNU]
@@ -64,10 +64,10 @@ auto constexpr FMT_OPTIONS = std::array{
     // [GNU]
     OPTION("-u", "--uniform-spacing",
            "one space between words, two after sentences", BOOL_TYPE),
-    // [GNU]
+    // [EXT] -x/--exact-prefix: not in GNU fmt
     OPTION("-x", "--exact-prefix", "do not ignore leading whitespace for -p",
            BOOL_TYPE),
-    // [GNU]
+    // [EXT] -X/--exact-skip-prefix: not in GNU fmt
     OPTION("-X", "--exact-skip-prefix",
            "do not ignore leading whitespace for -P", BOOL_TYPE),
     // [GNU]
@@ -90,7 +90,8 @@ struct Config {
   bool uniform_spacing = false;
   int tab_width = 8;
   int width = 75;
-  int goal = 0;  // Will be calculated as 93% of width
+  int goal = 0;  // Calculated as 93.5% of width unless -g is given
+  bool goal_set = false;
   bool width_set = false;
   std::string prefix;
   std::string skip_prefix;
@@ -170,6 +171,7 @@ auto build_config(const CommandContext<FMT_OPTIONS.size()>& ctx)
     auto goal = parse_positive_int(goal_opt, "goal");
     if (!goal) return std::unexpected(goal.error());
     cfg.goal = *goal;
+    cfg.goal_set = true;
     if (!cfg.width_set) {
       cfg.width = cfg.goal + 10;
     }
@@ -321,6 +323,210 @@ auto ends_sentence(std::string_view word) -> bool {
     return c == '.' || c == '?' || c == '!';
   }
   return false;
+}
+
+// [GNU] fmt.c check_punctuation()/get_line() word model. `space` is the
+// number of blank columns following the word in the input; `final` marks
+// sentence-ending words (a [.?!] word at end of line or followed by more
+// than one blank column). The last word of a paragraph is always treated
+// as sentence-final (fmt.c forces period/final at paragraph end).
+struct FmtWord {
+  std::string text;
+  int length = 0;
+  int space = 1;
+  bool paren = false;
+  bool punct = false;
+  bool period = false;
+  bool final = false;
+};
+
+auto fmt_is_open(char c) -> bool {
+  return c == '(' || c == '[' || c == '\'' || c == '`' || c == '"';
+}
+
+auto fmt_is_close(char c) -> bool {
+  return c == ')' || c == ']' || c == '\'' || c == '"';
+}
+
+auto fmt_is_period_char(char c) -> bool {
+  return c == '.' || c == '?' || c == '!';
+}
+
+// [GNU] Display columns of a string, expanding tabs at tab_width stops.
+auto fmt_display_width(std::string_view text, int tab_width) -> int {
+  const int tabw = std::max(tab_width, 1);
+  int width = 0;
+  for (char ch : text) {
+    if (ch == '\t') {
+      width += tabw - (width % tabw);
+    } else {
+      ++width;
+    }
+  }
+  return width;
+}
+
+// [GNU] fmt.c check_punctuation: paren = first char is an opening
+// character; punct = last char is punctuation; period = last non-closing
+// character is [.?!].
+auto fmt_check_punctuation(FmtWord& w) -> void {
+  if (w.text.empty()) return;
+  w.paren = fmt_is_open(w.text.front());
+  w.punct = std::ispunct(static_cast<unsigned char>(w.text.back())) != 0;
+  size_t end = w.text.size();
+  while (end > 1 && fmt_is_close(w.text[end - 1])) --end;
+  w.period = fmt_is_period_char(w.text[end - 1]);
+}
+
+// [GNU] fmt.c get_line/get_space: collect the words of one input line
+// starting at `offset` (used to skip a matched -p prefix), measuring the
+// blank columns after each word in input columns (tabs advance to tab
+// stops). End-of-line spacing is normalized to 1, or 2 after a
+// sentence-final word; -u normalizes all spacing the same way.
+auto collect_fmt_words(std::string_view line, size_t offset,
+                       std::vector<FmtWord>& words, const Config& cfg) -> void {
+  const int tabw = std::max(cfg.tab_width, 1);
+  int col = 0;
+  size_t pos = 0;
+  auto advance = [&] {
+    col = line[pos] == '\t' ? (col / tabw + 1) * tabw : col + 1;
+    ++pos;
+  };
+  while (pos < offset && pos < line.size()) advance();
+  while (pos < line.size()) {
+    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+      advance();
+    }
+    if (pos >= line.size()) break;
+    const size_t word_start = pos;
+    while (pos < line.size() && line[pos] != ' ' && line[pos] != '\t') {
+      advance();
+    }
+    FmtWord w;
+    w.text = std::string(line.substr(word_start, pos - word_start));
+    w.length = static_cast<int>(pos - word_start);
+    const int space_start_col = col;
+    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+      advance();
+    }
+    const bool eol = pos >= line.size();
+    int space = col - space_start_col;
+    fmt_check_punctuation(w);
+    w.final = w.period && (eol || space > 1);
+    if (eol || cfg.uniform_spacing) space = w.final ? 2 : 1;
+    w.space = space;
+    words.push_back(std::move(w));
+  }
+}
+
+// [GNU] fmt.c fmt_paragraph/base_cost/line_cost: dynamic programming over
+// the paragraph suffixes with GNU's exact cost model. Costs are kept in
+// 64-bit because GNU relies on long being at least 64 bits for EQUIV(600).
+auto gnu_wrap_words(std::string& out, const std::vector<FmtWord>& words,
+                    std::string_view first_indent, std::string_view rest_indent,
+                    const Config& cfg) -> void {
+  const size_t n = words.size();
+  if (n == 0) {
+    out.append(first_indent);
+    out.push_back('\n');
+    return;
+  }
+
+  using Cost = long long;
+  const Cost max_cost = std::numeric_limits<Cost>::max();
+  auto equiv = [](Cost v) { return v * v; };
+  auto short_cost = [&](Cost d) { return equiv(d * 10); };
+  auto ragged_cost = [&](Cost d) { return short_cost(d) / 2; };
+  constexpr Cost kLineCost = 70 * 70;
+  constexpr Cost kSentenceBonus = 50 * 50;
+  constexpr Cost kNoBreakCost = 600LL * 600LL;
+  constexpr Cost kParenBonus = 40 * 40;
+  constexpr Cost kPunctBonus = 40 * 40;
+  auto widow_cost = [](Cost len) { return (Cost)200 * 200 / (len + 2); };
+  auto orphan_cost = [](Cost len) { return (Cost)150 * 150 / (len + 2); };
+
+  // [GNU] goal_width defaults to 93.5% of max_width
+  // (max_width * (2 * (100 - LEEWAY) + 1) / 200, LEEWAY = 7).
+  const int goal = cfg.goal_set ? cfg.goal : cfg.width * 187 / 200;
+  const int first_cols = fmt_display_width(first_indent, cfg.tab_width);
+  const int other_cols = fmt_display_width(rest_indent, cfg.tab_width);
+
+  std::vector<Cost> best_cost(n + 1, 0);
+  std::vector<size_t> next_break(n + 1, n);
+  std::vector<int> line_len(n + 1, 0);
+
+  // [GNU] base_cost: constant cost of breaking a line before word i.
+  auto base_cost = [&](size_t i) -> Cost {
+    Cost cost = kLineCost;
+    if (i > 0) {
+      if (words[i - 1].period) {
+        cost += words[i - 1].final ? -kSentenceBonus : kNoBreakCost;
+      } else if (words[i - 1].punct) {
+        cost -= kPunctBonus;
+      } else if (i > 1 && words[i - 2].final) {
+        cost += widow_cost(words[i - 1].length);
+      }
+    }
+    if (words[i].paren) {
+      cost -= kParenBonus;
+    } else if (words[i].final) {
+      cost += orphan_cost(words[i].length);
+    }
+    return cost;
+  };
+
+  // [GNU] line_cost: cost of the line ending just before word w.
+  auto line_cost = [&](size_t w, Cost len) -> Cost {
+    if (w == n) return 0;  // the last line of the paragraph is free
+    Cost cost = short_cost(goal - len);
+    if (next_break[w] != n) {
+      cost += ragged_cost(len - line_len[w]);
+    }
+    return cost;
+  };
+
+  // [GNU] fmt_paragraph: best_cost[start] is the cheapest way to format
+  // the suffix beginning at `start`. GNU coreutils through 9.9 counts the
+  // trailing newline in the line width, so a break is only eligible while
+  // len < max_width; 9.10 changed --width to an inclusive maximum. The
+  // audit oracles (8.32/9.4) use the exclusive bound, matched here.
+  for (size_t s = n; s-- > 0;) {
+    Cost best = max_cost;
+    Cost len = (s == 0 ? first_cols : other_cols) + words[s].length;
+    size_t w = s;
+    while (true) {
+      ++w;
+      const Cost wcost = line_cost(w, len) + best_cost[w];
+      if (wcost < best) {
+        best = wcost;
+        next_break[s] = w;
+        line_len[s] = static_cast<int>(len);
+      }
+      if (w == n) break;
+      len += words[w - 1].space + words[w].length;
+      if (len >= cfg.width) break;
+    }
+    best_cost[s] = best + base_cost(s);
+  }
+
+  // [GNU] put_paragraph/put_line: emit lines through the next_break chain,
+  // preserving each word's input spacing between words on the same line.
+  size_t start = 0;
+  bool first = true;
+  while (start < n) {
+    size_t end = next_break[start];
+    if (end <= start) end = start + 1;  // safety: always progress
+    out.append(first ? first_indent : rest_indent);
+    for (size_t i = start; i < end; ++i) {
+      if (i > start) {
+        out.append(static_cast<size_t>(std::max(words[i - 1].space, 0)), ' ');
+      }
+      out.append(words[i].text);
+    }
+    out.push_back('\n');
+    first = false;
+    start = end;
+  }
 }
 
 auto is_header_name_char(unsigned char ch) -> bool {
@@ -557,49 +763,86 @@ auto format_group(std::span<const Line> group, const Config& cfg,
     }
   }
 
-  std::vector<std::string> words;
-  for (size_t i = 0; i < group.size(); ++i) {
-    std::string_view text = group[i].text;
-    if (!prefix_attachment.empty()) {
-      auto stripped = prefix_match(text, cfg.prefix);
-      text.remove_prefix(stripped.value_or(0));
-    } else if (crown_like) {
-      text.remove_prefix(std::min(leading_blank_count(text), text.size()));
-    } else {
-      auto indent_size = first_indent.size();
-      if (text.substr(0, indent_size) == first_indent) {
-        text.remove_prefix(indent_size);
+  // [EXT] The -P skip-prefix extension keeps the historical wrapping
+  // behaviour; it has no GNU counterpart to compare against.
+  if (!cfg.skip_prefix.empty()) {
+    std::vector<std::string> words;
+    for (size_t i = 0; i < group.size(); ++i) {
+      std::string_view text = group[i].text;
+      if (!prefix_attachment.empty()) {
+        auto stripped = prefix_match(text, cfg.prefix);
+        text.remove_prefix(stripped.value_or(0));
       } else {
-        text.remove_prefix(std::min(leading_blank_count(text), text.size()));
+        auto indent_size = first_indent.size();
+        if (text.substr(0, indent_size) == first_indent) {
+          text.remove_prefix(indent_size);
+        } else {
+          text.remove_prefix(std::min(leading_blank_count(text), text.size()));
+        }
       }
+      collect_words(text, words);
     }
-    collect_words(text, words);
+    append_wrapped_words(out, words, first_indent, rest_indent, cfg,
+                         cfg.preserve_headers || !prefix_attachment.empty(),
+                         true, !crown_like);
+    return out;
   }
 
-  append_wrapped_words(out, words, first_indent, rest_indent, cfg,
-                       cfg.preserve_headers || !prefix_attachment.empty(),
-                       !cfg.skip_prefix.empty(), !crown_like);
+  // [GNU] fmt_paragraph: words keep their input spacing and punctuation
+  // attributes so the DP sees sentence boundaries.
+  std::vector<FmtWord> words;
+  for (size_t i = 0; i < group.size(); ++i) {
+    const size_t offset =
+        prefix_attachment.empty()
+            ? 0
+            : prefix_match(group[i].text, cfg.prefix).value_or(0);
+    collect_fmt_words(group[i].text, offset, words, cfg);
+  }
+  // [GNU] The last word of a paragraph is always sentence-final.
+  if (!words.empty()) {
+    words.back().period = true;
+    words.back().final = true;
+  }
+  gnu_wrap_words(out, words, first_indent, rest_indent, cfg);
   return out;
 }
 
 auto split_only_line(std::string_view line, const Config& cfg,
                      std::string_view prefix_attachment,
                      std::optional<size_t> prefix_strip) -> std::string {
+  std::string out;
   std::string indent(prefix_attachment);
-  std::string text(line);
-  if (prefix_strip) {
-    text.erase(0, *prefix_strip);
-  } else {
-    indent = indentation_of(text);
-    text.erase(0, indent.size());
+
+  // [EXT] The -P skip-prefix extension keeps the historical wrapping
+  // behaviour; it has no GNU counterpart to compare against.
+  if (!cfg.skip_prefix.empty()) {
+    std::string text(line);
+    if (prefix_strip) {
+      text.erase(0, *prefix_strip);
+    } else {
+      indent = indentation_of(text);
+      text.erase(0, indent.size());
+    }
+    std::vector<std::string> words;
+    collect_words(text, words);
+    append_wrapped_words(out, words, indent, indent, cfg,
+                         cfg.preserve_headers || !prefix_attachment.empty(),
+                         true);
+    return out;
   }
 
-  std::vector<std::string> words;
-  collect_words(text, words);
-  std::string out;
-  append_wrapped_words(out, words, indent, indent, cfg,
-                       cfg.preserve_headers || !prefix_attachment.empty(),
-                       !cfg.skip_prefix.empty());
+  // [GNU] -s: each input line is its own paragraph, still formatted by the
+  // same DP (fmt.c get_paragraph reads one line per paragraph).
+  if (!prefix_strip) {
+    indent = indentation_of(line);
+  }
+  std::vector<FmtWord> words;
+  collect_fmt_words(line, prefix_strip.value_or(0), words, cfg);
+  if (!words.empty()) {
+    words.back().period = true;
+    words.back().final = true;
+  }
+  gnu_wrap_words(out, words, indent, indent, cfg);
   return out;
 }
 
@@ -614,13 +857,9 @@ auto format_content(const std::string& content, const Config& cfg)
   auto flush = [&](bool final_flush = false) {
     if (paragraph.empty()) return;
 
-    if (!cfg.prefix.empty() && paragraph.size() == 1 && final_flush) {
-      out += paragraph.front().text;
-      if (paragraph.front().has_newline) out.push_back('\n');
-    } else if (cfg.tagged_paragraph && paragraph.size() > 1 &&
-               cfg.prefix.empty() &&
-               indentation_of(paragraph[0].text) ==
-                   indentation_of(paragraph[1].text)) {
+    if (cfg.tagged_paragraph && paragraph.size() > 1 && cfg.prefix.empty() &&
+        indentation_of(paragraph[0].text) ==
+            indentation_of(paragraph[1].text)) {
       out += format_group(std::span<const Line>(paragraph.data(), 1), cfg, "");
       out += format_group(
           std::span<const Line>(paragraph.data() + 1, paragraph.size() - 1),

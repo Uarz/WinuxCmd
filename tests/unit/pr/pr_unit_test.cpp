@@ -162,15 +162,19 @@ TEST(pr, pr_column_width) {
 }
 
 TEST(pr, pr_expand_tabs) {
+  // GNU: -e takes an optional attached arg (-e[CHAR[WIDTH]]); a separate
+  // "4" operand would be treated as an input file.  A tab after column 5
+  // expands to the next multiple of 4: "hello   world".
   TempDir tmp;
   tmp.write("test.txt", "hello\tworld\n");
 
   Pipeline p;
   p.set_cwd(tmp.wpath());
-  p.add(L"pr.exe", {L"-e", L"4", L"test.txt"});
+  p.add(L"pr.exe", {L"-e4", L"test.txt"});
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
+  EXPECT_NE(r.stdout_text.find("hello   world"), std::string::npos);
 }
 
 TEST(pr, pr_form_feed) {
@@ -183,6 +187,50 @@ TEST(pr, pr_form_feed) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
+}
+
+TEST(pr, pr_multi_file_paginates_independently) {
+  // [GNU] Each file is paginated on its own: its own header name and its
+  // own Page 1..N sequence (pr.c calls print_files per input file).
+  TempDir tmp;
+  tmp.write("a.txt", "a1\na2\n");
+  tmp.write("b.txt", "b1\nb2\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"pr.exe", {L"a.txt", L"b.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  const std::string& out = r.stdout_text;
+  // Two independent page-1 headers.
+  auto first_page = out.find("Page 1");
+  EXPECT_TRUE(first_page != std::string::npos);
+  EXPECT_TRUE(out.find("Page 1", first_page + 1) != std::string::npos);
+  // Each header names its own file.
+  EXPECT_TRUE(out.find("a.txt") != std::string::npos);
+  EXPECT_TRUE(out.find("b.txt") != std::string::npos);
+  // The second file starts a fresh page after the first file's block.
+  EXPECT_TRUE(out.find("a1") < out.find("b.txt"));
+  EXPECT_TRUE(out.find("b.txt") < out.find("b1"));
+  // No Page 2: each file fits on one page.
+  EXPECT_TRUE(out.find("Page 2") == std::string::npos);
+}
+
+TEST(pr, pr_missing_file_fails_but_continues) {
+  // [GNU] A failed open prints a diagnostic and makes pr exit nonzero
+  // (failed_opens), but later files are still printed (pr.c main_exit).
+  TempDir tmp;
+  tmp.write("ok.txt", "content\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"pr.exe", {L"missing.txt", L"ok.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_FALSE(r.stderr_text.empty());
+  EXPECT_TRUE(r.stdout_text.find("content") != std::string::npos);
 }
 
 TEST(pr, pr_newline_mode_trims_trailing_cr_from_crlf_records) {

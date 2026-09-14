@@ -411,6 +411,9 @@ struct OutputConfig {
   bool human = false;
   bool si = false;
   uint64_t block_size = 1024;
+  // Set when a command-line option selected the size mode; environment
+  // block-size variables apply only when no option did (uutils #8916).
+  bool size_explicit = false;
   // Suffix appended to scaled output (set when --block-size used a bare
   // unit suffix such as "M", e.g. "du -BM" prints "1M").
   std::string display_suffix;
@@ -423,15 +426,16 @@ struct DuConfig {
   bool count_all = false;
   bool total = false;
   bool summarize = false;
-  bool dereference = false;      // -L
-  bool apparent_size = false;    // -A / --apparent-size [DIFFERS]
-  bool no_dereference = false;   // -P / --no-dereference [DIFFERS]
-  bool count_links = false;      // -l / --count-links
-  bool one_file_system = false;  // -x
-  bool show_inodes = false;      // --inodes
-  bool null_terminated = false;  // -0
-  bool separate_dirs = false;    // -S
-  bool show_time = false;        // --time
+  bool dereference = false;       // -L
+  bool dereference_args = false;  // -H/-D / --dereference-args
+  bool apparent_size = false;     // -A / --apparent-size [DIFFERS]
+  bool no_dereference = false;    // -P / --no-dereference [DIFFERS]
+  bool count_links = false;       // -l / --count-links
+  bool one_file_system = false;   // -x
+  bool show_inodes = false;       // --inodes
+  bool null_terminated = false;   // -0
+  bool separate_dirs = false;     // -S
+  bool show_time = false;         // --time
   DuTimeMode time_mode = DuTimeMode::Modification;
   std::string time_word;   // --time
   std::string time_style;  // --time-style
@@ -598,6 +602,7 @@ auto configure_output(const CommandContext<DU_OPTIONS.size()>& ctx)
       output.human = false;
       output.si = false;
       output.block_size = 1;
+      output.size_explicit = true;
       output.display_suffix.clear();
       continue;
     }
@@ -606,6 +611,7 @@ auto configure_output(const CommandContext<DU_OPTIONS.size()>& ctx)
       output.human = false;
       output.si = false;
       output.block_size = 1024;
+      output.size_explicit = true;
       output.display_suffix.clear();
       continue;
     }
@@ -614,6 +620,7 @@ auto configure_output(const CommandContext<DU_OPTIONS.size()>& ctx)
       output.human = false;
       output.si = false;
       output.block_size = 1024 * 1024;
+      output.size_explicit = true;
       output.display_suffix.clear();
       continue;
     }
@@ -621,6 +628,7 @@ auto configure_output(const CommandContext<DU_OPTIONS.size()>& ctx)
     if (meta.short_name == "-h" || meta.long_name == "--human-readable") {
       output.human = true;
       output.si = false;
+      output.size_explicit = true;
       output.display_suffix.clear();
       continue;
     }
@@ -628,6 +636,7 @@ auto configure_output(const CommandContext<DU_OPTIONS.size()>& ctx)
     if (meta.long_name == "--si") {
       output.human = false;
       output.si = true;
+      output.size_explicit = true;
       output.display_suffix.clear();
       continue;
     }
@@ -640,12 +649,14 @@ auto configure_output(const CommandContext<DU_OPTIONS.size()>& ctx)
       if (*value == "human-readable") {
         output.human = true;
         output.si = false;
+        output.size_explicit = true;
         output.display_suffix.clear();
         continue;
       }
       if (*value == "si") {
         output.human = false;
         output.si = true;
+        output.size_explicit = true;
         output.display_suffix.clear();
         continue;
       }
@@ -657,6 +668,36 @@ auto configure_output(const CommandContext<DU_OPTIONS.size()>& ctx)
       output.human = false;
       output.si = false;
       output.block_size = *parsed;
+      output.size_explicit = true;
+    }
+  }
+
+  // [GNU] With no size option, du reads its block size from the first set of
+  // DU_BLOCK_SIZE, BLOCK_SIZE, BLOCKSIZE; "human-readable"/"si" select those
+  // modes and an unparseable or zero value is ignored (uutils #8916).
+  if (!output.size_explicit) {
+    bool env_applied = false;
+    for (const char* name : {"DU_BLOCK_SIZE", "BLOCK_SIZE", "BLOCKSIZE"}) {
+      const char* value = std::getenv(name);
+      if (value == nullptr) continue;
+      const std::string spec(value);
+      if (spec == "human-readable") {
+        output.human = true;
+        env_applied = true;
+      } else if (spec == "si") {
+        output.si = true;
+        env_applied = true;
+      } else if (auto parsed = parse_block_size(spec)) {
+        output.block_size = *parsed;
+        env_applied = true;
+      }
+      break;  // the first set variable wins even when unparseable
+    }
+
+    // [GNU] POSIXLY_CORRECT changes the default block size to 512B only when
+    // neither an option nor an environment variable selected a size.
+    if (!env_applied && std::getenv("POSIXLY_CORRECT") != nullptr) {
+      output.block_size = 512;
     }
   }
 
@@ -730,11 +771,11 @@ auto configure_du(const CommandContext<DU_OPTIONS.size()>& ctx)
   // -P / --no-dereference: Default behavior on Windows. [DIFFERS]
   cfg.no_dereference =
       ctx.get<bool>("--no-dereference", false) || ctx.get<bool>("-P", false);
-  // -H / --dereference-args: Dereference only CLI symlink args. [DIFFERS]
-  // -D / --dereference-args: Duplicate of -H. [DIFFERS]
-  // On Windows, symlinks in command-line args are resolved by the kernel.
-  // Accept silently as no-op.
-  ctx.get<bool>("--dereference-args", false);
+  // -H / -D / --dereference-args: dereference only command-line symlink
+  // operands.  Needed to report dangling link operands like GNU does.
+  cfg.dereference_args = ctx.get<bool>("--dereference-args", false) ||
+                         ctx.get<bool>("-H", false) ||
+                         ctx.get<bool>("-D", false);
   // -l / --count-links: count sizes many times if hard linked
   cfg.count_links =
       ctx.get<bool>("--count-links", false) || ctx.get<bool>("-l", false);
@@ -896,7 +937,12 @@ auto calculate_dir_size(const std::wstring& path,
                         int current_depth, const DuConfig& cfg,
                         std::unordered_set<std::wstring>& seen_inodes,
                         std::unordered_set<std::wstring>& visited_dirs,
-                        const std::wstring& root_drive = L"") -> UsageSummary {
+                        const std::wstring& root_drive = L"",
+                        // [GNU] Entries are printed in traversal post-order:
+                        // a directory line follows its subtree, so the operand
+                        // directory prints last (Savannah #13956).
+                        std::vector<std::wstring>* print_order = nullptr)
+    -> UsageSummary {
   WIN32_FIND_DATAW find_data;
   std::wstring search_path = path + L"\\*";
   HANDLE hFind = FindFirstFileW(search_path.c_str(), &find_data);
@@ -956,7 +1002,7 @@ auto calculate_dir_size(const std::wstring& path,
       // Recursively calculate subdirectory size
       UsageSummary child_summary =
           calculate_dir_size(full_path, sizes, times, child_depth, cfg,
-                             seen_inodes, visited_dirs, drive);
+                             seen_inodes, visited_dirs, drive, print_order);
       if (!cfg.separate_dirs) {
         summary.size += child_summary.size;
       }
@@ -1005,6 +1051,9 @@ auto calculate_dir_size(const std::wstring& path,
       if (counted && cfg.count_all &&
           (cfg.max_depth < 0 || child_depth <= cfg.max_depth)) {
         sizes[full_path] = file_size;
+        if (print_order != nullptr) {
+          print_order->push_back(full_path);
+        }
       }
     }
   } while (FindNextFileW(hFind, &find_data) != 0);
@@ -1013,6 +1062,9 @@ auto calculate_dir_size(const std::wstring& path,
 
   if (cfg.max_depth < 0 || current_depth <= cfg.max_depth) {
     sizes[path] = summary.size;
+    if (print_order != nullptr) {
+      print_order->push_back(path);
+    }
     if (cfg.show_time && summary.has_time) {
       times[path] = summary.latest_time;
     }
@@ -1083,18 +1135,57 @@ auto print_disk_usage(const CommandContext<DU_OPTIONS.size()>& ctx)
   // are skipped entirely: no print, no recount (Savannah #10397).
   std::unordered_set<std::wstring> visited_dirs;
 
+  // [GNU] du prints operand paths and their descendants with forward
+  // slashes (Savannah #13956).
+  const auto display_path = [](const std::wstring& p) -> std::string {
+    std::string display = wstring_to_utf8(p);
+    std::replace(display.begin(), display.end(), '\\', '/');
+    return display;
+  };
+
   for (size_t i = 0; i < paths.size(); ++i) {
     const auto& path = paths[i];
     std::wstring wpath = utf8_to_wstring(path);
 
-    // Check if path exists
+    // [GNU] Under -L/-H a symlink operand that does not resolve (dangling
+    // link) is reported and the run fails; GNU prints no errno text for the
+    // dangling case but "No such file or directory" for a missing path.
+    if (cfg.dereference || cfg.dereference_args) {
+      std::error_code ec;
+      (void)std::filesystem::status(std::filesystem::path(wpath), ec);
+      if (ec) {
+        std::error_code lec;
+        const bool operand_exists = std::filesystem::exists(
+            std::filesystem::symlink_status(std::filesystem::path(wpath), lec));
+        safeErrorPrint("du: cannot access '");
+        safeErrorPrint(path);
+        if (!lec && operand_exists) {
+          safeErrorPrint("'\n");
+        } else {
+          safeErrorPrint("': No such file or directory\n");
+        }
+        all_ok = false;
+        continue;
+      }
+    }
+
+    // Check if path exists.  Without -L/-H du lstats the operand, so a
+    // dangling symlink still counts (as a zero-size entry) like GNU -P.
     DWORD attrs = GetFileAttributesW(wpath.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES) {
-      safeErrorPrint("du: cannot access '");
-      safeErrorPrint(path);
-      safeErrorPrint("': No such file or directory\n");
-      all_ok = false;
-      continue;
+      std::error_code lec;
+      const auto link_status =
+          std::filesystem::symlink_status(std::filesystem::path(wpath), lec);
+      if (!lec && std::filesystem::is_symlink(link_status) &&
+          !cfg.dereference && !cfg.dereference_args) {
+        attrs = FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_REPARSE_POINT;
+      } else {
+        safeErrorPrint("du: cannot access '");
+        safeErrorPrint(path);
+        safeErrorPrint("': No such file or directory\n");
+        all_ok = false;
+        continue;
+      }
     }
 
     if (should_exclude(cfg, wpath,
@@ -1112,53 +1203,67 @@ auto print_disk_usage(const CommandContext<DU_OPTIONS.size()>& ctx)
       if (!visited_dirs.insert(arg_key).second) {
         continue;
       }
+      // [GNU] Entries print in traversal post-order: every directory line
+      // follows its subtree, so the operand directory prints last
+      // (Savannah #13956).
+      std::vector<std::wstring> order;
       // Calculate directory size
-      UsageSummary dir_summary = calculate_dir_size(wpath, sizes, times, 0, cfg,
-                                                    seen_inodes, visited_dirs);
+      UsageSummary dir_summary = calculate_dir_size(
+          wpath, sizes, times, 0, cfg, seen_inodes, visited_dirs, L"", &order);
 
       // Print directory size
       uint64_t dir_size = sizes[wpath];
       grand_total += dir_size;
 
-      if (passes_threshold(cfg, dir_size)) {
+      auto print_entry = [&](const std::wstring& entry_path, uint64_t size,
+                             bool is_operand_root) {
         safePrint(L"");
         if (cfg.show_inodes) {
-          // Show inode count (approximated as file count)
-          safePrint(std::to_string(sizes.size()));
+          // Show inode count (approximated as file count) for the operand
+          // root; each listed entry counts as 1 inode.
+          safePrint(is_operand_root ? std::to_string(sizes.size()) : "1");
         } else {
-          print_scaled_size(dir_size, cfg.output);
+          print_scaled_size(size, cfg.output);
         }
-        print_time_if_requested(dir_summary, cfg);
+        if (cfg.show_time) {
+          UsageSummary entry_summary;
+          auto time_it = times.find(entry_path);
+          if (time_it != times.end()) {
+            entry_summary.latest_time = time_it->second;
+            entry_summary.has_time = true;
+          }
+          if (is_operand_root && dir_summary.has_time) {
+            entry_summary.latest_time = dir_summary.latest_time;
+            entry_summary.has_time = true;
+          }
+          print_time_if_requested(entry_summary, cfg);
+        }
         safePrint("\t");
-        safePrint(wpath);
+        safePrint(display_path(entry_path));
         print_record_terminator(cfg.null_terminated);
-      }
+      };
 
-      // Print subdirectories/files if not summarize mode
-      if (!cfg.summarize) {
-        for (const auto& [subpath, size] : sizes) {
-          if (subpath != wpath) {  // Skip the root directory itself
-            if (!passes_threshold(cfg, size)) {
-              continue;
-            }
-            safePrint(L"");
-            if (cfg.show_inodes) {
-              safePrint("1");  // Each entry counts as 1 inode
-            } else {
-              print_scaled_size(size, cfg.output);
-            }
-            if (cfg.show_time) {
-              UsageSummary entry_summary;
-              auto time_it = times.find(subpath);
-              if (time_it != times.end()) {
-                entry_summary.latest_time = time_it->second;
-                entry_summary.has_time = true;
-              }
-              print_time_if_requested(entry_summary, cfg);
-            }
-            safePrint("\t");
-            safePrint(subpath);
-            print_record_terminator(cfg.null_terminated);
+      if (cfg.summarize) {
+        // -s: print only the operand total.
+        if (passes_threshold(cfg, dir_size)) {
+          print_entry(wpath, dir_size, true);
+        }
+      } else {
+        for (const auto& subpath : order) {
+          auto size_it = sizes.find(subpath);
+          if (size_it == sizes.end()) {
+            continue;
+          }
+          if (!passes_threshold(cfg, size_it->second)) {
+            continue;
+          }
+          print_entry(subpath, size_it->second, subpath == wpath);
+        }
+        // Fallback safety: the operand root always prints.
+        if (order.empty() ||
+            std::find(order.begin(), order.end(), wpath) == order.end()) {
+          if (passes_threshold(cfg, dir_size)) {
+            print_entry(wpath, dir_size, true);
           }
         }
       }
@@ -1193,7 +1298,7 @@ auto print_disk_usage(const CommandContext<DU_OPTIONS.size()>& ctx)
         }
         print_time_if_requested(file_summary, cfg);
         safePrint("\t");
-        safePrint(wpath);
+        safePrint(display_path(wpath));
         print_record_terminator(cfg.null_terminated);
       }
     }

@@ -22,6 +22,8 @@
  *  - File: du_unit_test.cpp
  *  - CopyrightYear: 2026
  */
+#include <regex>
+
 #include "framework/winuxtest.h"
 
 namespace {
@@ -725,7 +727,7 @@ TEST(du, du_separate_dirs) {
 
   EXPECT_EQ(r.exit_code, 0);
   auto root_usage = usage_for_path(r.stdout_text, "root");
-  auto subdir_usage = usage_for_path(r.stdout_text, "root\\subdir");
+  auto subdir_usage = usage_for_path(r.stdout_text, "root/subdir");
   EXPECT_TRUE(root_usage.has_value());
   EXPECT_TRUE(subdir_usage.has_value());
   if (!root_usage.has_value() || !subdir_usage.has_value()) return;
@@ -871,4 +873,104 @@ TEST(du, du_full_iso_time_style_is_accepted) {
   auto r = p.run();
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_NE(r.stdout_text.find("file.txt"), std::string::npos);
+}
+
+namespace {
+bool du_test_create_symlink(const std::filesystem::path& link,
+                            const std::filesystem::path& target,
+                            bool target_is_directory = false) {
+  DWORD flags = 0;
+#ifdef SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
+  flags |= SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+#endif
+  if (target_is_directory) {
+    flags |= SYMBOLIC_LINK_FLAG_DIRECTORY;
+  }
+  if (CreateSymbolicLinkW(link.wstring().c_str(), target.wstring().c_str(),
+                          flags)) {
+    return true;
+  }
+  std::cout << "  SKIPPED (CreateSymbolicLinkW failed with error "
+            << GetLastError() << ")\n";
+  return false;
+}
+}  // namespace
+
+TEST(du, du_prints_children_before_parent_and_forward_slashes) {
+  TempDir tmp;
+  std::filesystem::create_directories(tmp.path / "d3" / "d3sub");
+  tmp.write("d3/d3sub/f.txt", "data");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"du.exe", {L"d3"});
+  auto r = p.run();
+
+  // [GNU] du prints in traversal post-order with '/' separators:
+  // "N d3/d3sub\nN d3\n" (Savannah #13956 / issue #385).
+  EXPECT_EQ(r.exit_code, 0);
+  const auto sub_pos = r.stdout_text.find("d3/d3sub");
+  const auto root_pos = r.stdout_text.rfind("\td3\n");
+  EXPECT_TRUE(sub_pos != std::string::npos);
+  EXPECT_TRUE(root_pos != std::string::npos);
+  EXPECT_TRUE(sub_pos < root_pos);
+  EXPECT_TRUE(r.stdout_text.find("d3\d3sub") == std::string::npos);
+}
+
+TEST(du, du_dereference_dangling_operand_errors) {
+  TempDir tmp;
+  tmp.write("gone.txt", "x");
+
+  std::filesystem::path link = tmp.path / "dangling";
+  if (!du_test_create_symlink(link, std::filesystem::path(L"gone.txt"))) {
+    return;
+  }
+  std::filesystem::remove(tmp.path / "gone.txt");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"du.exe", {L"-L", L"dangling"});
+  auto r = p.run();
+
+  // [GNU] "du -L dangling" reports "cannot access" and exits 1 (#1059).
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stderr_text.find("cannot access") != std::string::npos);
+}
+
+TEST(du, du_dangling_operand_without_dereference_lists_link) {
+  TempDir tmp;
+  tmp.write("gone.txt", "x");
+
+  std::filesystem::path link = tmp.path / "dangling";
+  if (!du_test_create_symlink(link, std::filesystem::path(L"gone.txt"))) {
+    return;
+  }
+  std::filesystem::remove(tmp.path / "gone.txt");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"du.exe", {L"dangling"});
+  auto r = p.run();
+
+  // [GNU] Default du lstats the operand: a dangling link counts as a
+  // zero-size entry, rc=0.
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stdout_text.find("dangling") != std::string::npos);
+}
+
+TEST(du, du_block_size_env_is_honored) {
+  TempDir tmp;
+  tmp.write("file.bin", std::string(2048, 'x'));
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.set_env(L"DU_BLOCK_SIZE", L"512");
+  p.add(L"du.exe", {L"file.bin"});
+  auto r = p.run();
+
+  // [GNU] DU_BLOCK_SIZE=512 makes du report 512B blocks (#964): the
+  // 2048-byte file needs at least 4 of them (default 1K blocks would be 2).
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(std::regex_search(
+      r.stdout_text, std::regex(R"(^([4-9]|[0-9][0-9]+)\tfile\.bin)")));
 }

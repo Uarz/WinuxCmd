@@ -71,6 +71,8 @@ auto constexpr DF_OPTIONS = std::array{
     OPTION("-H", "--si", "print sizes in powers of 1000 (e.g., 1.1G)"),
     OPTION("-i", "--inodes", "list inode information instead of block usage"),
     OPTION("-k", "", "like --block-size=1K"),
+    // [GNU] -m is a synonym for --block-size=1M (uutils #11565)
+    OPTION("-m", "", "like --block-size=1M"),
     OPTION("-l", "--local", "limit listing to local file systems"),
     OPTION("-T", "--print-type", "print file system type"),
     OPTION("-t", "--type", "limit listing to file systems of type TYPE",
@@ -486,6 +488,20 @@ auto block_label_for(std::string_view value) -> std::string {
   return label;
 }
 
+// [GNU] Environment-specified block sizes get a computed header label:
+// 1024 -> "1K-blocks", 4096 -> "4K-blocks", 512 -> "512B-blocks".
+auto block_label_for_size(uint64_t block_size) -> std::string {
+  static constexpr std::string_view kUnits = "KMGTPE";
+  for (int power = static_cast<int>(kUnits.size()); power >= 1; --power) {
+    const uint64_t scale = *pow_u64(1024, power);
+    if (block_size % scale == 0) {
+      return std::to_string(block_size / scale) +
+             std::string(1, kUnits[static_cast<size_t>(power - 1)]) + "-blocks";
+    }
+  }
+  return std::to_string(block_size) + "B-blocks";
+}
+
 /**
  * @brief Get disk free space information
  * @param path Path to check (any file/directory on the volume)
@@ -620,6 +636,16 @@ auto configure_output(const CommandContext<DF_OPTIONS.size()>& ctx)
       continue;
     }
 
+    if (meta.short_name == "-m") {
+      output.human = false;
+      output.si = false;
+      output.block_size = 1024 * 1024;
+      output.block_label = "1M-blocks";
+      output.block_size_explicit = true;
+      output.display_suffix.clear();
+      continue;
+    }
+
     if (meta.short_name == "-h" || meta.long_name == "--human-readable") {
       output.human = true;
       output.si = false;
@@ -681,6 +707,26 @@ auto configure_output(const CommandContext<DF_OPTIONS.size()>& ctx)
       output.block_size = *parsed;
       output.block_label = block_label_for(*value);
       output.block_size_explicit = true;
+    }
+  }
+
+  // [GNU] With no size option, df reads its block size from the first set of
+  // DF_BLOCK_SIZE, BLOCK_SIZE, BLOCKSIZE (uutils #1173).  "human-readable"
+  // and "si" select those modes; an unparseable or zero value is ignored.
+  if (!output.block_size_explicit && !output.human && !output.si) {
+    for (const char* name : {"DF_BLOCK_SIZE", "BLOCK_SIZE", "BLOCKSIZE"}) {
+      const char* value = std::getenv(name);
+      if (value == nullptr) continue;
+      const std::string spec(value);
+      if (spec == "human-readable") {
+        output.human = true;
+      } else if (spec == "si") {
+        output.si = true;
+      } else if (auto parsed = parse_block_size(spec)) {
+        output.block_size = *parsed;
+        output.block_label = block_label_for_size(*parsed);
+      }
+      break;  // the first set variable wins even when unparseable
     }
   }
 
@@ -942,6 +988,39 @@ auto print_disk_usage(const CommandContext<DF_OPTIONS.size()>& ctx)
 
   for (size_t i = 0; i < paths.size(); ++i) {
     const auto& path = paths[i];
+
+    // [GNU] df stats each command-line operand: a missing path reports
+    // "df: <path>: No such file or directory" and a trailing-slash operand
+    // on a non-directory reports "df: <path>: Not a directory"; the run
+    // fails (exit 1) but valid operands are still listed (uutils #12777).
+    if (!auto_enumerated_drives) {
+      std::wstring wpath = utf8_to_wstring(path);
+      std::wstring lookup = wpath;
+      bool needs_directory = false;
+      while (lookup.size() > 1 &&
+             (lookup.back() == L'/' || lookup.back() == L'\\')) {
+        lookup.pop_back();
+        needs_directory = true;
+      }
+      std::error_code ec;
+      const auto status =
+          std::filesystem::status(std::filesystem::path(lookup), ec);
+      if (ec || !std::filesystem::exists(status)) {
+        safeErrorPrint("df: ");
+        safeErrorPrint(path);
+        safeErrorPrint(": No such file or directory\n");
+        all_ok = false;
+        continue;
+      }
+      if (needs_directory && !std::filesystem::is_directory(status)) {
+        safeErrorPrint("df: ");
+        safeErrorPrint(path);
+        safeErrorPrint(": Not a directory\n");
+        all_ok = false;
+        continue;
+      }
+    }
+
     auto disk_info = get_disk_info(path);
 
     if (!disk_info) {

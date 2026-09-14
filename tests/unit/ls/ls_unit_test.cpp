@@ -844,9 +844,11 @@ TEST(ls, ls_long_format_classify_marks_directory_symlink_name_not_target) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_TRUE(r.stdout_text.find("dirlink@ ->") != std::string::npos);
-  EXPECT_TRUE(r.stdout_text.find("targetdir/") == std::string::npos);
-  EXPECT_TRUE(r.stdout_text.find("targetdir") != std::string::npos);
+  // [GNU] -lF puts the indicator on the link *target* ("dirlink ->
+  // targetdir/"), never '@' on the link name itself.
+  EXPECT_TRUE(r.stdout_text.find("dirlink@") == std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("dirlink ->") != std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("targetdir/") != std::string::npos);
 }
 
 TEST(ls, ls_long_format_H_dereferences_directory_junction_operand) {
@@ -2939,4 +2941,198 @@ TEST(ls, ls_invalid_block_size_fails) {
   auto r = p.run();
 
   EXPECT_NE(r.exit_code, 0);
+}
+
+TEST(ls, ls_unmatched_wildcard_operand_reports_enoent) {
+  TempDir tmp;
+  tmp.write("real.txt", "x");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"ls.exe", {L"zzz_nomatch_*"});
+  auto r = p.run();
+
+  // [GNU] An operand wildcard that matches nothing must fail with ENOENT
+  // (exit 2), never fabricate a listing for the literal pattern (#1051).
+  EXPECT_EQ(r.exit_code, 2);
+  EXPECT_TRUE(r.stderr_text.find("No such file or directory") !=
+              std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("zzz_nomatch_") == std::string::npos);
+}
+
+TEST(ls, ls_trailing_slash_on_regular_file_is_enotdir) {
+  TempDir tmp;
+  tmp.write("plain.txt", "x");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"ls.exe", {L"plain.txt/"});
+  auto r = p.run();
+
+  // [GNU] "ls file/" fails with ENOTDIR (exit 2) (#1051).
+  EXPECT_EQ(r.exit_code, 2);
+  EXPECT_TRUE(r.stderr_text.find("Not a directory") != std::string::npos);
+}
+
+TEST(ls, ls_trailing_slash_on_file_symlink_is_enotdir) {
+  TempDir tmp;
+  tmp.write("plain.txt", "x");
+
+  std::filesystem::path link = tmp.path / "linkfile";
+  if (!create_symlink_or_skip(link, std::filesystem::path(L"plain.txt"))) {
+    return;
+  }
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"ls.exe", {L"linkfile/"});
+  auto r = p.run();
+
+  // [GNU] "ls link-to-file/" resolves the link and fails ENOTDIR (#1051).
+  EXPECT_EQ(r.exit_code, 2);
+  EXPECT_TRUE(r.stderr_text.find("Not a directory") != std::string::npos);
+}
+
+TEST(ls, ls_trailing_slash_on_directory_operand_still_lists) {
+  TempDir tmp;
+  std::filesystem::create_directory(tmp.path / "sub");
+  tmp.write("sub/inside.txt", "x");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"ls.exe", {L"sub/"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stdout_text.find("inside.txt") != std::string::npos);
+}
+
+TEST(ls, ls_dereference_dangling_operand_reports_error) {
+  TempDir tmp;
+  tmp.write("gone.txt", "x");
+
+  std::filesystem::path link = tmp.path / "dangling";
+  if (!create_symlink_or_skip(link, std::filesystem::path(L"gone.txt"))) {
+    return;
+  }
+  std::filesystem::remove(tmp.path / "gone.txt");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"ls.exe", {L"-lL", L"dangling"});
+  auto r = p.run();
+
+  // [GNU] "ls -L dangling" reports "cannot access" and exits 2 (#387).
+  EXPECT_EQ(r.exit_code, 2);
+  EXPECT_TRUE(r.stderr_text.find("cannot access") != std::string::npos);
+}
+
+TEST(ls, ls_time_style_env_is_honored) {
+  TempDir tmp;
+  tmp.write("timed.txt", "x");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.set_env(L"TIME_STYLE", L"+%Y");
+  p.add(L"ls.exe", {L"-l", L"timed.txt"});
+  auto r = p.run();
+
+  // [GNU] TIME_STYLE env supplies the format when no --time-style is given:
+  // +%Y prints a bare year instead of the default date (#971).
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(
+      std::regex_search(r.stdout_text, std::regex(R"(\d{4}\s+timed\.txt)")));
+  EXPECT_TRUE(
+      std::regex_search(r.stdout_text, std::regex(R"([A-Z][a-z][a-z]\s+\d)")) ==
+      false);
+}
+
+TEST(ls, ls_time_style_env_invalid_is_usage_error) {
+  TempDir tmp;
+  tmp.write("timed.txt", "x");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.set_env(L"TIME_STYLE", L"bogus-style");
+  p.add(L"ls.exe", {L"-l", L"timed.txt"});
+  auto r = p.run();
+
+  // [GNU] An unparseable TIME_STYLE is a usage-class error: exit 2 (#971).
+  EXPECT_EQ(r.exit_code, 2);
+}
+
+TEST(ls, ls_colors_env_colors_regular_files) {
+  TempDir tmp;
+  tmp.write("plain.txt", "x");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.set_env(L"LS_COLORS", L"fi=01;35");
+  p.add(L"ls.exe", {L"--color=always", L"plain.txt"});
+  auto r = p.run();
+
+  // [GNU] LS_COLORS="fi=01;35" wraps the name in SGR 01;35 (#977).
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stdout_text.find("\033[01;35m") != std::string::npos);
+}
+
+TEST(ls, ls_tabsize_accepts_strtoumax_base0) {
+  TempDir tmp;
+  tmp.write("plain.txt", "x");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"ls.exe", {L"-T", L"0x8", L"plain.txt"});
+  auto r = p.run();
+
+  // [GNU] -T parses strtoumax base-0: "0x8" is a valid tab size (#741).
+  EXPECT_EQ(r.exit_code, 0);
+
+  Pipeline bad;
+  bad.set_cwd(tmp.wpath());
+  bad.add(L"ls.exe", {L"-T", L"nope", L"plain.txt"});
+  auto r2 = bad.run();
+  EXPECT_EQ(r2.exit_code, 2);
+}
+
+// [GNU] /dev/null is a real character device: "ls -l /dev/null" lists it
+// with a 'c' type ("crw-rw-rw- ... /dev/null") instead of failing (#225).
+TEST(ls, ls_long_format_lists_dev_null_as_char_device) {
+  TempDir tmp;
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"ls.exe", {L"-l", L"/dev/null"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(
+      std::regex_search(r.stdout_text, std::regex(R"(^crw[-r]{2}[-w]{2})")));
+  EXPECT_TRUE(r.stdout_text.find("/dev/null") != std::string::npos);
+}
+
+// [GNU] "ls -lL dir" still lists a dangling symlink member with '?'
+// placeholder columns ("l?????????"), reports "cannot access", and exits 1
+// (minor problem) rather than 2 (#387).
+TEST(ls, ls_dereference_dangling_entry_in_listing_marks_question_row) {
+  TempDir tmp;
+  std::filesystem::create_directory(tmp.path / "dir1");
+  tmp.write("dir1/plain.txt", "x");
+  tmp.write("dir1/gone.txt", "x");
+
+  std::filesystem::path link = tmp.path / "dir1" / "dangling";
+  if (!create_symlink_or_skip(link, std::filesystem::path(L"gone.txt"))) {
+    return;
+  }
+  std::filesystem::remove(tmp.path / "dir1" / "gone.txt");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"ls.exe", {L"-lL", L"dir1"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stderr_text.find("cannot access") != std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("l?????????") != std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("dangling") != std::string::npos);
 }

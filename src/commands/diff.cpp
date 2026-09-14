@@ -367,25 +367,48 @@ auto compute_diff(const std::vector<std::string> &lines1,
  * @param path File path
  * @return Result with vector of lines
  */
+// [GNU] "-" (and /dev/stdin-family operands) read standard input (#1057).
+auto operand_is_stdin(const std::string &path) -> bool {
+  return path == "-" ||
+         native_path::pseudo_device_std_fd(path) == std::optional<int>(0);
+}
+
 auto read_file_lines_result(const std::string &path)
     -> cp::Result<std::vector<std::string>> {
   auto diff_input_open_error = [](std::string_view file_path) -> std::string {
-    std::error_code ec;
-    auto status =
-        std::filesystem::status(std::filesystem::u8path(file_path), ec);
-    if (!ec && status.type() == std::filesystem::file_type::directory) {
+    auto operand = native_path::make_api_path_operand(file_path);
+    const DWORD attrs = native_path::operand_target_attributes_w(operand);
+    if (native_path::attributes_are_directory(attrs)) {
       return std::string(file_path) + ": Is a directory";
     }
-    return "cannot open '" + std::string(file_path) +
-           "' for reading: No such file or directory";
+    // [GNU] Unreadable input reports "<path>: <errno text>", not a
+    // "cannot open ... for reading" wrapper.
+    return std::string(file_path) + ": No such file or directory";
   };
 
-  std::ifstream file(path, std::ios::binary);
+  std::vector<std::string> lines;
+
+  if (operand_is_stdin(path)) {
+    // [GNU] A closed standard input (<&-) is a read error, not EOF (#973).
+    // For "-" GNU reports EBADF; a /dev/stdin-family operand dangles like a
+    // dead /proc/self/fd symlink and reports ENOENT instead.
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected(path + (path == "-"
+                                         ? ": Bad file descriptor"
+                                         : ": No such file or directory"));
+    }
+    std::string line;
+    while (std::getline(std::cin, line)) {
+      lines.push_back(line);
+    }
+    return lines;
+  }
+
+  std::ifstream file = file_io::open_binary_file(path);
   if (!file.is_open()) {
     return std::unexpected(diff_input_open_error(path));
   }
 
-  std::vector<std::string> lines;
   std::string line;
   while (std::getline(file, line)) {
     lines.push_back(line);
@@ -541,19 +564,9 @@ auto expand_tabs_lines(const std::vector<std::string> &lines, int tabsize)
  * @return Result with true if files are equal
  */
 auto compare_files(const std::string &path1, const std::string &path2,
-                   bool brief, bool ignore_all_space) -> cp::Result<bool> {
-  auto lines1_result = read_file_lines_result(path1);
-  if (!lines1_result) {
-    return std::unexpected(lines1_result.error());
-  }
-
-  auto lines2_result = read_file_lines_result(path2);
-  if (!lines2_result) {
-    return std::unexpected(lines2_result.error());
-  }
-
-  auto &lines1 = lines1_result.value();
-  auto &lines2 = lines2_result.value();
+                   const std::vector<std::string> &lines1,
+                   const std::vector<std::string> &lines2, bool brief,
+                   bool ignore_all_space) -> bool {
   auto compare_lines1 = normalize_lines_for_compare(lines1, ignore_all_space);
   auto compare_lines2 = normalize_lines_for_compare(lines2, ignore_all_space);
 
@@ -1105,6 +1118,12 @@ REGISTER_COMMAND(
     DIFF_OPTIONS) {
   using namespace diff_pipeline;
 
+#ifdef _WIN32
+  // [GNU] "-" reads raw stdin bytes; text mode would strip CR and corrupt
+  // CRLF comparisons (#1057).
+  _setmode(_fileno(stdin), _O_BINARY);
+#endif
+
   // -- Boolean flags [DIFFERS] --
   bool brief = ctx.get<bool>("-q", false) || ctx.get<bool>("--brief", false);
   bool ignore_all_space =
@@ -1254,25 +1273,96 @@ REGISTER_COMMAND(
   std::string file1 = (*files_result)[0];
   std::string file2 = (*files_result)[1];
 
+  // [GNU] Two standard-input operands name the same stream: diff detects the
+  // same inode and reports identical instead of consuming stdin twice.
+  if (operand_is_stdin(file1) && operand_is_stdin(file2)) {
+    if (file_io::stdin_is_bad()) {
+      safeErrorPrint("diff: ");
+      safeErrorPrint(file1);
+      safeErrorPrintLn(": Bad file descriptor");
+      return 2;
+    }
+    if (report_identical) {
+      safePrint("Files ");
+      safePrint(file1);
+      safePrint(" and ");
+      safePrint(file2);
+      safePrint(" are identical\n");
+    }
+    return 0;
+  }
+
+  // [GNU] Missing operands are reported under their original names before
+  // any directory expansion, and every missing operand gets an error
+  // ("diff: <path>: No such file or directory", exit 2).
+  bool operand_trouble = false;
+  for (const std::string *operand_path : {&file1, &file2}) {
+    // -N/--new-file treats an absent operand as an empty file instead.
+    if (new_file || operand_is_stdin(*operand_path)) continue;
+    auto operand = native_path::make_api_path_operand(*operand_path);
+    if (native_path::operand_target_attributes_w(operand) ==
+        INVALID_FILE_ATTRIBUTES) {
+      safeErrorPrint("diff: ");
+      safeErrorPrint(*operand_path);
+      safeErrorPrint(": No such file or directory\n");
+      operand_trouble = true;
+    }
+  }
+  if (operand_trouble) {
+    return 2;
+  }
+
+  // [GNU] A directory operand is rewritten to "<dir>/<basename of the other
+  // operand>" before comparison, so "diff dir file" compares dir/file with
+  // file.  Two directory operands request a directory comparison, which is
+  // not implemented; they fall through to the "Is a directory" error.
+  auto operand_is_directory = [](const std::string &operand_path) -> bool {
+    if (operand_is_stdin(operand_path)) return false;
+    auto operand = native_path::make_api_path_operand(operand_path);
+    return native_path::attributes_are_directory(
+        native_path::operand_target_attributes_w(operand));
+  };
+  auto base_name_of = [](const std::string &operand_path) -> std::string {
+    size_t end = operand_path.size();
+    while (end > 0 &&
+           (operand_path[end - 1] == '/' || operand_path[end - 1] == '\\')) {
+      --end;
+    }
+    size_t start = end;
+    while (start > 0 && operand_path[start - 1] != '/' &&
+           operand_path[start - 1] != '\\') {
+      --start;
+    }
+    return operand_path.substr(start, end - start);
+  };
+  auto join_dir_member = [](const std::string &dir,
+                            const std::string &member) -> std::string {
+    if (member.empty()) return dir;
+    if (!dir.empty() && dir.back() != '/' && dir.back() != '\\') {
+      return dir + "/" + member;
+    }
+    return dir + member;
+  };
+  const bool file1_is_dir = operand_is_directory(file1);
+  const bool file2_is_dir = operand_is_directory(file2);
+  if (file1_is_dir && !file2_is_dir) {
+    file1 = join_dir_member(file1, base_name_of(file2));
+  } else if (file2_is_dir && !file1_is_dir) {
+    file2 = join_dir_member(file2, base_name_of(file1));
+  }
+
   DiffLabel label1{file1, false};
   DiffLabel label2{file2, false};
   auto labels = ctx.string_occurrences({"--label"});
   if (!labels.empty()) label1 = DiffLabel{labels[0].value, true};
   if (labels.size() > 1) label2 = DiffLabel{labels[1].value, true};
 
-  if (brief) {
-    auto result = compare_files(file1, file2, true, ignore_all_space);
-    if (!result) {
-      safeErrorPrint("diff: ");
-      safeErrorPrint(result.error());
-      safeErrorPrint("\n");
-      return 1;
-    }
-    return result.value() ? 0 : 1;
-  }
-
-  // -- Read both files; -N/--new-file treats missing as empty [DIFFERS]
+  // -- Read both files; -N/--new-file treats missing as empty [DIFFERS].
+  // [GNU] Every unreadable operand is reported (not just the first), and
+  // input trouble exits 2 (0=same, 1=differ).
   auto lines1_result = read_file_lines_result(file1);
+  auto lines2_result = read_file_lines_result(file2);
+  bool input_error = false;
   if (!lines1_result) {
     if (new_file) {
       lines1_result = std::vector<std::string>{};
@@ -1280,11 +1370,9 @@ REGISTER_COMMAND(
       safeErrorPrint("diff: ");
       safeErrorPrint(lines1_result.error());
       safeErrorPrint("\n");
-      return 1;
+      input_error = true;
     }
   }
-
-  auto lines2_result = read_file_lines_result(file2);
   if (!lines2_result) {
     if (new_file) {
       lines2_result = std::vector<std::string>{};
@@ -1292,12 +1380,21 @@ REGISTER_COMMAND(
       safeErrorPrint("diff: ");
       safeErrorPrint(lines2_result.error());
       safeErrorPrint("\n");
-      return 1;
+      input_error = true;
     }
+  }
+  if (input_error) {
+    return 2;
   }
 
   auto &lines1 = lines1_result.value();
   auto &lines2 = lines2_result.value();
+
+  if (brief) {
+    return compare_files(file1, file2, lines1, lines2, true, ignore_all_space)
+               ? 0
+               : 1;
+  }
 
   // -- Apply transformations for comparison [DIFFERS] --
   auto cmp1 = lines1;

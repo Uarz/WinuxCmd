@@ -150,8 +150,10 @@ auto constexpr LS_OPTIONS = std::array{
     OPTION("-s", "--size", "print the allocated size of each file, in blocks"),
     OPTION("-S", "", "sort by file size, largest first"),
     OPTION("-t", "", "sort by time, newest first"),
+    // [GNU] -T takes a number in strtoumax base-0 syntax, so "0xff" is 255
+    // while "-T=0xff" hands us the literal "=0xff" and is invalid.
     OPTION("-T", "--tabsize", "assume tab stops at each COLS instead of 8",
-           INT_TYPE),
+           STRING_TYPE),
     OPTION(
         "-u", "",
         "with -lt: sort by, and show, access time; with -l: show access time "
@@ -449,6 +451,23 @@ auto probe_path(const std::wstring &path) -> PathProbe {
     FindClose(hfind);
   }
 
+  // [GNU] POSIX pseudo-devices (/dev/null, /dev/tty, /dev/stdin, ...) and
+  // their DOS device spellings (NUL, CONIN$, ...) are real, openable objects
+  // but have no directory entry, so both probes above fail.  Report them as
+  // existing plain files so "ls /dev/null" lists instead of failing with
+  // ENOENT (uutils #6540).
+  if (!probe.attributes_valid && !probe.found &&
+      native_path::resolve_pseudo_device_w(lookup_path)) {
+    // FILE_ATTRIBUTE_DEVICE marks the entry as a character device so the
+    // long-format listing renders a 'c' type like GNU ("crw-rw-rw-").
+    probe.attributes = FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_DEVICE;
+    probe.attributes_valid = true;
+    probe.found = true;
+    probe.find_data = WIN32_FIND_DATAW{};
+    probe.find_data.dwFileAttributes =
+        FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_DEVICE;
+  }
+
   return probe;
 }
 
@@ -472,9 +491,87 @@ auto is_plain_directory(const WIN32_FIND_DATAW &find_data) -> bool {
          !is_reparse_link(find_data);
 }
 
+// [GNU] The LS_COLORS environment variable is the whole color database for
+// ls --color: "di=01;34:ln=01;36:*.zip=01;31:..."  Each value is an SGR
+// parameter list that GNU wraps as "\033[<params>m".  When the variable is
+// set it replaces the built-in table entirely (uutils: LS_COLORS support).
+struct LsColorsTable {
+  bool active = false;
+  std::unordered_map<std::wstring, std::wstring> keys;
+  std::vector<std::pair<std::wstring, std::wstring>> ext_patterns;
+};
+
+auto ls_colors_table() -> const LsColorsTable & {
+  static const LsColorsTable table = [] {
+    LsColorsTable parsed;
+    wchar_t buffer[32767];
+    const DWORD length = GetEnvironmentVariableW(
+        L"LS_COLORS", buffer, static_cast<DWORD>(std::size(buffer)));
+    if (length == 0 || length >= std::size(buffer)) {
+      return parsed;
+    }
+    parsed.active = true;
+    const std::wstring env(buffer, length);
+    size_t pos = 0;
+    while (pos <= env.size()) {
+      const size_t colon = env.find(L':', pos);
+      const std::wstring_view item = std::wstring_view(env).substr(
+          pos,
+          colon == std::wstring::npos ? std::wstring_view::npos : colon - pos);
+      const size_t eq = item.find(L'=');
+      if (eq != std::wstring_view::npos && eq > 0) {
+        const std::wstring key(item.substr(0, eq));
+        std::wstring sequence =
+            L"\033[" + std::wstring(item.substr(eq + 1)) + L"m";
+        if (!key.empty() && key.front() == L'*') {
+          parsed.ext_patterns.emplace_back(key, std::move(sequence));
+        } else {
+          parsed.keys[key] = std::move(sequence);
+        }
+      }
+      if (colon == std::wstring::npos) break;
+      pos = colon + 1;
+    }
+    return parsed;
+  }();
+  return table;
+}
+
+auto ls_colors_lookup(const LsColorsTable &colors, const std::wstring &name,
+                      const WIN32_FIND_DATAW &find_data) -> std::wstring_view {
+  auto keyed = [&](std::wstring_view key) -> std::wstring_view {
+    auto it = colors.keys.find(std::wstring(key));
+    return it == colors.keys.end() ? std::wstring_view{}
+                                   : std::wstring_view(it->second);
+  };
+
+  if (is_reparse_link(find_data)) {
+    return keyed(L"ln");
+  }
+  if (is_plain_directory(find_data)) {
+    return keyed(L"di");
+  }
+  // [GNU] "*.<ext>" entries match the file name case-sensitively.
+  for (const auto &[pattern, sequence] : colors.ext_patterns) {
+    if (wildcard_match(pattern, name, true)) {
+      return sequence;
+    }
+  }
+  if (is_executable_name(name)) {
+    if (auto seq = keyed(L"ex"); !seq.empty()) {
+      return seq;
+    }
+  }
+  return keyed(L"fi");
+}
+
 auto get_color_for_entry(const std::wstring &name,
                          const WIN32_FIND_DATAW &find_data)
     -> std::wstring_view {
+  const LsColorsTable &colors = ls_colors_table();
+  if (colors.active) {
+    return ls_colors_lookup(colors, name, find_data);
+  }
   if (is_reparse_link(find_data)) {
     return COLOR_LINK;
   }
@@ -847,10 +944,21 @@ auto build_display_name_parts(const std::wstring &name,
   }
   if (!target) {
     rendered += get_indicator_suffix(name, find_data, ctx);
-  }
-
-  if (target) {
-    rendered += get_indicator_suffix(name, find_data, ctx);
+  } else {
+    // [GNU] In long-format "name -> target" display the indicator is computed
+    // from the link *target's* type and appended to the target name, not to
+    // the link name (uutils #12036): "sdir -> realdir/", "s -> f".
+    auto target_probe = probe_path(target->resolved_path.native());
+    WIN32_FIND_DATAW target_find_data{};
+    if (target_probe.found) {
+      target_find_data = target_probe.find_data;
+    } else if (target_probe.attributes_valid) {
+      target_find_data.dwFileAttributes = target_probe.attributes;
+    }
+    if (target_probe.found || target_probe.attributes_valid) {
+      target->display += get_indicator_suffix(
+          target->resolved_path.filename().native(), target_find_data, ctx);
+    }
   }
 
   return {std::move(rendered), std::move(target)};
@@ -1316,6 +1424,7 @@ auto apply_default_output_format(FormatMode mode,
 auto resolve_time_style(const CommandContext<LS_OPTIONS.size()> &ctx)
     -> cp::Result<TimeStyleSelection> {
   TimeStyleSelection selection;
+  bool explicit_style = false;
   for (const auto &occurrence : ctx.options.occurrences()) {
     if (occurrence.index >= LS_OPTIONS.size()) continue;
     const auto &meta = LS_OPTIONS[occurrence.index];
@@ -1323,11 +1432,13 @@ auto resolve_time_style(const CommandContext<LS_OPTIONS.size()> &ctx)
     if (meta.long_name == "--full-time") {
       selection.style = TimeStyle::FullIso;
       selection.format.clear();
+      explicit_style = true;
       continue;
     }
 
     if (meta.long_name != "--time-style") continue;
 
+    explicit_style = true;
     auto value = std::get_if<std::string>(&occurrence.value);
     if (!value) return std::unexpected(build_invalid_time_style_message(""));
     if (!value->empty() && (*value)[0] == '+') {
@@ -1340,6 +1451,40 @@ auto resolve_time_style(const CommandContext<LS_OPTIONS.size()> &ctx)
     if (!parsed)
       return std::unexpected(build_invalid_time_style_message(*value));
     selection.style = *parsed;
+  }
+
+  // [GNU] The TIME_STYLE environment variable supplies the style when no
+  // --time-style/--full-time option was given (uutils #12676).  An
+  // unparseable value is a usage-class error, exit 2.
+  if (!explicit_style) {
+    if (const char *env = std::getenv("TIME_STYLE")) {
+      const std::string_view value(env);
+      auto env_error = [value](bool ambiguous) {
+        return std::unexpected(
+            std::string("ls: ") +
+            (ambiguous ? "ambiguous argument '" : "invalid argument '") +
+            std::string(value) +
+            "' for 'time style'\nValid arguments are:\n"
+            "  - [posix-]full-iso\n"
+            "  - [posix-]long-iso\n"
+            "  - [posix-]iso\n"
+            "  - [posix-]locale\n"
+            "  - +FORMAT (e.g., +%H:%M) for a 'date'-style "
+            "format\n"
+            "Try 'ls --help' for more information.");
+      };
+      if (value.empty()) {
+        return env_error(true);
+      }
+      if (value.front() == '+') {
+        selection.style = TimeStyle::CustomFormat;
+        selection.format = std::string(value.substr(1));
+      } else if (auto parsed = parse_time_style(value)) {
+        selection.style = *parsed;
+      } else {
+        return env_error(false);
+      }
+    }
   }
   return selection;
 }
@@ -1692,6 +1837,24 @@ auto print_tab_aligned_padding(size_t current_column, size_t target_column,
   }
 }
 
+// [GNU] -T/--tabsize values use strtoumax base-0 syntax: "8" is decimal,
+// "010" is octal, "0xff" is 255.  Rejects empty, non-numeric, non-positive,
+// and out-of-range values (uutils #12841).
+auto parse_tab_size_value(std::string_view value) -> std::optional<uintmax_t> {
+  if (value.empty()) {
+    return std::nullopt;
+  }
+  errno = 0;
+  char *end = nullptr;
+  const std::string text(value);
+  const uintmax_t parsed = std::strtoumax(text.c_str(), &end, 0);
+  if (end != text.c_str() + text.size() || errno == ERANGE ||
+      parsed > static_cast<uintmax_t>(std::numeric_limits<int>::max())) {
+    return std::nullopt;
+  }
+  return parsed;
+}
+
 auto resolve_tab_size(const CommandContext<LS_OPTIONS.size()> &ctx) -> int {
   int tab_size = ls_constants::DEFAULT_TAB_SIZE;
 
@@ -1700,13 +1863,11 @@ auto resolve_tab_size(const CommandContext<LS_OPTIONS.size()> &ctx) -> int {
     const auto &meta = LS_OPTIONS[occurrence.index];
     if (meta.short_name != "-T" && meta.long_name != "--tabsize") continue;
 
-    const auto *value = std::get_if<int>(&occurrence.value);
-    if (!value || *value <= 0) {
-      tab_size = ls_constants::DEFAULT_TAB_SIZE;
-      continue;
+    const auto *value = std::get_if<std::string>(&occurrence.value);
+    if (!value) continue;
+    if (auto parsed = parse_tab_size_value(*value); parsed && *parsed > 0) {
+      tab_size = static_cast<int>(*parsed);
     }
-
-    tab_size = *value;
   }
 
   return tab_size;
@@ -1815,13 +1976,17 @@ auto validate_arguments(const CommandContext<LS_OPTIONS.size()> &ctx)
     paths.push_back(".");
   }
 
-  // [GNU] rejects a non-positive tab size ("invalid tab size: '-1'").
-  if (ctx.count({"-T", "--tabsize"}) > 0) {
-    int tab_size = ctx.get<int>("-T", 0);
-    if (tab_size == 0) tab_size = ctx.get<int>("--tabsize", 0);
-    if (tab_size <= 0) {
-      return std::unexpected("invalid tab size: '" + std::to_string(tab_size) +
-                             "'");
+  // [GNU] rejects a tab size that is not a positive strtoumax base-0 number
+  // ("invalid tab size: '-1'", "invalid tab size: '=0xff'").
+  for (const auto &occurrence : ctx.options.occurrences()) {
+    if (occurrence.index >= LS_OPTIONS.size()) continue;
+    const auto &meta = LS_OPTIONS[occurrence.index];
+    if (meta.short_name != "-T" && meta.long_name != "--tabsize") continue;
+    const auto *value = std::get_if<std::string>(&occurrence.value);
+    const std::string raw = value ? *value : std::string();
+    auto parsed = parse_tab_size_value(raw);
+    if (!parsed || *parsed == 0) {
+      return std::unexpected("invalid tab size: '" + raw + "'");
     }
   }
 
@@ -1844,7 +2009,11 @@ auto get_permissions_string(const WIN32_FIND_DATAW &find_data) -> std::string {
   perms[10] = '\0';
 
   // Set file type
-  if (is_reparse_link(find_data)) {
+  const bool is_char_device =
+      (find_data.dwFileAttributes & FILE_ATTRIBUTE_DEVICE) != 0;
+  if (is_char_device) {
+    perms[0] = 'c';  // Character device (e.g. /dev/null)
+  } else if (is_reparse_link(find_data)) {
     perms[0] = 'l';  // Symbolic link / junction style display
   } else if (is_plain_directory(find_data)) {
     perms[0] = 'd';
@@ -1855,19 +2024,21 @@ auto get_permissions_string(const WIN32_FIND_DATAW &find_data) -> std::string {
   const bool read_only =
       (find_data.dwFileAttributes & FILE_ATTRIBUTE_READONLY) != 0;
   const char write_char = read_only ? '-' : 'w';
+  // [GNU] Device files are not executable: /dev/null shows "crw-rw-rw-".
+  const char exec_char = is_char_device ? '-' : 'x';
 
   // Match Microsoft coreutils' Windows approximation:
   // every non-link entry is readable and "searchable/executable" for all,
   // while the read-only attribute removes the write bit triplet-wide.
   perms[1] = 'r';
   perms[2] = write_char;
-  perms[3] = 'x';
+  perms[3] = exec_char;
   perms[4] = 'r';
   perms[5] = write_char;
-  perms[6] = 'x';
+  perms[6] = exec_char;
   perms[7] = 'r';
   perms[8] = write_char;
-  perms[9] = 'x';
+  perms[9] = exec_char;
 
   // Handle hidden files (optional)
   // Note: Keeping 10 characters for consistent formatting
@@ -2588,6 +2759,29 @@ auto list_file(const std::string &path,
                const CommandContext<LS_OPTIONS.size()> &ctx)
     -> cp::Result<bool>;
 
+// [GNU] ls has three exit states: 0 for success, 1 for minor problems (an
+// entry inside a listed directory could not be statted, e.g. a dangling
+// symlink under -L), and 2 for serious trouble (an inaccessible operand).
+// Failures inside a directory listing are recorded here so the command can
+// exit 1 while still printing the rest of the listing.
+bool g_had_minor_errors = false;
+
+// [GNU] Under -L/-H, an entry whose dereference fails is still listed: its
+// metadata columns degrade to '?' placeholders and an error is reported.
+auto is_dangling_dereference(const EntryInfo &entry,
+                             const CommandContext<LS_OPTIONS.size()> &ctx)
+    -> bool {
+  if (!is_reparse_link(entry.find_data) ||
+      !should_dereference_entry_metadata(resolve_dereference_mode(ctx),
+                                         entry.find_data,
+                                         entry.command_line_operand)) {
+    return false;
+  }
+  std::error_code ec;
+  (void)std::filesystem::canonical(entry.full_path, ec);
+  return static_cast<bool>(ec);
+}
+
 /**
  * @brief List directory contents
  * @param path Path to directory
@@ -2796,6 +2990,30 @@ auto list_directory(const std::string &path,
       info.name = entry.name;
       info.find_data = display_find_data;
       info.full_path = entry.full_path;
+      if (is_dangling_dereference(entry, ctx)) {
+        // [GNU] A dangling symlink under -L is reported and listed with '?'
+        // placeholders instead of disappearing or showing link metadata
+        // (Savannah #11124).
+        const std::string sep =
+            (!path.empty() && path.back() != '/' && path.back() != '\\') ? "/"
+                                                                         : "";
+        safeErrorPrintLn(std::wstring(L"ls: cannot access '") +
+                         std::wstring(path.begin(), path.end()) +
+                         std::wstring(sep.begin(), sep.end()) + entry.name +
+                         L"': No such file or directory");
+        g_had_minor_errors = true;
+        info.perms = "l?????????";
+        info.inode = "?";
+        info.blocks = "?";
+        info.link_count = "?";
+        info.size = "?";
+        info.mtime = "?";
+        info.owner = "?";
+        info.author = "?";
+        info.group = "?";
+        files.push_back(info);
+        continue;
+      }
       info.perms = get_permissions_string(display_find_data);
       if (show_inode) {
         info.inode =
@@ -3009,12 +3227,30 @@ auto list_file(const std::string &path,
   HANDLE hFind = FindFirstFileW(metadata_operand.extended.c_str(), &find_data);
 
   if (hFind == INVALID_HANDLE_VALUE) {
-    return std::unexpected("cannot access '" + path +
-                           "': No such file or directory");
+    // [GNU] POSIX pseudo-devices (/dev/null, ...) have no directory entry on
+    // Windows but are real objects; list them as plain files (uutils #6540).
+    if (!native_path::resolve_pseudo_device_w(lookup_wpath)) {
+      return std::unexpected("cannot access '" + path +
+                             "': No such file or directory");
+    }
+    find_data = WIN32_FIND_DATAW{};
+    // [GNU] Pseudo-devices are character devices: mark them so the long
+    // listing shows a 'c' type ("crw-rw-rw- ... /dev/null").
+    find_data.dwFileAttributes = FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_DEVICE;
+    const std::wstring leaf =
+        std::filesystem::path(lookup_wpath).filename().wstring();
+    wcsncpy_s(find_data.cFileName, leaf.c_str(), _TRUNCATE);
+    FILETIME now{};
+    GetSystemTimeAsFileTime(&now);
+    find_data.ftCreationTime = now;
+    find_data.ftLastAccessTime = now;
+    find_data.ftLastWriteTime = now;
+    hFind = nullptr;
+  } else {
+    FindClose(hFind);
   }
 
   std::wstring filename = find_data.cFileName;
-  FindClose(hFind);
 
   WIN32_FIND_DATAW display_find_data = find_data;
   std::wstring metadata_name = filename;
@@ -3023,6 +3259,13 @@ auto list_file(const std::string &path,
     display_find_data = dereferenced->first;
     metadata_name = dereferenced->second;
     wcsncpy_s(display_find_data.cFileName, metadata_name.c_str(), _TRUNCATE);
+  } else if (is_reparse_link(find_data) &&
+             should_dereference_metadata(find_data, ctx,
+                                         /*command_line_operand=*/true)) {
+    // [GNU] stat() on the operand failed under -L/-H: a dangling symlink
+    // operand is reported, not listed (Savannah #11124).
+    return std::unexpected("cannot access '" + path +
+                           "': No such file or directory");
   }
 
   auto size_cfg_result = configure_sizes(ctx);
@@ -3269,6 +3512,62 @@ struct ExpandedPathOperands {
   size_t logical_operand_count = 0;
 };
 
+// [GNU] An operand containing '*' or '?' can never name a real file on
+// Windows: those characters are illegal in file names, but FindFirstFileW
+// treats them as wildcard metacharacters and would "find" an unrelated
+// match.  When glob expansion left such an operand untouched (the shell owns
+// expansion, or the pattern matched nothing) it must be reported missing
+// instead of fabricating a listing for the literal pattern text.
+auto contains_unmatchable_wildcard(std::wstring_view path) -> bool {
+  return path.find(L'*') != std::wstring_view::npos ||
+         path.find(L'?') != std::wstring_view::npos;
+}
+
+// [GNU] An operand whose last component is empty (a trailing '/' or '\\',
+// e.g. "dir/") or is "." / ".." requires traversal through the named file as
+// a directory.  On a regular file GNU ls fails with ENOTDIR rather than
+// listing the file.
+auto operand_requires_directory(std::wstring_view path) -> bool {
+  size_t end = path.size();
+  while (end > 0 && (path[end - 1] == L'/' || path[end - 1] == L'\\')) {
+    --end;
+  }
+  if (end != path.size()) {
+    return true;
+  }
+  if (end == 0 || path[end - 1] != L'.') {
+    return false;
+  }
+  if (end == 1) {
+    return true;  // "."
+  }
+  const wchar_t prev = path[end - 2];
+  if (prev == L'/' || prev == L'\\') {
+    return true;  // "/."
+  }
+  if (prev == L'.') {
+    if (end == 2) {
+      return true;  // ".."
+    }
+    const wchar_t prev2 = path[end - 3];
+    if (prev2 == L'/' || prev2 == L'\\') {
+      return true;  // "/.."
+    }
+  }
+  return false;
+}
+
+// [GNU] Trailing-slash/dotted operands follow symlinks: "link-to-dir/" is a
+// directory while "link-to-file/" is ENOTDIR, so directory-ness is tested on
+// the resolved target, not the link itself.
+auto resolved_operand_is_directory(std::wstring_view path) -> bool {
+  std::error_code ec;
+  const std::filesystem::path fs_path(
+      normalize_lookup_path(std::wstring(path)));
+  const auto status = std::filesystem::status(fs_path, ec);
+  return !ec && std::filesystem::is_directory(status);
+}
+
 auto expand_path_operands(const std::vector<std::string> &paths)
     -> ExpandedPathOperands {
   std::vector<std::string> expanded_paths;
@@ -3286,11 +3585,31 @@ auto expand_path_operands(const std::vector<std::string> &paths)
         }
         continue;
       }
+
+      ++logical_operand_count;
+      if (contains_unmatchable_wildcard(wpath)) {
+        safeErrorPrintLn(std::wstring(L"ls: cannot access '") +
+                         std::wstring(path.begin(), path.end()) +
+                         L"': No such file or directory");
+        success = false;
+        continue;
+      }
+      // A bracket-class-only operand may still name a literal file ('[' and
+      // ']' are legal in Windows file names); fall through and probe it.
     }
 
     auto probe = probe_path(wpath);
     ++logical_operand_count;
     if (probe.attributes_valid || probe.found) {
+      if (operand_requires_directory(wpath) &&
+          !resolved_operand_is_directory(wpath)) {
+        // [GNU] "ls file/" fails with ENOTDIR instead of listing "file/".
+        safeErrorPrintLn(std::wstring(L"ls: cannot access '") +
+                         std::wstring(path.begin(), path.end()) +
+                         L"': Not a directory");
+        success = false;
+        continue;
+      }
       expanded_paths.push_back(path);
     } else {
       safeErrorPrintLn(std::wstring(L"ls: cannot access '") +
@@ -3501,7 +3820,10 @@ REGISTER_COMMAND(
   auto result = process_command(ctx);
   if (!result) {
     const std::string error = std::string(result.error());
-    if (error.starts_with(kInvalidTimeStylePrefix)) {
+    // [GNU] Bad --time-style values and an unparseable TIME_STYLE
+    // environment variable are usage-class errors: exit 2.
+    if (error.starts_with(kInvalidTimeStylePrefix) ||
+        error.find("for 'time style'") != std::string::npos) {
       safeErrorPrint(error);
       safeErrorPrint("\n");
       return 2;
@@ -3517,6 +3839,10 @@ REGISTER_COMMAND(
   }
 
   // GNU/Microsoft-style ls uses exit 2 for serious runtime trouble such as
-  // missing-path "cannot access" failures.
-  return *result ? 0 : 2;
+  // missing-path "cannot access" failures, and exit 1 for minor problems
+  // such as entries inside a listed directory that could not be statted.
+  if (*result) {
+    return g_had_minor_errors ? 1 : 0;
+  }
+  return 2;
 }

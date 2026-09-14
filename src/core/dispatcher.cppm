@@ -940,6 +940,89 @@ class RegistryImpl {
     // Get meta data from the command
     auto options = it->second.options;  // std::span<const OptionMeta>
 
+    // GNU getopt_long accepts any unambiguous abbreviation of a long option.
+    // Normalise abbreviations against the command's declared long options plus
+    // the implicit --help/--version, so hand-rolled option parsers get the
+    // same behaviour. Commands whose leading arguments are data strings are
+    // excluded (e.g. `echo --hel` must print "--hel", not help).
+    {
+      static constexpr std::string_view kLiteralArgCommands[] = {
+          "echo", "yes", "test", "[", "true", "false"};
+      const bool literal_args =
+          std::ranges::any_of(kLiteralArgCommands, [cmdName](auto n) {
+            return n == cmdName;
+          });
+      if (!literal_args) {
+        std::vector<std::string> abbrev_storage;
+        bool end_of_options = false;
+        std::optional<std::string> ambiguous;
+        for (std::string_view arg : effective_args) {
+          if (end_of_options || arg.size() <= 2 ||
+              !arg.starts_with("--")) {
+            if (arg == "--") end_of_options = true;
+            abbrev_storage.emplace_back(arg);
+            continue;
+          }
+          std::string_view name = arg;
+          std::string_view suffix;
+          if (auto eq = arg.find('='); eq != std::string_view::npos) {
+            name = arg.substr(0, eq);
+            suffix = arg.substr(eq);
+          }
+          if (name.size() <= 2) {
+            abbrev_storage.emplace_back(arg);
+            continue;
+          }
+          bool exact = (name == "--help" || name == "--version");
+          for (const auto &m : options) {
+            exact = exact || m.long_name == name;
+          }
+          if (exact) {
+            abbrev_storage.emplace_back(arg);
+            continue;
+          }
+          std::vector<std::string_view> matches;
+          auto consider = [&matches](std::string_view candidate,
+                                     std::string_view prefix) {
+            if (candidate.size() > prefix.size() &&
+                candidate.starts_with(prefix) &&
+                std::ranges::find(matches, candidate) == matches.end()) {
+              matches.push_back(candidate);
+            }
+          };
+          for (const auto &m : options) consider(m.long_name, name);
+          consider(std::string_view("--help"), name);
+          consider(std::string_view("--version"), name);
+          if (matches.empty()) {
+            abbrev_storage.emplace_back(arg);
+            continue;
+          }
+          if (matches.size() > 1) {
+            std::string msg = "option '" + std::string(name) +
+                              "' is ambiguous; possibilities:";
+            for (std::string_view p : matches) {
+              msg += " '";
+              msg += p;
+              msg += "'";
+            }
+            ambiguous = std::move(msg);
+            break;
+          }
+          abbrev_storage.push_back(std::string(matches[0]) +
+                                   std::string(suffix));
+        }
+        if (ambiguous) {
+          safeErrorPrintLn(std::string(cmdName) + ": " + *ambiguous);
+          safeErrorPrintLn(winux::i18n::format(
+              "common.try_help", "Try '{} --help' for more information.",
+              cmdName));
+          return behavior.parse_error_exit_code;
+        }
+        effective_args = replace_effective_args(
+            std::move(abbrev_storage), rewritten_storage, rewritten_views);
+      }
+    }
+
     if (behavior.special_dispatch != nullptr) {
       if (auto status = behavior.special_dispatch(it->second, effective_args)) {
         return *status;

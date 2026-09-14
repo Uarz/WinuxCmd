@@ -277,13 +277,18 @@ int wmain(int argc, wchar_t* wargv[]) noexcept {
       return printHelp();
     }
 
-    // Check for top-level help flag/alias
-    if (args.size() == 1 && args[0] == "--help") {
+    // Check for top-level help flag/alias. Like GNU getopt_long, accept any
+    // unambiguous abbreviation (e.g. --hel, --he for --help).
+    if (args.size() == 1 && args[0].size() >= 3 &&
+        std::string_view("--help").starts_with(args[0])) {
       return printHelp();
     }
 
-    // Check for version flags
-    if (args.size() == 1 && (args[0] == "--version" || args[0] == "-v")) {
+    // Check for version flags (unambiguous --version abbreviations too)
+    if (args.size() == 1 &&
+        (args[0] == "-v" ||
+         (args[0].size() >= 3 &&
+          std::string_view("--version").starts_with(args[0])))) {
       safePrintLn(L"WinuxCmd " + utf8_to_wstring(WinuxCmd::VERSION_STRING));
       return 0;
     }

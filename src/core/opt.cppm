@@ -213,8 +213,33 @@ export ParseResultRuntime parse_command_runtime(
       }
 
       if (!meta) {
-        set_unrecognized_option(name);
-        return result;
+        // GNU getopt_long accepts an unambiguous abbreviation of a long
+        // option and reports every candidate when it is ambiguous.
+        std::vector<std::string_view> possibilities;
+        for (const auto& m : metas) {
+          if (m.long_name.size() > name.size() &&
+              m.long_name.starts_with(name)) {
+            possibilities.push_back(m.long_name);
+            if (!meta) meta = &m;
+          }
+        }
+        if (possibilities.size() != 1) {
+          meta = nullptr;
+          if (possibilities.empty()) {
+            set_unrecognized_option(name);
+          } else {
+            std::string msg = "option '" + std::string(name) +
+                              "' is ambiguous; possibilities:";
+            for (std::string_view p : possibilities) {
+              msg += " '";
+              msg.append(p);
+              msg += "'";
+            }
+            result.ok = false;
+            result.error_message = std::move(msg);
+          }
+          return result;
+        }
       }
 
       size_t idx = meta->index;

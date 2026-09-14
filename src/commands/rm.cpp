@@ -700,6 +700,46 @@ REGISTER_COMMAND(
     RM_OPTIONS) {
   using namespace rm_pipeline;
 
+  // [GNU] rm.c refuses ANY abbreviated spelling of --no-preserve-root
+  // (getopt_long resolves the prefix, then rm errors out before acting):
+  //   rm --no-p f  ->  "rm: you may not abbreviate the --no-preserve-root
+  //   option" (exit 1, nothing removed).
+  // ctx.raw_args is post-normalization: the dispatcher already expands
+  // unambiguous long-option prefixes (getopt_long behaviour), so the
+  // abbreviation is invisible there.  Inspect the original process
+  // arguments via the CRT globals instead (uutils#10188, issue 962).
+  {
+    constexpr std::string_view kNoPreserveRoot = "--no-preserve-root";
+    bool end_of_options = false;
+    for (int i = 1; i < __argc; ++i) {
+      const std::string token = wstring_to_utf8(__wargv[i]);
+      std::string_view arg(token);
+      if (end_of_options || arg == "--") {
+        end_of_options = true;
+        continue;
+      }
+      if (!arg.starts_with("--")) continue;
+      const auto eq = arg.find('=');
+      const bool has_arg = eq != std::string_view::npos;
+      const std::string_view name =
+          has_arg ? arg.substr(0, eq) : arg;
+      if (name.size() <= 2 || !kNoPreserveRoot.starts_with(name)) continue;
+      if (has_arg) {
+        // getopt_long reports the argument on the *resolved* option name
+        // before rm's abbreviation check runs.
+        safeErrorPrintLn(
+            "rm: option '--no-preserve-root' doesn't allow an argument");
+        safeErrorPrintLn("Try 'rm --help' for more information.");
+        return 1;
+      }
+      if (name.size() < kNoPreserveRoot.size()) {
+        safeErrorPrintLn(
+            "rm: you may not abbreviate the --no-preserve-root option");
+        return 1;
+      }
+    }
+  }
+
   auto result = process_command(ctx);
   if (!result) {
     if (result.error() == "missing file operand") {

@@ -37,6 +37,10 @@ import core;
 import utils;
 import container;
 
+// Shared GNU-faithful test/[ parser and stat() helpers (issues 236, 963,
+// 1063).  Must come after `import utils;` for native_path::.
+#include "commands/test_expr.hpp"
+
 using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
@@ -71,9 +75,7 @@ auto constexpr BRACKET_OPTIONS =
                "file is owned by effective group ID (unsupported on Windows)"),
         // [GNU] -h
         OPTION("-h", "", "file is a symbolic link"),
-        // [GNU] -l: file is a symbolic link
-        OPTION("-l", "", "file is a symbolic link"),
-        // [IMPLEMENTED] Windows reparse points provide symbolic-link detection.
+        // [GNU] -L
         OPTION("-L", "", "file is a symbolic link"),
         // [GNU] -k
         OPTION("-k", "", "file has sticky bit"),
@@ -112,12 +114,8 @@ auto constexpr BRACKET_OPTIONS =
         OPTION("-ge", "", "integer greater than or equal"),
         // [GNU] -a
         OPTION("-a", "", "logical and"),
-        // [EXT] -and
-        OPTION("-and", "", "logical and"),
         // [GNU] -o
         OPTION("-o", "", "logical or"),
-        // [EXT] -or
-        OPTION("-or", "", "logical or"),
         // [GNU] !
         OPTION("!", "", "logical not"),
         // [GNU] =
@@ -126,14 +124,12 @@ auto constexpr BRACKET_OPTIONS =
         OPTION("==", "", "string equal"),
         // [GNU] !=
         OPTION("!=", "", "string not equal"),
-        // [GNU] <
-        OPTION("<", "", "string less than"),
-        // [GNU] <=
-        OPTION("<=", "", "string less than or equal"),
-        // [GNU] >
-        OPTION(">", "", "string greater than"),
-        // [GNU] >=
-        OPTION(">=", "", "string greater than or equal")};
+        // [GNU] -nt
+        OPTION("-nt", "", "file1 is newer than file2"),
+        // [GNU] -ot
+        OPTION("-ot", "", "file1 is older than file2"),
+        // [GNU] -ef
+        OPTION("-ef", "", "file1 and file2 have the same device and inode")};
 
 namespace bracket_command {
 auto materialize_raw_args(const std::vector<std::string_view>& raw_args)
@@ -144,267 +140,16 @@ auto materialize_raw_args(const std::vector<std::string_view>& raw_args)
   return args;
 }
 
-auto file_attrs(const std::string& path) -> DWORD {
-  return GetFileAttributesW(utf8_to_wstring(path).c_str());
-}
-
-auto file_exists(const std::string& path) -> bool {
-  return file_attrs(path) != INVALID_FILE_ATTRIBUTES;
-}
-
-auto is_regular_file(const std::string& path) -> bool {
-  DWORD attrs = file_attrs(path);
-  return attrs != INVALID_FILE_ATTRIBUTES &&
-         (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
-}
-
-auto is_directory(const std::string& path) -> bool {
-  DWORD attrs = file_attrs(path);
-  return attrs != INVALID_FILE_ATTRIBUTES &&
-         (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
-}
-
-auto is_symbolic_link(const std::string& path) -> bool {
-  DWORD attrs = file_attrs(path);
-  return attrs != INVALID_FILE_ATTRIBUTES &&
-         (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-}
-
-auto is_modified_since_read(const std::string& path) -> bool {
-  WIN32_FILE_ATTRIBUTE_DATA data;
-  if (!GetFileAttributesExW(utf8_to_wstring(path).c_str(),
-                            GetFileExInfoStandard, &data)) {
-    return false;
+auto evaluate_bracket_expression(std::span<const std::string> args,
+                                 std::string* error_message) -> int {
+  // [GNU] `[` shares test's parser exactly (test_expr.hpp), mirroring
+  // coreutils test.c semantics and diagnostics.
+  test_expr::Parser parser(args);
+  const int status = parser.parse();
+  if (error_message != nullptr) {
+    *error_message = parser.error();
   }
-  return CompareFileTime(&data.ftLastWriteTime, &data.ftLastAccessTime) > 0;
-}
-
-auto file_has_size(const std::string& path) -> bool {
-  WIN32_FILE_ATTRIBUTE_DATA data;
-  if (!GetFileAttributesExW(utf8_to_wstring(path).c_str(),
-                            GetFileExInfoStandard, &data)) {
-    return false;
-  }
-  return data.nFileSizeHigh > 0 || data.nFileSizeLow > 0;
-}
-
-auto string_to_int(const std::string& value, long long& out) -> bool {
-  auto [ptr, ec] =
-      std::from_chars(value.data(), value.data() + value.size(), out);
-  return ec == std::errc() && ptr == value.data() + value.size();
-}
-
-auto is_unary_operator(const std::string& op) -> bool {
-  static const std::unordered_set<std::string> ops = {
-      "-n", "-N", "-z", "-b", "-c", "-d", "-e", "-f", "-g", "-G", "-h", "-l",
-      "-L", "-k", "-p", "-r", "-s", "-S", "-t", "-u", "-w", "-x", "-O"};
-  return ops.contains(op);
-}
-
-auto is_binary_operator(const std::string& op) -> bool {
-  static const std::unordered_set<std::string> ops = {
-      "=",   "==",  "!=",  "<",  "<=",   ">",  ">=",  "-eq", "-ne", "-lt",
-      "-le", "-gt", "-ge", "-a", "-and", "-o", "-or", "-nt", "-ot", "-ef"};
-  return ops.contains(op);
-}
-
-auto compare_strings(const std::string& op, const std::string& a,
-                     const std::string& b) -> bool {
-  if (op == "=" || op == "==") return a == b;
-  if (op == "!=") return a != b;
-  if (op == "<") return a < b;
-  if (op == "<=") return a <= b;
-  if (op == ">") return a > b;
-  if (op == ">=") return a >= b;
-  return false;
-}
-
-auto compare_integers(const std::string& op, long long a, long long b) -> bool {
-  if (op == "-eq") return a == b;
-  if (op == "-ne") return a != b;
-  if (op == "-lt") return a < b;
-  if (op == "-le") return a <= b;
-  if (op == "-gt") return a > b;
-  if (op == "-ge") return a >= b;
-  return false;
-}
-
-auto evaluate_unary(const std::string& op, const std::string& arg) -> int {
-  if (op == "-n") return arg.empty() ? 1 : 0;
-  if (op == "-N") return is_modified_since_read(arg) ? 0 : 1;
-  if (op == "-z") return arg.empty() ? 0 : 1;
-  if (op == "-b") return file_exists(arg) ? 0 : 1;
-  if (op == "-c") return file_exists(arg) ? 0 : 1;
-  if (op == "-d") return is_directory(arg) ? 0 : 1;
-  if (op == "-e") return file_exists(arg) ? 0 : 1;
-  if (op == "-f") return is_regular_file(arg) ? 0 : 1;
-  if (op == "-g") return 1;
-  if (op == "-G") {
-    safeErrorPrintLn(
-        "test: -G is not supported on Windows (no effective group ID)");
-    return 2;
-  }
-  if (op == "-h" || op == "-l" || op == "-L") {
-    return is_symbolic_link(arg) ? 0 : 1;
-  }
-  if (op == "-k") return 1;
-  if (op == "-p") return 1;
-  if (op == "-r") return file_exists(arg) ? 0 : 1;
-  if (op == "-s") return file_has_size(arg) ? 0 : 1;
-  if (op == "-S") {
-    safeErrorPrintLn(
-        "test: -S is not supported for filesystem paths on Windows");
-    return 2;
-  }
-  if (op == "-t") return 1;
-  if (op == "-u") return 1;
-  if (op == "-w") {
-    DWORD attrs = file_attrs(arg);
-    return attrs != INVALID_FILE_ATTRIBUTES &&
-                   (attrs & FILE_ATTRIBUTE_READONLY) == 0
-               ? 0
-               : 1;
-  }
-  if (op == "-x") {
-    std::wstring wpath = utf8_to_wstring(arg);
-    auto dot = wpath.find_last_of(L'.');
-    if (dot == std::wstring::npos) return 1;
-    std::wstring ext = wpath.substr(dot + 1);
-    std::ranges::transform(ext, ext.begin(), towlower);
-    return (ext == L"exe" || ext == L"bat" || ext == L"cmd" || ext == L"ps1")
-               ? 0
-               : 1;
-  }
-  if (op == "-O") {
-    safeErrorPrintLn(
-        "test: -O is not supported on Windows (no effective user ID)");
-    return 2;
-  }
-  return 2;
-}
-
-auto evaluate_binary(const std::string& a, const std::string& op,
-                     const std::string& b) -> int {
-  if (op == "=" || op == "==" || op == "!=" || op == "<" || op == "<=" ||
-      op == ">" || op == ">=") {
-    return compare_strings(op, a, b) ? 0 : 1;
-  }
-
-  if (op == "-eq" || op == "-ne" || op == "-lt" || op == "-le" || op == "-gt" ||
-      op == "-ge") {
-    long long left = 0;
-    long long right = 0;
-    if (!string_to_int(a, left) || !string_to_int(b, right)) return 2;
-    return compare_integers(op, left, right) ? 0 : 1;
-  }
-
-  if (op == "-a" || op == "-and") return (!a.empty() && !b.empty()) ? 0 : 1;
-  if (op == "-o" || op == "-or") return (!a.empty() || !b.empty()) ? 0 : 1;
-  return 2;
-}
-
-auto invert_test_status(int status) -> int {
-  if (status == 0) return 1;
-  if (status == 1) return 0;
   return status;
-}
-
-auto evaluate_bracket_expression_legacy(std::span<const std::string> args)
-    -> int {
-  if (args.empty()) return 1;
-  if (args.front() == "!") {
-    return invert_test_status(
-        evaluate_bracket_expression_legacy(args.subspan(1)));
-  }
-  if (args.size() == 1) return args[0].empty() ? 1 : 0;
-  if (args.size() == 2 && is_unary_operator(args[0])) {
-    return evaluate_unary(args[0], args[1]);
-  }
-  if (args.size() == 3 && is_binary_operator(args[1])) {
-    return evaluate_binary(args[0], args[1], args[2]);
-  }
-  if (args.size() == 4 && args[1] == "!" &&
-      (args[2] == "=" || args[2] == "==" || args[2] == "!=")) {
-    return invert_test_status(evaluate_binary(args[0], args[2], args[3]));
-  }
-  return 2;
-}
-
-class BracketExpressionParser {
- public:
-  explicit BracketExpressionParser(std::span<const std::string> args)
-      : args_(args) {}
-  int parse() {
-    if (args_.empty()) return 1;
-    int result = parse_or();
-    return error_ || pos_ != args_.size() ? 2 : result;
-  }
-
- private:
-  int parse_or() {
-    int result = parse_and();
-    while (peek("-o") || peek("-or")) {
-      ++pos_;
-      int right = parse_and();
-      result = result == 0 || right == 0 ? 0 : 1;
-    }
-    return result;
-  }
-  int parse_and() {
-    int result = parse_not();
-    while (peek("-a") || peek("-and")) {
-      ++pos_;
-      int right = parse_not();
-      result = result == 0 && right == 0 ? 0 : 1;
-    }
-    return result;
-  }
-  int parse_not() {
-    if (peek("!")) {
-      ++pos_;
-      return invert_test_status(parse_not());
-    }
-    if (peek("(")) {
-      ++pos_;
-      int result = parse_or();
-      if (!peek(")")) {
-        error_ = true;
-        return 2;
-      }
-      ++pos_;
-      return result;
-    }
-    return parse_primary();
-  }
-  int parse_primary() {
-    if (pos_ >= args_.size()) {
-      error_ = true;
-      return 2;
-    }
-    if (pos_ + 1 < args_.size() &&
-        is_unary_operator(std::string(args_[pos_]))) {
-      auto op = std::string(args_[pos_++]);
-      return evaluate_unary(op, std::string(args_[pos_++]));
-    }
-    if (pos_ + 2 < args_.size() &&
-        is_binary_operator(std::string(args_[pos_ + 1]))) {
-      auto left = std::string(args_[pos_++]);
-      auto op = std::string(args_[pos_++]);
-      auto right = std::string(args_[pos_++]);
-      return evaluate_binary(left, op, right);
-    }
-    return args_[pos_++].empty() ? 1 : 0;
-  }
-  bool peek(std::string_view token) const {
-    return pos_ < args_.size() && args_[pos_] == token;
-  }
-  std::span<const std::string> args_;
-  size_t pos_ = 0;
-  bool error_ = false;
-};
-
-auto evaluate_bracket_expression(std::span<const std::string> args) -> int {
-  return BracketExpressionParser(args).parse();
 }
 }  // namespace bracket_command
 
@@ -433,5 +178,11 @@ REGISTER_COMMAND(bracket,
   }
 
   args.pop_back();
-  return bracket_command::evaluate_bracket_expression(args);
+  std::string error_message;
+  const int status =
+      bracket_command::evaluate_bracket_expression(args, &error_message);
+  if (!error_message.empty()) {
+    safeErrorPrintLn("[: " + winux::i18n::translate_error(error_message));
+  }
+  return status;
 }

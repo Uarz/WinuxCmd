@@ -429,8 +429,7 @@ auto move_single_path(const std::string& src_path, const std::string& dest_path,
   if (overwrite_mode == OverwriteMode::default_mode && dest_exists &&
       _isatty(_fileno(stdin))) {
     DWORD attrs = GetFileAttributesW(wdest_path.c_str());
-    if (attrs != INVALID_FILE_ATTRIBUTES &&
-        (attrs & FILE_ATTRIBUTE_READONLY)) {
+    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY)) {
       safeErrorPrint("mv: replace '");
       safeErrorPrint(dest_path);
       safeErrorPrint("', overriding mode 0444 (r--r--r--)? ");
@@ -551,9 +550,8 @@ auto process_single_source(const std::string& src_path,
   // [GNU] A trailing separator forces a directory operand: a regular file
   // fails at stat time, while a symlink/junction passes stat but the rename
   // fails ENOTDIR (uutils#10026).
-  bool trailing_sep =
-      src_path.size() > 1 &&
-      (src_path.back() == '/' || src_path.back() == '\\');
+  bool trailing_sep = src_path.size() > 1 &&
+                      (src_path.back() == '/' || src_path.back() == '\\');
   if (trailing_sep) {
     std::string stripped = strip_trailing_slashes(src_path);
     DWORD attrs = GetFileAttributesW(utf8_to_wstring(stripped).c_str());
@@ -562,8 +560,7 @@ auto process_single_source(const std::string& src_path,
                              "': No such file or directory");
     }
     if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-      return std::unexpected("cannot stat '" + src_path +
-                             "': Not a directory");
+      return std::unexpected("cannot stat '" + src_path + "': Not a directory");
     }
     if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
       std::string final_dest = move_ctx.dest_path;

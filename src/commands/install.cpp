@@ -133,8 +133,7 @@ auto quote_mode_text(std::string_view text) -> std::string {
   for (unsigned char ch : text) {
     if (ch < 0x20 || ch == 0x7f) {
       char esc[8];
-      std::snprintf(esc, sizeof(esc), "\\%03o",
-                    static_cast<unsigned>(ch));
+      std::snprintf(esc, sizeof(esc), "\\%03o", static_cast<unsigned>(ch));
       out += esc;
     } else {
       out.push_back(static_cast<char>(ch));
@@ -468,10 +467,9 @@ auto build_config(const CommandContext<INSTALL_OPTIONS.size()>& ctx)
 
   if (ctx.positionals.size() == 1) {
     // GNU: a single operand in copy mode is a missing destination.
-    return std::unexpected(
-        "missing destination file operand after '" +
-        std::string(ctx.positionals[0]) +
-        "'\nTry 'install --help' for more information.");
+    return std::unexpected("missing destination file operand after '" +
+                           std::string(ctx.positionals[0]) +
+                           "'\nTry 'install --help' for more information.");
   }
 
   for (size_t i = 0; i + 1 < ctx.positionals.size(); ++i) {
@@ -523,18 +521,18 @@ auto preserve_timestamps(const std::string& source, const std::string& dest)
     -> bool {
   auto src_operand = native_path::make_api_path_operand(source);
   auto dst_operand = native_path::make_api_path_operand(dest);
-  HANDLE hSource = CreateFileW(
-      src_operand.extended.c_str(), GENERIC_READ,
-      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  HANDLE hSource =
+      CreateFileW(src_operand.extended.c_str(), GENERIC_READ,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (hSource == INVALID_HANDLE_VALUE) {
     return false;
   }
 
-  HANDLE hDest = CreateFileW(
-      dst_operand.extended.c_str(), FILE_WRITE_ATTRIBUTES,
-      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  HANDLE hDest =
+      CreateFileW(dst_operand.extended.c_str(), FILE_WRITE_ATTRIBUTES,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (hDest == INVALID_HANDLE_VALUE) {
     CloseHandle(hSource);
     return false;
@@ -709,8 +707,7 @@ auto run(const Config& cfg) -> int {
       if (dest_attrs != INVALID_FILE_ATTRIBUTES) {
         std::string backup_path = dest + cfg.backup_suffix;
         auto dest_operand = native_path::make_api_path_operand(dest);
-        auto backup_operand =
-            native_path::make_api_path_operand(backup_path);
+        auto backup_operand = native_path::make_api_path_operand(backup_path);
         if (MoveFileExW(dest_operand.extended.c_str(),
                         backup_operand.extended.c_str(),
                         MOVEFILE_REPLACE_EXISTING)) {
@@ -734,8 +731,7 @@ auto run(const Config& cfg) -> int {
       // [GNU] install copies /dev/stdin contents like a regular file
       // (uutils#12407).
       if (!copy_stdin_to_dest(dest)) {
-        safeErrorPrintLn("install: cannot create regular file '" + dest +
-                         "'");
+        safeErrorPrintLn("install: cannot create regular file '" + dest + "'");
         return 1;
       }
     } else {
@@ -747,11 +743,10 @@ auto run(const Config& cfg) -> int {
       }
       auto src_operand = native_path::make_api_path_operand(source);
       auto dst_operand = native_path::make_api_path_operand(dest);
-      if (!CopyFileW(src_operand.extended.c_str(),
-                     dst_operand.extended.c_str(), FALSE)) {
+      if (!CopyFileW(src_operand.extended.c_str(), dst_operand.extended.c_str(),
+                     FALSE)) {
         safeErrorPrintLn("install: cannot create regular file '" + dest +
-                         "': " +
-                         win32_posix_error_text(GetLastError()));
+                         "': " + win32_posix_error_text(GetLastError()));
         return 1;
       }
     }

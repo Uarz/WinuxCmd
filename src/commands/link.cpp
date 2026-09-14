@@ -57,9 +57,8 @@ REGISTER_COMMAND(
     link_cmd, "link", "link FILE1 FILE2",
     "Call the link function to create a link named FILE2 to an existing "
     "FILE1.\n",
-    "  link existing.txt newlink.txt",
-    "ln(1), symlink(2)", "WinuxCmd", "Copyright © 2026 WinuxCmd",
-    LINK_OPTIONS) {
+    "  link existing.txt newlink.txt", "ln(1), symlink(2)", "WinuxCmd",
+    "Copyright © 2026 WinuxCmd", LINK_OPTIONS) {
   const auto& positionals = ctx.positionals;
   if (positionals.size() < 2) {
     if (positionals.empty()) {

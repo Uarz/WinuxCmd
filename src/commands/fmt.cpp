@@ -112,6 +112,30 @@ auto parse_positive_int(std::string_view value, std::string_view name)
   return parsed;
 }
 
+// [GNU] fmt.c reports bad -w/-g values (and the obsolete -WIDTH form) as
+//   fmt: invalid width: 'abc'
+//   fmt: invalid width: '99999999999': Value too large for defined data type
+// (xstrtol surfaces EOVERFLOW for out-of-range literals). Both options accept
+// 0 (e.g. "fmt -w 0" puts every word on its own line).
+auto parse_width_value(std::string_view value) -> cp::Result<int> {
+  auto message = [&value](bool out_of_range) {
+    std::string msg = winux::i18n::format("command.fmt.error.invalid_width",
+                                          "invalid width: '{}'", value);
+    if (out_of_range) msg += ": Value too large for defined data type";
+    return msg;
+  };
+  int parsed = 0;
+  auto [ptr, ec] =
+      std::from_chars(value.data(), value.data() + value.size(), parsed);
+  if (ec == std::errc::result_out_of_range) {
+    return std::unexpected(message(true));
+  }
+  if (ec != std::errc() || ptr != value.data() + value.size() || parsed < 0) {
+    return std::unexpected(message(false));
+  }
+  return parsed;
+}
+
 auto build_config(const CommandContext<FMT_OPTIONS.size()>& ctx)
     -> cp::Result<Config> {
   Config cfg;
@@ -147,7 +171,7 @@ auto build_config(const CommandContext<FMT_OPTIONS.size()>& ctx)
     width_opt = ctx.get<std::string>("-w", "");
   }
   if (!width_opt.empty()) {
-    auto width = parse_positive_int(width_opt, "width");
+    auto width = parse_width_value(width_opt);
     if (!width) return std::unexpected(width.error());
     cfg.width = *width;
     cfg.width_set = true;
@@ -168,10 +192,20 @@ auto build_config(const CommandContext<FMT_OPTIONS.size()>& ctx)
     goal_opt = ctx.get<std::string>("-g", "");
   }
   if (!goal_opt.empty()) {
-    auto goal = parse_positive_int(goal_opt, "goal");
+    auto goal = parse_width_value(goal_opt);
     if (!goal) return std::unexpected(goal.error());
     cfg.goal = *goal;
     cfg.goal_set = true;
+    // [GNU] A goal wider than the maximum width is rejected after option
+    // parsing, independently of the order -w and -g appear on the command
+    // line (max_width is the -w value or the default 75 here).
+    if (cfg.goal > cfg.width) {
+      return std::unexpected(
+          winux::i18n::format("command.fmt.error.invalid_width",
+                              "invalid width: '{}'", goal_opt) +
+          ": Numerical result out of range");
+    }
+    // [GNU] With -g but no -w the maximum width becomes goal + 10.
     if (!cfg.width_set) {
       cfg.width = cfg.goal + 10;
     }

@@ -711,6 +711,31 @@ auto rewrite_fold_obsolete_args(std::span<std::string_view> args)
   return rewritten;
 }
 
+// GNU fmt accepts the obsolete "-WIDTH" form (e.g. "fmt -60"), but only when
+// it is the very first argument; a digit option in any other position is a
+// getopt error in fmt.c. The whole rest of the argument must be digits —
+// "fmt -60s" fails with "invalid width: '60s'" — so the token is rewritten
+// to "-w <rest>" and fmt's own validation reports the same diagnostic.
+auto rewrite_fmt_obsolete_args(std::span<std::string_view> args)
+    -> std::optional<std::vector<std::string>> {
+  if (args.empty()) {
+    return std::nullopt;
+  }
+
+  std::string_view first = args[0];
+  if (first.size() < 2 || first[0] != '-' || first[1] == '-' ||
+      !std::isdigit(static_cast<unsigned char>(first[1]))) {
+    return std::nullopt;
+  }
+
+  std::vector<std::string> rewritten;
+  rewritten.reserve(args.size() + 1);
+  rewritten.emplace_back("-w");
+  rewritten.emplace_back(first.substr(1));
+  append_remaining_args(rewritten, args, 1);
+  return rewritten;
+}
+
 auto echo_posixly_correct_literal_mode(std::string_view cmdName,
                                        std::span<std::string_view> args)
     -> bool {
@@ -889,7 +914,11 @@ auto behavior_for(std::string_view name) -> CommandBehavior {
     behavior.parse_error_exit_code = 125;
   } else if (name == "nohup") {
     behavior.parse_error_exit_code = is_posixly_correct() ? 127 : 125;
-  } else if (name == "printenv" || name == "tty") {
+  } else if (name == "printenv" || name == "tty" || name == "sort" ||
+             name == "ls" || name == "dir" || name == "vdir" ||
+             name == "getopt" || name == "expr" || name == "test" ||
+             name == "[") {
+    // [GNU] these commands exit 2 on option/usage errors.
     behavior.parse_error_exit_code = 2;
   }
 
@@ -911,6 +940,8 @@ auto behavior_for(std::string_view name) -> CommandBehavior {
     append_rewrite_hook(behavior, rewrite_pr_args);
   } else if (name == "fold") {
     append_rewrite_hook(behavior, rewrite_fold_obsolete_args);
+  } else if (name == "fmt") {
+    append_rewrite_hook(behavior, rewrite_fmt_obsolete_args);
   } else if (name == "echo") {
     append_rewrite_hook(behavior, rewrite_echo_args);
     behavior.standard_interception_enabled = echo_standard_interception_enabled;
@@ -1107,8 +1138,18 @@ class RegistryImpl {
     }
 
     if (wants_standard_version(cmdName, effective_args, options)) {
+      // [GNU] --version prints a multi-line block in the shape of
+      // "cmd (suite) version" + copyright/license/warranty/author (#1044).
       safePrintLn(std::string(cmdName) + " (WinuxCmd) " +
                   std::string(WinuxCmd::VERSION_STRING));
+      safePrintLn("Copyright (C) 2026 WinuxCmd");
+      safePrintLn("License MIT <https://opensource.org/license/mit>.");
+      safePrintLn(
+          "This is free software: you are free to change and "
+          "redistribute it.");
+      safePrintLn("There is NO WARRANTY, to the extent permitted by law.");
+      safePrintLn("");
+      safePrintLn("Written by WinuxCmd contributors.");
       return 0;
     }
 

@@ -35,6 +35,14 @@ export auto option_policy_for_command(std::string_view command)
   if (command == "timeout") {
     policy.stop_options_after_positionals = 2;
   }
+  if (command == "getopt") {
+    // [util-linux] getopt's own options end at the first operand
+    // (the optstring); everything after it is data to normalize.
+    policy.stop_options_after_positionals = 1;
+  }
+  // [GNU] fmt's obsolete "-WIDTH" width is argv[1]-only; digit options in
+  // other positions get fmt.c's own diagnostic.
+  policy.obsolete_numeric_width_hint = command == "fmt";
   return policy;
 }
 

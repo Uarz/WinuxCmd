@@ -107,9 +107,11 @@ auto constexpr PR_OPTIONS = std::array{
     // [GNU]
     OPTION("-N", "--first-line-number",
            "start counting with NUMBER at line 1 of first page", STRING_TYPE),
-    // [GNU]
+    // [GNU] -S takes an optional *attached* [STRING] argument only; a
+    // separate word is a file operand (pr -S , f fails to open ',').
     OPTION("-S", "--sep-string",
-           "separate columns by STRING (default single space)", STRING_TYPE),
+           "separate columns by STRING (default single space)",
+           OPTIONAL_STRING_TYPE),
     // [GNU]
     OPTION("-v", "--show-nonprinting",
            "use octal backslash notation for non-printing characters",
@@ -138,11 +140,28 @@ struct Config {
   bool form_feed = false;
   std::string header;
   int page_length = 66;
-  // [GNU] -n/--number-lines: presence flag (numbering enabled).
+  // [GNU] -n/--number-lines: presence flag (numbering enabled) plus the
+  // [SEP[DIGITS]] parameters — the separator character defaults to TAB and
+  // the field width to 5 digits.
   bool number_lines_set = false;
+  char number_sep = '\t';
+  int number_digits = 5;
   int indent = 0;
   bool no_file_warnings = false;
   std::string separator = "\t";
+  // [GNU] -s/--separator is an "old" option (pr.c old_s): bare it selects
+  // field mode for column output, and without -w/-W it annuls column
+  // alignment entirely (join_lines).
+  bool old_s = false;
+  bool old_s_arg = false;
+  // [GNU] -a/--across only changes the column fill order; it never selects
+  // a column count by itself.
+  bool across = false;
+  // [GNU] -w is an "old" option (old_w): with columns/-m it activates -W
+  // (truncate+align), without them it selects join mode.
+  bool width_set = false;
+  bool page_width_set = false;  // -W/--page-width
+  bool sep_string_set = false;  // -S/--sep-string
   bool omit_header = false;
   bool omit_pagination = false;
   int page_width = 72;
@@ -219,6 +238,37 @@ auto parse_tab_spec(const std::string& label, const std::string& raw)
   return v;
 }
 
+// [GNU] -n takes an optional attached [SEP[DIGITS]] argument: when the first
+// character is not a digit it is the separator character, and the remaining
+// digits give the line-number field width. Mirrors pr.c messages:
+//   pr: '-n' extra characters or invalid number in the argument: '3x'
+auto parse_number_spec(const std::string& label, const std::string& raw)
+    -> std::expected<std::pair<char, int>, std::string> {
+  auto fail = [&](const std::string& quoted) {
+    return std::unexpected(winux::i18n::format(
+        "command.pr.error.extra_characters",
+        "'{}' extra characters or invalid number in the argument: '{}'", label,
+        quoted));
+  };
+  size_t i = 0;
+  char sep = '\t';
+  if (i < raw.size() && !std::isdigit(static_cast<unsigned char>(raw[i]))) {
+    sep = raw[i++];
+  }
+  std::string rest = raw.substr(i);
+  if (rest.empty()) return std::pair{sep, 5};  // [GNU] default field width
+  int v = 0;
+  try {
+    size_t pos = 0;
+    v = std::stoi(rest, &pos);
+    if (pos != rest.size()) return fail(rest);
+  } catch (...) {
+    return fail(rest);
+  }
+  if (v < 1) return fail(rest);
+  return std::pair{sep, v};
+}
+
 auto build_config(const CommandContext<PR_OPTIONS.size()>& ctx)
     -> cp::Result<Config> {
   Config cfg;
@@ -249,10 +299,9 @@ auto build_config(const CommandContext<PR_OPTIONS.size()>& ctx)
   // [GNU] --double-space is the long-name alias of -d.
   cfg.double_space =
       ctx.get<bool>("-d", false) || ctx.get<bool>("--double-space", false);
-  // [GNU] --across requests multi-column output like -a.
-  const bool across =
-      ctx.get<bool>("--across", false) || ctx.get<bool>("-a", false);
-  if (across && cfg.columns == 1) cfg.columns = 2;
+  // [GNU] -a/--across only switches the column fill order; it does not
+  // imply a column count (pr -a FILE prints single-column output).
+  cfg.across = ctx.get<bool>("--across", false) || ctx.get<bool>("-a", false);
   cfg.form_feed =
       ctx.get<bool>("--form-feed", false) || ctx.get<bool>("-f", false);
   cfg.no_file_warnings =
@@ -263,25 +312,21 @@ auto build_config(const CommandContext<PR_OPTIONS.size()>& ctx)
       ctx.get<bool>("--omit-pagination", false) || ctx.get<bool>("-T", false);
 
   // [GNU] -e/--expand-tabs accept an optional attached [CHAR[WIDTH]] value;
-  // the option alone enables expansion with the default width 8.
+  // the option alone enables expansion with the default width 8. pr.c always
+  // reports the short option name '-e' in diagnostics.
   cfg.expand_set = ctx.count({"-e", "--expand", "--expand-tabs"}) > 0;
   std::string expand_raw;
-  const char* expand_label = "-e";
-  for (auto [name, label] :
-       {std::pair{std::string_view("--expand"),
-                  std::string_view("--expand-tabs")},
-        std::pair{std::string_view("--expand-tabs"),
-                  std::string_view("--expand-tabs")},
-        std::pair{std::string_view("-e"), std::string_view("-e")}}) {
+  for (auto name :
+       {std::string_view("--expand"), std::string_view("--expand-tabs"),
+        std::string_view("-e")}) {
     auto v = ctx.get<std::string>(name, "");
     if (!v.empty()) {
       expand_raw = v;
-      expand_label = label.data();
       break;
     }
   }
   if (!expand_raw.empty()) {
-    auto w = parse_tab_spec(expand_label, expand_raw);
+    auto w = parse_tab_spec("-e", expand_raw);
     if (!w) return std::unexpected(w.error());
     cfg.expand_width = *w;
   }
@@ -303,24 +348,23 @@ auto build_config(const CommandContext<PR_OPTIONS.size()>& ctx)
   }
 
   // [GNU] -n takes an optional attached [SEP[DIGITS]] argument; the option
-  // alone enables numbering with defaults.
+  // alone enables numbering with defaults. pr.c always reports the short
+  // option name '-n' in diagnostics.
   cfg.number_lines_set = ctx.count({"-n", "--number-lines"}) > 0;
   std::string number_raw;
-  const char* number_label = "-n";
-  for (auto [name, label] :
-       {std::pair{std::string_view("--number-lines"),
-                  std::string_view("--number-lines")},
-        std::pair{std::string_view("-n"), std::string_view("-n")}}) {
+  for (auto name :
+       {std::string_view("--number-lines"), std::string_view("-n")}) {
     auto v = ctx.get<std::string>(name, "");
     if (!v.empty()) {
       number_raw = v;
-      number_label = label.data();
       break;
     }
   }
   if (!number_raw.empty()) {
-    auto w = parse_tab_spec(number_label, number_raw);
-    if (!w) return std::unexpected(w.error());
+    auto spec = parse_number_spec("-n", number_raw);
+    if (!spec) return std::unexpected(spec.error());
+    cfg.number_sep = spec->first;
+    cfg.number_digits = spec->second;
   }
 
   auto indent_opt = ctx.get<std::string>("--indent", "");
@@ -328,17 +372,31 @@ auto build_config(const CommandContext<PR_OPTIONS.size()>& ctx)
     indent_opt = ctx.get<std::string>("-o", "");
   }
   if (!indent_opt.empty()) {
+    // [GNU] pr.c reports '-o MARGIN' invalid line offset: 'abc' for a
+    // malformed or negative margin; zero is accepted.
+    auto bad_indent = [&]() {
+      return std::unexpected(winux::i18n::format(
+          "command.pr.error.invalid_line_offset",
+          "'-o MARGIN' invalid line offset: '{}'", indent_opt));
+    };
     try {
-      cfg.indent = std::stoi(indent_opt);
+      size_t pos = 0;
+      int v = std::stoi(indent_opt, &pos);
+      if (pos != indent_opt.size() || v < 0) return bad_indent();
+      cfg.indent = v;
     } catch (...) {
-      return std::unexpected("invalid indent value");
+      return bad_indent();
     }
   }
 
+  // [GNU] -s takes an optional attached character; a bare -s selects field
+  // mode for column output without naming a separator character.
+  cfg.old_s = ctx.count({"-s", "--separator"}) > 0;
   auto sep_opt = ctx.get<std::string>("--separator", "");
   if (sep_opt.empty()) {
     sep_opt = ctx.get<std::string>("-s", "");
   }
+  cfg.old_s_arg = !sep_opt.empty();
   if (!sep_opt.empty()) {
     cfg.separator = sep_opt;
   }
@@ -347,12 +405,14 @@ auto build_config(const CommandContext<PR_OPTIONS.size()>& ctx)
   if (width_opt.empty()) {
     width_opt = ctx.get<std::string>("-w", "");
   }
+  cfg.width_set = ctx.count({"-w", "--width"}) > 0;
   if (!width_opt.empty()) {
     auto v = parse_positive_number("-w PAGE_WIDTH", "characters", width_opt);
     if (!v) return std::unexpected(v.error());
     cfg.page_width = *v;
   }
 
+  const bool columns_explicit = ctx.count({"-COLUMN", "--columns"}) > 0;
   auto col_opt = ctx.get<std::string>("--columns", "");
   if (col_opt.empty()) {
     col_opt = ctx.get<std::string>("-COLUMN", "");
@@ -385,23 +445,20 @@ auto build_config(const CommandContext<PR_OPTIONS.size()>& ctx)
   }
   cfg.date_format = date_fmt;
 
-  // [GNU] -i takes an optional attached [CHAR[WIDTH]] argument.
+  // [GNU] -i takes an optional attached [CHAR[WIDTH]] argument. pr.c always
+  // reports the short option name '-i' in diagnostics.
   cfg.output_tabs_set = ctx.count({"-i", "--output-tabs"}) > 0;
   std::string output_tabs_raw;
-  const char* output_tabs_label = "-i";
-  for (auto [name, label] :
-       {std::pair{std::string_view("--output-tabs"),
-                  std::string_view("--output-tabs")},
-        std::pair{std::string_view("-i"), std::string_view("-i")}}) {
+  for (auto name :
+       {std::string_view("--output-tabs"), std::string_view("-i")}) {
     auto v = ctx.get<std::string>(name, "");
     if (!v.empty()) {
       output_tabs_raw = v;
-      output_tabs_label = label.data();
       break;
     }
   }
   if (!output_tabs_raw.empty()) {
-    auto w = parse_tab_spec(output_tabs_label, output_tabs_raw);
+    auto w = parse_tab_spec("-i", output_tabs_raw);
     if (!w) return std::unexpected(w.error());
     cfg.output_tabs_width = *w;
   }
@@ -412,6 +469,7 @@ auto build_config(const CommandContext<PR_OPTIONS.size()>& ctx)
   }
   cfg.first_line_number = fln_opt;
 
+  cfg.sep_string_set = ctx.count({"-S", "--sep-string"}) > 0;
   auto sep_str = ctx.get<std::string>("--sep-string", "");
   if (sep_str.empty()) {
     sep_str = ctx.get<std::string>("-S", "");
@@ -437,10 +495,23 @@ auto build_config(const CommandContext<PR_OPTIONS.size()>& ctx)
 
   auto pwidth_opt = ctx.get<std::string>("--page-width", "");
   if (pwidth_opt.empty()) pwidth_opt = ctx.get<std::string>("-W", "");
+  cfg.page_width_set = ctx.count({"-W", "--page-width"}) > 0;
   if (!pwidth_opt.empty()) {
     auto v = parse_positive_number("-W PAGE_WIDTH", "characters", pwidth_opt);
     if (!v) return std::unexpected(v.error());
     cfg.page_width = *v;
+  }
+
+  // [GNU] -m conflicts with both an explicit column count and -a
+  // (pr.c: "cannot specify number of columns when printing in parallel",
+  // "cannot specify both printing across and printing in parallel").
+  if (cfg.merge && columns_explicit) {
+    return std::unexpected(
+        "cannot specify number of columns when printing in parallel");
+  }
+  if (cfg.merge && cfg.across) {
+    return std::unexpected(
+        "cannot specify both printing across and printing in parallel");
   }
 
   return cfg;
@@ -645,18 +716,314 @@ auto format_date_header(const std::string& date_format, const SYSTEMTIME& st)
   return buf;
 }
 
-// Build column separator
-auto get_separator(const Config& cfg) -> std::string {
-  if (!cfg.sep_string.empty()) return cfg.sep_string;
-  if (!cfg.separator.empty()) return cfg.separator;
-  return "\t";
+// [GNU] Column layout resolved like pr.c init_parameters()/init_funcs():
+//   * no -s/-S: the separator is a single space for aligned columns or a
+//     TAB in join mode;
+//   * -s[CHAR] (the "old" option) without -w/-W annuls alignment: columns
+//     become fields joined by the separator (join_lines);
+//   * -S STRING selects an explicit separator but keeps alignment;
+//   * a single-TAB separator under alignment degrades to a space;
+//   * columns > 1 truncate cell text to the column width unless joining.
+struct ColumnLayout {
+  int columns = 1;
+  int margin = 0;
+  int colw = 0;
+  std::string sep;
+  int sep_len = 0;
+  bool join = false;
+  bool truncate = false;
+  bool parallel = false;
+  bool stored = false;  // down-column mode: lines are buffered first
+  bool numbered = false;
+  int in_tab = 8;
+  int num_digits = 5;
+  char num_sep = '\t';
+  int num_width = 0;
+  int out_tab = 8;
+};
+
+auto make_column_layout(const Config& cfg, int columns, bool parallel)
+    -> ColumnLayout {
+  ColumnLayout L;
+  L.columns = columns;
+  L.parallel = parallel;
+  L.stored = !parallel && !cfg.across;
+  L.in_tab = cfg.expand_width;
+  L.margin = cfg.indent;
+  L.numbered = cfg.number_lines_set;
+  L.num_digits = cfg.number_digits;
+  L.num_sep = cfg.number_sep;
+  L.out_tab = cfg.output_tabs_set ? cfg.output_tabs_width : 8;
+  // [GNU] number_width = digits + TAB_WIDTH(8, digits) when the number
+  // separator is TAB, digits + 1 otherwise (pr.c init_parameters).
+  L.num_width = cfg.number_digits +
+                (cfg.number_sep == '\t' ? (8 - cfg.number_digits % 8) : 1);
+
+  L.join = cfg.join_lines || (cfg.old_s && !cfg.width_set &&
+                              !cfg.page_width_set && (parallel || columns > 1));
+
+  const bool use_sep = cfg.sep_string_set || (cfg.old_s && cfg.old_s_arg);
+  if (use_sep) {
+    L.sep = cfg.sep_string_set ? cfg.sep_string : cfg.separator;
+    L.sep_len = static_cast<int>(L.sep.size());
+  } else {
+    L.sep = L.join ? "\t" : " ";
+    L.sep_len = 1;
+  }
+  if (!L.join && L.sep_len == 1 && L.sep == "\t") {
+    L.sep = " ";
+  }
+  L.truncate = columns > 1 && !L.join;
+
+  const int used_by_number = (parallel && L.numbered) ? L.num_width : 0;
+  const int useful =
+      cfg.page_width - used_by_number - (columns - 1) * L.sep_len;
+  L.colw = columns > 0 ? useful / columns : useful;
+  return L;
+}
+
+// [GNU] Column c is padded out to start_position - col_sep_length, i.e.
+// margin plus the slots (column width + separator) of the columns before
+// it.  For parallel numbered output the first slot is wider by the number
+// field (pr.c: h_next = h + chars_per_column + number_width).
+auto column_pad_target(const ColumnLayout& L, int c) -> int {
+  int target = L.margin;
+  for (int j = 0; j < c; ++j) {
+    target += L.colw + L.sep_len;
+    if (L.parallel && L.numbered && j == 0) {
+      target += L.num_width;
+    }
+  }
+  return target;
+}
+
+// [GNU] Row emitter implementing pr.c's lazy whitespace model: runs of
+// spaces are not printed immediately but accumulated (spaces_not_printed)
+// and tabified when flushed — a TAB is emitted whenever the next tab stop
+// lands on or before the pending goal and more than one column remains.
+// Trailing pending spaces at end of row are never emitted.
+struct ColumnEmitter {
+  const ColumnLayout& L;
+  std::string out;
+  int outpos = 0;
+  int pending = 0;
+  int pending_seps = 0;
+
+  void flush_spaces() {
+    const int goal = outpos + pending;
+    while (goal - outpos > 1) {
+      const int next = outpos + (L.out_tab - outpos % L.out_tab);
+      if (next > goal) break;
+      out += '\t';
+      outpos = next;
+    }
+    while (outpos < goal) {
+      out += ' ';
+      ++outpos;
+    }
+    pending = 0;
+  }
+
+  // [GNU] print_char: spaces join the pending run; other characters flush
+  // it first. Only printable characters advance output_position — a TAB in
+  // the text counts as zero width ('\b' backs up one).
+  void emit_char(char c) {
+    if (c == ' ') {
+      ++pending;
+      return;
+    }
+    if (pending > 0) flush_spaces();
+    out += c;
+    if (c == '\b') {
+      --outpos;
+    } else if (static_cast<unsigned char>(c) >= 0x20 && c != '\x7f') {
+      ++outpos;
+    }
+  }
+
+  void emit_text(const std::string& s) {
+    for (char c : s) emit_char(c);
+  }
+
+  // [GNU] print_sep_string: emits every separator counted so far; space
+  // characters join the pending run, other characters flush it first and
+  // are printed literally (a separator TAB counts as one column, not a tab
+  // stop), and a separator ending in spaces flushes the run.
+  void emit_seps() {
+    if (pending_seps <= 0) {
+      if (pending > 0) flush_spaces();
+      return;
+    }
+    for (int k = pending_seps; k > 0; --k) {
+      for (char s : L.sep) {
+        if (s == ' ') {
+          ++pending;
+        } else {
+          if (pending > 0) flush_spaces();
+          out += s;
+          ++outpos;
+        }
+      }
+      if (pending > 0) flush_spaces();
+    }
+    pending_seps = 0;
+  }
+
+  // [GNU] pad_across_to assigns the pending run so the logical position
+  // reaches the target; overshooting lines leave it negative (no-op pad).
+  void pad_to(int target) { pending = target - outpos; }
+
+  // [GNU] add_line_number: right-justified digits followed, for columns>1
+  // and a TAB separator, by number_width - digits spaces (the separator is
+  // not printed literally in that case).
+  void emit_number(long num) {
+    const std::string digits = std::to_string(num);
+    for (int i = static_cast<int>(digits.size()); i < L.num_digits; ++i) {
+      emit_char(' ');
+    }
+    emit_text(digits);
+    if (L.num_sep == '\t') {
+      for (int i = L.num_width - L.num_digits; i > 0; --i) emit_char(' ');
+    } else {
+      emit_char(L.num_sep);
+    }
+  }
+};
+
+struct ColumnCell {
+  std::string text;
+  bool present = false;
+  long number = 0;
+};
+
+// [GNU] Print one body row of columns (pr.c print_page inner loop).  GNU
+// stores each column's start_position and pads to start_position minus
+// col_sep_length; column 0's start_position already includes the separator
+// slot (init_funcs presets h = margin + col_sep_length), so its pad target
+// is just the margin.  In join mode (-J, or bare -s without -w/-W) the
+// start positions are ANYWHERE and no padding happens — except that the
+// margin still applies to column 0.  Every column contributes one
+// separator slot whether it prints or not; a column that has a line pads
+// and flushes the pending separators before its text.  Exhausted parallel
+// columns encountered after text still emit their padding/separators,
+// while exhausted leading columns are deferred (align_empty_cols): they
+// pad — and column 0 prints its number — without emitting separators.
+auto emit_column_row(const ColumnLayout& L,
+                     const std::vector<ColumnCell>& cells,
+                     long parallel_row_number) -> void {
+  ColumnEmitter e{L};
+  auto pad_for = [&](int c) {
+    e.pad_to(column_pad_target(L, c) - (c > 0 ? L.sep_len : 0));
+  };
+  bool any_printed = false;
+  for (int c = 0; c < L.columns; ++c) {
+    const ColumnCell& cell = cells[static_cast<size_t>(c)];
+    if (cell.present) {
+      if (L.parallel && !any_printed && c > 0) {
+        // [GNU] align_empty_cols: each exhausted leading column is aligned
+        // while separators_not_printed is held at zero, so no separator is
+        // emitted for it; the slots are re-counted afterwards.
+        for (int q = 0; q < c; ++q) {
+          if (!L.join) pad_for(q);
+          if (e.pending > 0) e.flush_spaces();
+          if (q == 0 && L.numbered) {
+            e.emit_number(parallel_row_number);
+          }
+        }
+        // [GNU] read_line then resets spaces_not_printed (0 when joining,
+        // chars_per_column when truncating); an aligned column's own
+        // pad_across_to overwrites it anyway.
+        if (L.join) e.pending = 0;
+      }
+      if (!L.join || c == 0) pad_for(c);
+      e.emit_seps();
+      if (L.numbered && (!L.parallel || c == 0)) {
+        e.emit_number(cell.number);
+      }
+      e.emit_text(cell.text);
+      // [GNU] print_stored finishes a buffered column by snapping
+      // output_position to its start_position plus the stored line length
+      // (end_vector[line]); column 0's start_position includes the
+      // separator slot which is subtracted back out.  This makes the
+      // logical column position — not the tabified visual one — the base
+      // for the next column, which matters in join mode where no padding
+      // fixes the positions.
+      if (L.stored && e.pending == 0) {
+        int text_len = 0;
+        for (char ch : cell.text) {
+          text_len += (ch == '\t') ? (L.in_tab - text_len % L.in_tab) : 1;
+        }
+        const int cell_len = (L.numbered ? L.num_width : 0) + text_len;
+        const int start = (L.join && c > 0) ? 0
+                          : c == 0          ? L.margin + L.sep_len
+                                            : column_pad_target(L, c);
+        int pos = start + cell_len;
+        if (start - L.sep_len == L.margin) pos -= L.sep_len;
+        e.outpos = pos;
+      }
+      any_printed = true;
+    } else if (L.parallel && any_printed) {
+      // [GNU] align_column for a file that ran out mid-row.
+      if (!L.join) pad_for(c);
+      e.emit_seps();
+    }
+    ++e.pending_seps;
+  }
+  safePrintLn(e.out);
+}
+
+// [GNU] Apply the per-cell transformations and truncation that pr.c applies
+// while reading a column line: input tabs are expanded unless the column
+// separator is a single TAB (untabify_input), and aligned columns truncate
+// at the column width.
+auto prepare_cell_text(const Config& cfg, const ColumnLayout& L,
+                       std::string text, bool numbered_cell) -> std::string {
+  const bool untabify = L.columns > 1 && !(L.sep_len == 1 && L.sep == "\t");
+  if (cfg.expand_set || untabify) {
+    text = expand_tabs(text, cfg.expand_width);
+  }
+  if (cfg.show_control_chars) {
+    text = show_control_chars_hat(text);
+  }
+  if (cfg.show_nonprinting) {
+    text = show_nonprinting_octal(text);
+  }
+  if (L.truncate) {
+    int limit = L.colw;
+    if (numbered_cell && !L.parallel) {
+      limit -= L.num_width;
+    }
+    if (limit < 0) limit = 0;
+    int pos = 0;
+    size_t cut = text.size();
+    for (size_t i = 0; i < text.size(); ++i) {
+      const int w =
+          (text[i] == '\t') ? (cfg.expand_width - pos % cfg.expand_width) : 1;
+      if (pos + w > limit) {
+        cut = i;
+        break;
+      }
+      pos += w;
+    }
+    text.resize(cut);
+  }
+  return text;
 }
 
 // Print page header
+// [GNU] When the page length leaves no room for a body (page_length <= 10,
+// i.e. lines_per_body = page_length - 10 <= 0), pr.c sets extremities =
+// false: the header block, the 5-line footer margin and all inter-page
+// padding are dropped and output is continuous, although pages are still
+// counted for +PAGE selection.
+auto extremities_on(const Config& cfg) -> bool {
+  return !cfg.omit_header && !cfg.omit_pagination && cfg.page_length > 10;
+}
+
 auto print_page_header(const Config& cfg, int page_num,
                        const std::string& filename, const std::string& date_str)
     -> void {
-  if (cfg.omit_header || cfg.omit_pagination) return;
+  if (!extremities_on(cfg)) return;
 
   std::string header_text = cfg.header.empty() ? filename : cfg.header;
 
@@ -675,10 +1042,14 @@ auto print_page_header(const Config& cfg, int page_num,
   if (right < 1) right = 1;
 
   // [GNU] The page starts with two blank lines, the header line, and two
-  // more blank lines before the body. (Savannah #1728)
+  // more blank lines before the body. (Savannah #1728) The -o margin is
+  // emitted before the first of those newlines and again before the header
+  // text line (pr.c print_header pads across to chars_per_margin first);
+  // the remaining header/trailer blank lines carry no margin.
+  const std::string margin(cfg.indent, ' ');
+  safePrintLn(margin);
   safePrintLn("");
-  safePrintLn("");
-  safePrintLn(date_str + std::string(left, ' ') + header_text +
+  safePrintLn(margin + date_str + std::string(left, ' ') + header_text +
               std::string(right, ' ') + page_str);
   safePrintLn("");
   safePrintLn("");
@@ -689,11 +1060,11 @@ auto print_page_header(const Config& cfg, int page_num,
 // page_length - 10 (measured against GNU 8.32: 66-line pages break the
 // body after 56 lines). (Savannah #1728)
 auto header_block_lines(const Config& cfg) -> int {
-  return (cfg.omit_header || cfg.omit_pagination) ? 0 : 5;
+  return extremities_on(cfg) ? 5 : 0;
 }
 
 auto body_capacity(const Config& cfg) -> int {
-  if (cfg.omit_header || cfg.omit_pagination) {
+  if (!extremities_on(cfg)) {
     return std::max(1, cfg.page_length);
   }
   return std::max(1, cfg.page_length - 10);
@@ -701,10 +1072,24 @@ auto body_capacity(const Config& cfg) -> int {
 
 // Print page trailer (blank lines for form feed)
 auto print_page_trailer(const Config& cfg) -> void {
-  if (cfg.omit_pagination) return;
+  if (!extremities_on(cfg)) return;
   if (cfg.form_feed || cfg.form_feed_ff) {
     safePrint("\f");
   }
+}
+
+// [GNU] -n[SEP[DIGITS]] line number field: the number right-justified in
+// DIGITS columns (default 5) followed by the separator character (default
+// TAB). Numbers wider than the field are not truncated.
+auto number_field(const Config& cfg, int line_num) -> std::string {
+  std::string field;
+  std::string num = std::to_string(line_num);
+  if (static_cast<int>(num.size()) < cfg.number_digits) {
+    field.append(cfg.number_digits - num.size(), ' ');
+  }
+  field += num;
+  field += cfg.number_sep;
+  return field;
 }
 
 // [GNU] Paginate one file's lines. Every file is printed by a separate
@@ -713,28 +1098,20 @@ auto print_page_trailer(const Config& cfg) -> void {
 auto paginate_file(const Config& cfg, SmallVector<std::string, 1024> all_lines,
                    const std::string& header_name, const std::string& date_str)
     -> void {
-  // Join lines if requested (-J/--join-lines)
-  if (cfg.join_lines && all_lines.size() > 1) {
-    SmallVector<std::string, 1024> joined_lines;
-    for (size_t i = 0; i < all_lines.size(); ++i) {
-      if (i + 1 < all_lines.size() && !all_lines[i].empty() &&
-          all_lines[i].back() != '\n') {
-        // Join with next line
-        joined_lines.push_back(all_lines[i] + all_lines[i + 1]);
-        ++i;  // Skip next line
-      } else {
-        joined_lines.push_back(all_lines[i]);
-      }
-    }
-    all_lines = std::move(joined_lines);
-  }
-
   // Apply start_page: skip lines before the start page
   // [GNU] Paging counts body lines only; the header block is part of the
   // page length. (Savannah #1728)
-  const int lines_per_page = body_capacity(cfg);
+  // [GNU] -d halves the number of text lines per page (pr.c:
+  // lines_per_body = MAX(1, lines_per_body / 2)) and each printed line is
+  // followed by a blank, so a page holds lines_per_body*2 physical body
+  // lines; when page_length-10 is odd the printed page is one line shorter
+  // than -l.
+  const int lines_per_page = cfg.double_space
+                                 ? std::max(1, body_capacity(cfg) / 2)
+                                 : body_capacity(cfg);
+  const int body_slots = cfg.double_space ? lines_per_page * 2 : lines_per_page;
   const int page_lines_total =
-      cfg.omit_header || cfg.omit_pagination ? lines_per_page : cfg.page_length;
+      extremities_on(cfg) ? body_slots + 10 : body_slots;
 
   // [GNU] a start page beyond the file's page count is reported and the
   // file is skipped (uutils #13557). pr.c reports this via error(0, ...),
@@ -762,7 +1139,6 @@ auto paginate_file(const Config& cfg, SmallVector<std::string, 1024> all_lines,
 
   // Process lines with all options
   std::string indent_str(cfg.indent, ' ');
-  std::string sep = get_separator(cfg);
   int line_num =
       cfg.first_line_number.empty() ? 1 : std::stoi(cfg.first_line_number);
   int page_num = 1;
@@ -774,93 +1150,79 @@ auto paginate_file(const Config& cfg, SmallVector<std::string, 1024> all_lines,
 
   // Process with multi-column support
   if (cfg.columns > 1) {
-    // Distribute lines across columns
-    size_t total_lines = all_lines.size();
-    size_t lines_per_col = (total_lines + cfg.columns - 1) / cfg.columns;
+    // [GNU] One file, multiple columns (pr.c storing_columns): each page
+    // holds lines_per_body rows of `columns` cells; the cells of a page are
+    // a contiguous chunk of the file, distributed down the columns (or
+    // across the rows with -a).  Column heights are balanced.
+    const ColumnLayout L = make_column_layout(cfg, cfg.columns, false);
+    const size_t total_lines = all_lines.size();
+    const int cols = cfg.columns;
+    size_t pos = 0;
+    while (pos < total_lines) {
+      const size_t chunk = std::min(static_cast<size_t>(lines_per_page) * cols,
+                                    total_lines - pos);
+      std::vector<std::vector<ColumnCell>> page_rows;
+      if (cfg.across) {
+        const size_t nrows = (chunk + cols - 1) / cols;
+        page_rows.assign(nrows, std::vector<ColumnCell>(cols));
+        for (size_t i = 0; i < chunk; ++i) {
+          ColumnCell& cell = page_rows[i / cols][i % cols];
+          cell.present = true;
+          cell.number = line_num + static_cast<long>(pos + i);
+          cell.text = prepare_cell_text(cfg, L, all_lines[pos + i],
+                                        cfg.number_lines_set);
+        }
+      } else {
+        // [GNU] balance(): first chunk%cols columns get one extra line.
+        std::vector<size_t> heights(cols);
+        size_t maxh = 0;
+        size_t off = pos;
+        for (int c = 0; c < cols; ++c) {
+          heights[c] =
+              chunk / cols + (c < static_cast<int>(chunk % cols) ? 1 : 0);
+          maxh = std::max(maxh, heights[c]);
+        }
+        page_rows.assign(maxh, std::vector<ColumnCell>(cols));
+        for (int c = 0; c < cols; ++c) {
+          for (size_t r = 0; r < heights[c]; ++r) {
+            ColumnCell& cell = page_rows[r][c];
+            cell.present = true;
+            cell.number = line_num + static_cast<long>(off + r);
+            cell.text = prepare_cell_text(cfg, L, all_lines[off + r],
+                                          cfg.number_lines_set);
+          }
+          off += heights[c];
+        }
+      }
 
-    // Balance columns on last page
-    if (cfg.balance_columns) {
-      lines_per_col = (total_lines + cfg.columns - 1) / cfg.columns;
+      if (page_num >= cfg.start_page) {
+        if (extremities_on(cfg)) {
+          print_page_header(cfg, page_num, header_name, date_str);
+        }
+        int used = 0;
+        for (const auto& row : page_rows) {
+          emit_column_row(L, row, 0);
+          ++used;
+          if (cfg.double_space) {
+            safePrintLn("");
+            ++used;
+          }
+        }
+        if (extremities_on(cfg) && !cfg.omit_pagination) {
+          for (int pad = page_lines_total - header_block_lines(cfg) - used;
+               pad > 0; --pad) {
+            safePrintLn("");
+          }
+          print_page_trailer(cfg);
+        }
+      }
+      pos += chunk;
+      ++page_num;
     }
+    return;
+  }
 
-    for (size_t row = 0; row < lines_per_col; ++row) {
-      if (!started) {
-        // Skip rows until we reach start_page
-        ++lines_on_page;
-        if (lines_on_page >= lines_per_page) {
-          lines_on_page = 0;
-          ++page_num;
-          if (page_num >= cfg.start_page) {
-            started = true;
-          }
-        }
-        continue;
-      }
-
-      if (!in_page) {
-        print_page_header(cfg, page_num, header_name, date_str);
-        in_page = true;
-      }
-
-      std::string output = indent_str;
-      for (int col = 0; col < cfg.columns; ++col) {
-        if (col > 0) output += sep;
-        size_t idx = col * lines_per_col + row;
-        if (idx < total_lines) {
-          std::string line = all_lines[idx];
-
-          // Apply expand_tabs
-          if (cfg.expand_set) {
-            line = expand_tabs(line, cfg.expand_width);
-          }
-
-          // Apply show_control_chars
-          if (cfg.show_control_chars) {
-            line = show_control_chars_hat(line);
-          }
-
-          // Apply show_nonprinting
-          if (cfg.show_nonprinting) {
-            line = show_nonprinting_octal(line);
-          }
-
-          // Apply output_tabs
-          if (cfg.output_tabs_set) {
-            line = replace_spaces_with_tabs(line, cfg.output_tabs_width);
-          }
-
-          output += line;
-        }
-      }
-
-      // Add line numbers
-      if (cfg.number_lines_set) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%6d  ", line_num++);
-        output = indent_str + buf + output.substr(indent_str.size());
-      }
-
-      safePrintLn(output);
-
-      if (cfg.double_space) {
-        safePrintLn("");
-      }
-
-      ++lines_on_page;
-      if (lines_on_page >= lines_per_page && !cfg.omit_pagination) {
-        // [GNU] Every page is filled to the page length before the break.
-        for (int pad =
-                 page_lines_total - header_block_lines(cfg) - lines_on_page;
-             pad > 0; --pad) {
-          safePrintLn("");
-        }
-        print_page_trailer(cfg);
-        ++page_num;
-        lines_on_page = 0;
-        in_page = false;
-      }
-    }
-  } else {
+  {
     // Single column mode
     for (const auto& line : all_lines) {
       if (!started) {
@@ -898,6 +1260,24 @@ auto paginate_file(const Config& cfg, SmallVector<std::string, 1024> all_lines,
         processed = show_nonprinting_octal(processed);
       }
 
+      // [GNU] -W truncates single-column lines at the page width; the old
+      // -w option only selects join mode and leaves lines intact.
+      if (cfg.page_width_set) {
+        int pos = 0;
+        size_t cut = processed.size();
+        for (size_t i = 0; i < processed.size(); ++i) {
+          const int w = (processed[i] == '\t')
+                            ? (cfg.expand_width - pos % cfg.expand_width)
+                            : 1;
+          if (pos + w > cfg.page_width) {
+            cut = i;
+            break;
+          }
+          pos += w;
+        }
+        processed.resize(cut);
+      }
+
       // Apply output_tabs
       if (cfg.output_tabs_set) {
         processed = replace_spaces_with_tabs(processed, cfg.output_tabs_width);
@@ -907,21 +1287,21 @@ auto paginate_file(const Config& cfg, SmallVector<std::string, 1024> all_lines,
 
       // Add line numbers
       if (cfg.number_lines_set) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%6d  ", line_num++);
-        output += buf;
+        output += number_field(cfg, line_num++);
       }
 
       output += processed;
 
       safePrintLn(output);
 
+      ++lines_on_page;
       if (cfg.double_space) {
+        // [GNU] The blank line inserted by -d occupies a body slot too.
         safePrintLn("");
+        ++lines_on_page;
       }
 
-      ++lines_on_page;
-      if (lines_on_page >= lines_per_page) {
+      if (lines_on_page >= body_slots) {
         // [GNU] Every page is filled to the page length before the break.
         for (int pad =
                  page_lines_total - header_block_lines(cfg) - lines_on_page;
@@ -939,8 +1319,9 @@ auto paginate_file(const Config& cfg, SmallVector<std::string, 1024> all_lines,
   // Final page trailer
   if (in_page && !cfg.omit_pagination) {
     // [GNU] Pad the final page with blank lines up to the page length
-    // (Savannah #1728). -t omits headers *and* trailers, so no padding.
-    if (!cfg.omit_header) {
+    // (Savannah #1728). -t omits headers *and* trailers, so no padding; the
+    // same applies when -l leaves no room for a body (page_length <= 10).
+    if (extremities_on(cfg)) {
       int used = header_block_lines(cfg) + lines_on_page;
       while (used < page_lines_total) {
         safePrintLn("");
@@ -961,9 +1342,10 @@ auto run(const Config& cfg) -> int {
   // process exit nonzero, even when -r suppresses the diagnostic.
   bool all_ok = true;
 
-  // Merge mode: print all files in parallel columns
+  // [GNU] -m/--merge prints the files in parallel columns and paginates
+  // the result like any other page stream: one shared header per page with
+  // an empty file name and the current time (pr.c init_fps/init_header).
   if (cfg.merge) {
-    // Read each file separately for merge mode
     SmallVector<SmallVector<std::string, 1024>, 16> file_lines;
     size_t max_lines = 0;
     for (const auto& file : files) {
@@ -973,7 +1355,7 @@ auto run(const Config& cfg) -> int {
         if (!cfg.no_file_warnings) {
           cp::report_error(lines_result, L"pr");
         }
-        file_lines.push_back({});
+        // [GNU] a file that cannot be opened removes its column entirely.
         continue;
       }
       file_lines.push_back(*lines_result);
@@ -981,21 +1363,91 @@ auto run(const Config& cfg) -> int {
         max_lines = lines_result->size();
       }
     }
+    if (file_lines.empty()) {
+      return 1;
+    }
 
-    std::string sep = get_separator(cfg);
-    std::string indent_str(cfg.indent, ' ');
+    const int ncols = static_cast<int>(file_lines.size());
+    const ColumnLayout L = make_column_layout(cfg, ncols, true);
+    if (L.colw < 1) {
+      safeErrorPrintLn(winux::i18n::format("command.pr.error.page_width_narrow",
+                                           "pr: page width too narrow"));
+      return 1;
+    }
 
-    for (size_t i = 0; i < max_lines; ++i) {
-      std::string output = indent_str;
-      for (size_t f = 0; f < file_lines.size(); ++f) {
-        if (f > 0) output += sep;
-        if (i < file_lines[f].size()) {
-          output += file_lines[f][i];
+    const std::string date_str =
+        format_date_header(cfg.date_format, now_local_st());
+    const int start_num =
+        cfg.first_line_number.empty() ? 1 : std::stoi(cfg.first_line_number);
+    const int lines_per_page = cfg.double_space
+                                   ? std::max(1, body_capacity(cfg) / 2)
+                                   : body_capacity(cfg);
+    const int body_slots =
+        cfg.double_space ? lines_per_page * 2 : lines_per_page;
+    const int page_lines_total =
+        extremities_on(cfg) ? body_slots + 10 : body_slots;
+
+    // [GNU] a start page beyond the page count is reported, the file is
+    // skipped, and the exit status is unaffected (uutils #13557).
+    const int total_pages = std::max(
+        1, static_cast<int>((max_lines + lines_per_page - 1) / lines_per_page));
+    if (cfg.start_page > total_pages) {
+      safeErrorPrintLn(winux::i18n::format(
+          "command.pr.error.page_exceeds",
+          "pr: starting page number {} exceeds page count {}", cfg.start_page,
+          total_pages));
+      return all_ok ? 0 : 1;
+    }
+
+    int page_num = 1;
+    size_t row = 0;
+    while (row < max_lines) {
+      const size_t end =
+          std::min(row + static_cast<size_t>(lines_per_page), max_lines);
+      if (page_num >= cfg.start_page) {
+        if (extremities_on(cfg)) {
+          print_page_header(cfg, page_num, "", date_str);
         }
+        int used = 0;
+        for (; row < end; ++row) {
+          std::vector<ColumnCell> cells(ncols);
+          for (int c = 0; c < ncols; ++c) {
+            if (row < file_lines[c].size()) {
+              ColumnCell& cell = cells[static_cast<size_t>(c)];
+              cell.present = true;
+              cell.number = start_num + static_cast<long>(row);
+              cell.text = prepare_cell_text(cfg, L, file_lines[c][row],
+                                            cfg.number_lines_set);
+            }
+          }
+          emit_column_row(L, cells, start_num + static_cast<long>(row));
+          ++used;
+          if (cfg.double_space) {
+            safePrintLn("");
+            ++used;
+          }
+        }
+        if (extremities_on(cfg) && !cfg.omit_pagination) {
+          for (int pad = page_lines_total - header_block_lines(cfg) - used;
+               pad > 0; --pad) {
+            safePrintLn("");
+          }
+          print_page_trailer(cfg);
+        }
+      } else {
+        row = end;
       }
-      safePrintLn(output);
+      ++page_num;
     }
     return all_ok ? 0 : 1;
+  }
+
+  // [GNU] init_parameters fails up front when the page width leaves less
+  // than one character per column.
+  if (cfg.columns > 1 && make_column_layout(cfg, cfg.columns, false).colw < 1) {
+    safeErrorPrintLn(winux::i18n::format("command.pr.error.page_width_narrow",
+                                         "pr: page width too narrow"));
+    return 1;
   }
 
   // [GNU] Without -m each file is paginated independently: it gets its own

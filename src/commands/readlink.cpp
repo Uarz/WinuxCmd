@@ -145,24 +145,6 @@ auto strip_extended_prefix(std::wstring path) -> std::wstring {
   return path;
 }
 
-auto get_full_path(const std::wstring& path)
-    -> std::expected<std::wstring, std::string> {
-  DWORD required = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
-  if (required == 0) {
-    return std::unexpected(win32_posix_error_text(GetLastError()));
-  }
-
-  std::wstring buffer(required, L'\0');
-  DWORD written =
-      GetFullPathNameW(path.c_str(), required, buffer.data(), nullptr);
-  if (written == 0 || written >= required) {
-    return std::unexpected(win32_posix_error_text(GetLastError()));
-  }
-
-  buffer.resize(written);
-  return strip_extended_prefix(std::move(buffer));
-}
-
 auto open_path_handle(const std::wstring& path, bool follow_reparse)
     -> UniqueHandle {
   DWORD flags = FILE_FLAG_BACKUP_SEMANTICS;
@@ -176,173 +158,37 @@ auto open_path_handle(const std::wstring& path, bool follow_reparse)
                   nullptr, OPEN_EXISTING, flags, nullptr));
 }
 
-auto path_from_handle(HANDLE handle)
-    -> std::expected<std::wstring, std::string> {
-  DWORD required = GetFinalPathNameByHandleW(
-      handle, nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-  if (required == 0) {
-    return std::unexpected(win32_posix_error_text(GetLastError()));
-  }
-
-  std::wstring buffer(required, L'\0');
-  DWORD written = GetFinalPathNameByHandleW(
-      handle, buffer.data(), required, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-  if (written == 0 || written >= required) {
-    return std::unexpected(win32_posix_error_text(GetLastError()));
-  }
-
-  buffer.resize(written);
-  return strip_extended_prefix(std::move(buffer));
-}
-
-auto path_suffix(const std::filesystem::path& full,
-                 const std::filesystem::path& prefix) -> std::filesystem::path {
-  auto full_it = full.begin();
-  auto prefix_it = prefix.begin();
-  while (full_it != full.end() && prefix_it != prefix.end() &&
-         *full_it == *prefix_it) {
-    ++full_it;
-    ++prefix_it;
-  }
-
-  std::filesystem::path suffix;
-  for (; full_it != full.end(); ++full_it) {
-    suffix /= *full_it;
-  }
-  return suffix;
-}
-
-auto find_existing_prefix(const std::filesystem::path& absolute)
-    -> std::filesystem::path {
-  std::error_code ec;
-  auto current = absolute;
-  while (!current.empty()) {
-    if (std::filesystem::exists(current, ec) && !ec) {
-      return current;
-    }
-
-    auto parent = current.parent_path();
-    if (parent == current) {
-      break;
-    }
-    current = parent;
-  }
-
-  return {};
-}
-
-auto canonicalize_existing(const std::filesystem::path& absolute)
-    -> std::expected<std::wstring, std::string> {
-  UniqueHandle handle = open_path_handle(absolute.wstring(), true);
-  if (!handle) {
-    return std::unexpected(win32_posix_error_text(GetLastError()));
-  }
-
-  return path_from_handle(handle.get());
-}
-
-// [GNU] -f/-m still follow links for every component of the non-existing
-// suffix; a symlink loop must fail with exit 1 and no output
-// (uutils #10249).
-auto check_suffix_resolvable(const std::filesystem::path& prefix,
-                             const std::filesystem::path& suffix)
-    -> std::expected<void, std::string> {
-  if (suffix.empty()) {
-    return {};
-  }
-  std::filesystem::path current = prefix;
-  for (const auto& part : suffix) {
-    current /= part;
-    const DWORD attrs = GetFileAttributesW(current.c_str());
-    if (attrs != INVALID_FILE_ATTRIBUTES &&
-        (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-      auto handle = open_path_handle(current.wstring(), true);
-      if (!handle) {
-        return std::unexpected(
-            winux::i18n::format("command.readlink.error.too_many_symlinks",
-                                "Too many levels of symbolic links"));
-      }
-      auto final_path = path_from_handle(handle.get());
-      if (!final_path) {
-        return std::unexpected(
-            winux::i18n::format("command.readlink.error.too_many_symlinks",
-                                "Too many levels of symbolic links"));
-      }
-    }
-  }
-  return {};
-}
-
+// [GNU] -f, -e and -m are canonicalize_filename_mode() CAN_ALL_BUT_LAST,
+// CAN_EXISTING and CAN_MISSING: every component is resolved and symlink
+// targets are substituted as they are found, so "ldir/f" resolves through
+// the intermediate link and a dangling leaf still prints its target's path
+// under -f/-m (uutils #10249).
 auto canonicalize_path(const std::wstring& original, Mode mode)
     -> std::expected<std::wstring, std::string> {
-  auto full_path_result = get_full_path(original);
-  if (!full_path_result) {
-    return std::unexpected(full_path_result.error());
-  }
-
-  std::filesystem::path absolute(*full_path_result);
-  std::error_code ec;
-  bool exists = std::filesystem::exists(absolute, ec) && !ec;
-
+  native_path::CanonMode canon_mode = native_path::CanonMode::all_but_last;
   if (mode == Mode::canonicalize_existing) {
-    if (!exists) {
-      return std::unexpected("No such file or directory");
-    }
-    return canonicalize_existing(absolute);
+    canon_mode = native_path::CanonMode::existing;
+  } else if (mode == Mode::canonicalize_missing) {
+    canon_mode = native_path::CanonMode::missing;
   }
 
-  if (mode == Mode::canonicalize) {
-    if (exists) {
-      return canonicalize_existing(absolute);
-    }
-
-    auto parent = absolute.parent_path();
-    std::error_code parent_ec;
-    if (parent.empty() || !std::filesystem::exists(parent, parent_ec) ||
-        parent_ec || !std::filesystem::is_directory(parent, parent_ec) ||
-        parent_ec) {
-      return std::unexpected("No such file or directory");
-    }
-
-    auto parent_resolved = canonicalize_existing(parent);
-    if (!parent_resolved) {
-      return parent_resolved;
-    }
-
-    auto suffix = path_suffix(absolute, parent);
-    if (auto check = check_suffix_resolvable(parent, suffix); !check) {
-      return std::unexpected(check.error());
-    }
-    return (std::filesystem::path(*parent_resolved) / suffix).wstring();
-  }
-
-  if (exists) {
-    return canonicalize_existing(absolute);
-  }
-
-  auto prefix = find_existing_prefix(absolute);
-  if (prefix.empty()) {
-    return std::unexpected("No such file or directory");
-  }
-
-  auto suffix = path_suffix(absolute, prefix);
-  if (!suffix.empty()) {
-    std::error_code dir_ec;
-    if (!std::filesystem::is_directory(prefix, dir_ec) || dir_ec) {
-      return std::unexpected("No such file or directory");
+  auto resolved = native_path::canonicalize_path_w(original, canon_mode);
+  if (!resolved) {
+    switch (resolved.error()) {
+      case ELOOP:
+        return std::unexpected(
+            winux::i18n::format("command.readlink.error.too_many_symlinks",
+                                "Too many levels of symbolic links"));
+      case ENOTDIR:
+        return std::unexpected("Not a directory");
+      case ENAMETOOLONG:
+        return std::unexpected(winux::i18n::format(
+            "command.readlink.error.file_name_too_long", "File name too long"));
+      default:
+        return std::unexpected("No such file or directory");
     }
   }
-
-  auto prefix_resolved = canonicalize_existing(prefix);
-  if (!prefix_resolved) {
-    return prefix_resolved;
-  }
-
-  if (auto check = check_suffix_resolvable(prefix, suffix); !check) {
-    return std::unexpected(check.error());
-  }
-
-  return absolute.wstring();
+  return *resolved;
 }
 
 auto read_link_target(const std::wstring& path)

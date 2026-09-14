@@ -243,6 +243,10 @@ auto format_size(uint64_t size) -> std::string {
 }
 
 auto format_permissions(DWORD attrs) -> std::string {
+  // [GNU] lstat() reports symlinks as lrwxrwxrwx regardless of the target.
+  if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+    return "lrwxrwxrwx";
+  }
   const bool directory = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
   const bool writable = (attrs & FILE_ATTRIBUTE_READONLY) == 0;
   std::string perm = directory ? "d" : "-";
@@ -258,6 +262,9 @@ auto file_type_name(DWORD attrs) -> std::string {
 }
 
 auto format_mode_octal(DWORD attrs) -> std::string {
+  if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+    return "777";
+  }
   if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
     return (attrs & FILE_ATTRIBUTE_READONLY) ? "555" : "755";
   }
@@ -293,13 +300,38 @@ auto io_block_size_for(const std::filesystem::path& p) -> uint32_t {
   return static_cast<uint32_t>(block_size);
 }
 
-auto load_file_stat(const std::filesystem::path& p)
+// [GNU] Without -L, stat uses lstat(): a symlink operand reports the link's
+// own metadata, so a dangling link still stats successfully.
+auto operand_is_symlink_w(const std::wstring& path) -> bool {
+  std::error_code ec;
+  const auto status = std::filesystem::symlink_status(
+      std::filesystem::path(native_path::to_extended_path(path)), ec);
+  return !ec && std::filesystem::is_symlink(status);
+}
+
+auto load_file_stat(const std::filesystem::path& p, bool lstat_link = false)
     -> cp::Result<FileStatData> {
   FileStatData stat;
   auto operand = native_path::make_api_path_operand_w(p.wstring());
   if (!GetFileAttributesExW(operand.extended.c_str(), GetFileExInfoStandard,
                             &stat.attrs)) {
-    return std::unexpected("Access denied");
+    if (!lstat_link) {
+      return std::unexpected("Access denied");
+    }
+    // lstat() path: GetFileAttributesExW resolves (and fails on) dangling
+    // links; FindFirstFileW returns the reparse point's own metadata.
+    WIN32_FIND_DATAW link_data{};
+    HANDLE find = FindFirstFileW(operand.extended.c_str(), &link_data);
+    if (find == INVALID_HANDLE_VALUE) {
+      return std::unexpected("Access denied");
+    }
+    FindClose(find);
+    stat.attrs.dwFileAttributes = link_data.dwFileAttributes;
+    stat.attrs.ftCreationTime = link_data.ftCreationTime;
+    stat.attrs.ftLastAccessTime = link_data.ftLastAccessTime;
+    stat.attrs.ftLastWriteTime = link_data.ftLastWriteTime;
+    stat.attrs.nFileSizeHigh = link_data.nFileSizeHigh;
+    stat.attrs.nFileSizeLow = link_data.nFileSizeLow;
   }
 
   auto accounts = win32_file_accounts(operand.extended);
@@ -310,6 +342,14 @@ auto load_file_stat(const std::filesystem::path& p)
 
   stat.size = stat.attrs.nFileSizeLow +
               (static_cast<uint64_t>(stat.attrs.nFileSizeHigh) << 32);
+  if (lstat_link) {
+    // [GNU] st_size of a symlink is the length of its target name.
+    std::error_code ec;
+    const auto target = std::filesystem::read_symlink(p, ec);
+    if (!ec) {
+      stat.size = target.wstring().size();
+    }
+  }
   stat.io_block_size = io_block_size_for(p);
 
   HANDLE h =
@@ -468,11 +508,11 @@ auto render_format(std::string_view format, const std::string& filename,
         // [GNU] %N dereferences symlinks in the output: 'l' -> 'target'
         // (uutils #8789).
         const std::wstring wname = utf8_to_wstring(filename);
-        const DWORD link_attrs = GetFileAttributesW(wname.c_str());
+        const DWORD link_attrs = native_path::attributes_w(wname);
         if (link_attrs != INVALID_FILE_ATTRIBUTES &&
             (link_attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
           HANDLE handle = CreateFileW(
-              wname.c_str(), 0,
+              native_path::to_extended_path(wname).c_str(), 0,
               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
               OPEN_EXISTING,
               FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -683,9 +723,9 @@ auto render_file_system_format(std::string_view format,
 auto print_file_system_stat(const std::string& filename) -> int {
   auto stat_result = load_file_system_stat(filename);
   if (!stat_result) {
-    safePrint("stat: cannot read file system for '");
-    safePrint(filename);
-    safePrintLn("'");
+    safeErrorPrint("stat: cannot read file system for '");
+    safeErrorPrint(filename);
+    safeErrorPrintLn("'");
     return 1;
   }
   const auto& stat = *stat_result;
@@ -712,14 +752,38 @@ auto print_file_system_stat(const std::string& filename) -> int {
 }
 
 auto print_stat(const std::string& filename, const Config& cfg) -> int {
-  std::error_code ec;
-  std::filesystem::path p(filename);
+  // Decode UTF-8 explicitly: a narrow std::filesystem::path decodes via the
+  // system ACP, and exists() without the \\?\ prefix fails beyond MAX_PATH
+  // (#1061).
+  std::filesystem::path p(utf8_to_wstring(filename));
 
-  if (!std::filesystem::exists(p, ec)) {
+  // [GNU] Default stat() is lstat(): a symlink operand (even a dangling one)
+  // stats the link itself; only -L follows it.
+  const bool is_link = operand_is_symlink_w(p.wstring());
+  const bool lstat_link = !cfg.dereference && is_link;
+
+  // [GNU] stat -L follows the link: a dangling target fails with ENOENT
+  // ("cannot statx 'dang': No such file or directory") (#1060).  Windows
+  // attribute queries return the reparse point's own metadata even when
+  // the target is gone, so resolve the operand through canonicalize.
+  std::filesystem::path stat_target = p;
+  if (cfg.dereference && is_link) {
+    auto resolved = native_path::canonicalize_path_w(
+        p.wstring(), native_path::CanonMode::existing);
+    if (!resolved) {
+      // [GNU] modern GNU stat uses the statx verb (uutils #13012)
+      safeErrorPrint("stat: cannot statx '");
+      safeErrorPrint(filename);
+      safeErrorPrint("': No such file or directory\n");
+      return 1;
+    }
+    stat_target = *resolved;
+  }
+  if (!lstat_link && !native_path::exists_w(stat_target.wstring())) {
     // [GNU] modern GNU stat uses the statx verb (uutils #13012)
-    safePrint("stat: cannot statx '");
-    safePrint(filename);
-    safePrint("': No such file or directory\n");
+    safeErrorPrint("stat: cannot statx '");
+    safeErrorPrint(filename);
+    safeErrorPrint("': No such file or directory\n");
     return 1;
   }
 
@@ -730,9 +794,9 @@ auto print_stat(const std::string& filename, const Config& cfg) -> int {
 
     auto stat_result = load_file_system_stat(filename);
     if (!stat_result) {
-      safePrint("stat: cannot read file system for '");
-      safePrint(filename);
-      safePrintLn("'");
+      safeErrorPrint("stat: cannot read file system for '");
+      safeErrorPrint(filename);
+      safeErrorPrintLn("'");
       return 1;
     }
 
@@ -745,14 +809,25 @@ auto print_stat(const std::string& filename, const Config& cfg) -> int {
     return 0;
   }
 
-  auto stat_result = load_file_stat(p);
+  auto stat_result = load_file_stat(stat_target, lstat_link);
   if (!stat_result) {
-    safePrint("stat: cannot statx '");
-    safePrint(filename);
-    safePrint("': Permission denied\n");
+    safeErrorPrint("stat: cannot statx '");
+    safeErrorPrint(filename);
+    safeErrorPrint("': Permission denied\n");
     return 1;
   }
   const auto& stat = *stat_result;
+
+  // [GNU] A non-dereferenced symlink operand displays as "'name' ->
+  // 'target'" in the File: line (uutils #8789).
+  std::string link_target;
+  if (lstat_link) {
+    std::error_code ec;
+    const auto target = std::filesystem::read_symlink(p, ec);
+    if (!ec) {
+      link_target = wstring_to_utf8(target.wstring());
+    }
+  }
 
   if (cfg.terse) {
     // Terse format
@@ -773,6 +848,10 @@ auto print_stat(const std::string& filename, const Config& cfg) -> int {
     // Default format
     safePrint("  File: ");
     safePrint(filename);
+    if (!link_target.empty()) {
+      safePrint(" -> ");
+      safePrint(link_target);
+    }
     safePrint("\n");
     safePrint("  Size: ");
     safePrint(format_size(stat.size));

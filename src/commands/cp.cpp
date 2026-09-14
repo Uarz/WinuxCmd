@@ -915,12 +915,9 @@ auto process_source_paths(
     } else {
       auto fileResult = copy_file(srcPath, finalDestPath, ctx);
       if (!fileResult) {
-        // OPTIMIZED: Avoid wstring concatenation
-        safeErrorPrint("cp: error copying file '");
-        safeErrorPrint(srcPath);
-        safeErrorPrint("': ");
-        safeErrorPrint(fileResult.error());
-        safeErrorPrint("\n");
+        safeErrorPrintLn(winux::i18n::format(
+            "command.cp.error.copying_file",
+            "cp: error copying file '{}': {}", srcPath, fileResult.error()));
         success = false;
       }
     }

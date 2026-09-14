@@ -656,8 +656,8 @@ struct ReparseDataBuffer {
 }  // namespace cp_win32_compat
 
 auto strip_nt_prefix(std::wstring_view path) -> std::wstring {
-  for (std::wstring_view prefix : {std::wstring_view(L"\\??\\"),
-                                   std::wstring_view(L"\\\\?\\")}) {
+  for (std::wstring_view prefix :
+       {std::wstring_view(L"\\??\\"), std::wstring_view(L"\\\\?\\")}) {
     if (path.starts_with(prefix)) {
       return std::wstring(path.substr(prefix.size()));
     }
@@ -671,13 +671,11 @@ auto read_mount_point_target(const std::string& path)
     -> std::optional<std::wstring> {
   const auto operand =
       native_path::make_api_path_operand_w(utf8_to_wstring(path));
-  UniqueHandle h(CreateFileW(operand.extended.c_str(), FILE_READ_ATTRIBUTES,
-                             FILE_SHARE_READ | FILE_SHARE_WRITE |
-                                 FILE_SHARE_DELETE,
-                             nullptr, OPEN_EXISTING,
-                             FILE_FLAG_BACKUP_SEMANTICS |
-                                 FILE_FLAG_OPEN_REPARSE_POINT,
-                             nullptr));
+  UniqueHandle h(CreateFileW(
+      operand.extended.c_str(), FILE_READ_ATTRIBUTES,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+      nullptr));
   if (!h) return std::nullopt;
 
   std::array<std::byte, MAXIMUM_REPARSE_DATA_BUFFER_SIZE> buffer{};
@@ -743,11 +741,10 @@ using DirectoryId = std::pair<DWORD, unsigned long long>;
 
 auto directory_file_id(const std::string& path) -> std::optional<DirectoryId> {
   const auto operand = native_path::make_api_path_operand(path);
-  UniqueHandle h(CreateFileW(operand.extended.c_str(), 0,
-                             FILE_SHARE_READ | FILE_SHARE_WRITE |
-                                 FILE_SHARE_DELETE,
-                             nullptr, OPEN_EXISTING,
-                             FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+  UniqueHandle h(
+      CreateFileW(operand.extended.c_str(), 0,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
   if (!h) return std::nullopt;
   BY_HANDLE_FILE_INFORMATION info{};
   if (!GetFileInformationByHandle(h.get(), &info)) return std::nullopt;
@@ -855,10 +852,10 @@ auto copy_file(const std::string& srcPath, const std::string& destPath,
   // recursion), while -L follows everything and -H only command-line
   // sources (#1064).
   const DerefMode deref_mode = resolve_deref_mode(ctx);
-  bool no_deref = deref_mode == DerefMode::Never ||
-                  (deref_mode == DerefMode::Default &&
-                   recursive_enabled(ctx)) ||
-                  (deref_mode == DerefMode::CommandLine && !command_line_arg);
+  bool no_deref =
+      deref_mode == DerefMode::Never ||
+      (deref_mode == DerefMode::Default && recursive_enabled(ctx)) ||
+      (deref_mode == DerefMode::CommandLine && !command_line_arg);
 
   std::error_code equivalent_ec;
   // Use the error_code overload: pseudo-device operands such as "NUL" make
@@ -1033,9 +1030,8 @@ auto copy_file(const std::string& srcPath, const std::string& destPath,
     }
     // A junction is always a directory link even when its target is
     // dangling; for plain symlinks the (followed) attributes decide.
-    bool src_is_dir =
-        link_reparse_tag(srcPath) ==
-        std::optional<DWORD>{IO_REPARSE_TAG_MOUNT_POINT};
+    bool src_is_dir = link_reparse_tag(srcPath) ==
+                      std::optional<DWORD>{IO_REPARSE_TAG_MOUNT_POINT};
     if (!src_is_dir) {
       DWORD sattrs = GetFileAttributesW(utf8_to_wstring(srcPath).c_str());
       src_is_dir = sattrs != INVALID_FILE_ATTRIBUTES &&
@@ -1123,8 +1119,7 @@ auto copy_file(const std::string& srcPath, const std::string& destPath,
 auto copy_directory_helper(const std::string& srcPath,
                            const std::string& destPath,
                            const CommandContext<CP_OPTIONS.size()>& ctx,
-                           int depth,
-                           std::vector<DirectoryId>& ancestors)
+                           int depth, std::vector<DirectoryId>& ancestors)
     -> cp::Result<bool> {
   // Prevent deep recursion
   if (depth > 100) {
@@ -1297,17 +1292,15 @@ auto process_source_paths(
   // [GNU] a command-line link source is recreated (never followed) under
   // -P/-d/-a or plain -r/-R; -H and -L dereference it (#1064).
   const DerefMode deref_mode = resolve_deref_mode(ctx);
-  const bool cmdline_no_deref =
-      deref_mode == DerefMode::Never ||
-      (deref_mode == DerefMode::Default && recursive);
+  const bool cmdline_no_deref = deref_mode == DerefMode::Never ||
+                                (deref_mode == DerefMode::Default && recursive);
   bool success = true;
 
   for (const auto& srcPath : sourcePaths) {
     // Check if source path exists; when the link itself is copied a
     // dangling symlink/junction still counts.
-    bool src_exists = cmdline_no_deref
-                          ? lexists(srcPath)
-                          : path_exists(srcPath).value_or(false);
+    bool src_exists = cmdline_no_deref ? lexists(srcPath)
+                                       : path_exists(srcPath).value_or(false);
     if (!src_exists) {
       // OPTIMIZED: Avoid wstring concatenation
       safeErrorPrint("cp: cannot stat '");

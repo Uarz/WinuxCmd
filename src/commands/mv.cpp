@@ -691,6 +691,11 @@ REGISTER_COMMAND(
   auto result = process_command(ctx);
   if (!result) {
     report_error(result, L"mv");
+    // [GNU] operand-count errors are followed by the try-help hint.
+    if (result.error().starts_with("missing ")) {
+      safeErrorPrintLn(winux::i18n::format(
+          "common.try_help", "Try '{} --help' for more information.", "mv"));
+    }
     return 1;
   }
 

@@ -331,8 +331,8 @@ auto load_sources(const Config& cfg) -> cp::Result<std::vector<SourceText>> {
         return std::unexpected(make_error(file + ": Is a directory"));
       }
       return std::unexpected(make_error("cannot open " + q + file + q +
-                                      " for reading: No such file or "
-                                      "directory"));
+                                        " for reading: No such file or "
+                                        "directory"));
     }
     SourceText source;
     source.name = file == "-" ? "" : file;

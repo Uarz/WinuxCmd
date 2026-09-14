@@ -613,8 +613,9 @@ auto process_file(const std::string &path, std::string_view mode_str,
   // "retained as A" diagnostics (issue 987).
   const auto operand = native_path::make_api_path_operand(path);
   WIN32_FILE_ATTRIBUTE_DATA before{};
-  const bool had_before = GetFileAttributesExW(
-      operand.extended.c_str(), GetFileExInfoStandard, &before) != 0;
+  const bool had_before =
+      GetFileAttributesExW(operand.extended.c_str(), GetFileExInfoStandard,
+                           &before) != 0;
   const bool is_dir =
       had_before && (before.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
   const unsigned int old_mode =
@@ -662,8 +663,8 @@ auto process_file(const std::string &path, std::string_view mode_str,
         new_mode = apply_clause_for_display(new_mode, clause, is_dir);
       }
     }
-    report_mode_change(path, old_mode, new_mode, old_mode != new_mode,
-                       verbose, changes, is_dir);
+    report_mode_change(path, old_mode, new_mode, old_mode != new_mode, verbose,
+                       changes, is_dir);
   }
 
   return changed;
@@ -682,8 +683,9 @@ auto process_file_reference(const std::string &path, DWORD reference_attrs,
 
   const auto operand = native_path::make_api_path_operand(path);
   WIN32_FILE_ATTRIBUTE_DATA before{};
-  const bool had_before = GetFileAttributesExW(
-      operand.extended.c_str(), GetFileExInfoStandard, &before) != 0;
+  const bool had_before =
+      GetFileAttributesExW(operand.extended.c_str(), GetFileExInfoStandard,
+                           &before) != 0;
   const bool is_dir =
       had_before && (before.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
   const unsigned int old_mode =
@@ -702,8 +704,8 @@ auto process_file_reference(const std::string &path, DWORD reference_attrs,
 
   bool changed = result.value();
   if (verbose || changes) {
-    report_mode_change(path, old_mode, new_mode, old_mode != new_mode,
-                       verbose, changes, is_dir);
+    report_mode_change(path, old_mode, new_mode, old_mode != new_mode, verbose,
+                       changes, is_dir);
   }
 
   return changed;

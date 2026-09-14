@@ -177,19 +177,23 @@ auto validate_arguments(std::span<const std::string_view> args)
   return paths;
 }
 
+// [GNU] wc reports open failures as "wc: PATH: REASON" (#1041), e.g.
+// "wc: nosuch: No such file or directory".
 auto wc_input_open_error(std::string_view path) -> std::string {
   auto operand = native_path::make_api_path_operand(path);
   const DWORD attrs = native_path::operand_target_attributes_w(operand);
   if (operand.had_trailing_separator &&
       native_path::attributes_are_regular_file(attrs)) {
-    return "cannot open '" + std::string(path) +
-           "' for reading: Not a directory";
+    return std::string(path) + ": Not a directory";
   }
   if (native_path::attributes_are_directory(attrs)) {
     return std::string(path) + ": Is a directory";
   }
-  return "cannot open '" + std::string(path) +
-         "' for reading: No such file or directory";
+  if (attrs != INVALID_FILE_ATTRIBUTES) {
+    // The operand exists but could not be opened for reading.
+    return std::string(path) + ": Permission denied";
+  }
+  return std::string(path) + ": No such file or directory";
 }
 
 auto read_files0_from(const std::string& path) -> cp::Result<Files0ReadResult> {

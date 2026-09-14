@@ -104,7 +104,8 @@ TEST(printenv, printenv_invalid_option_returns_two_with_gnu_style_error) {
 
   EXPECT_EQ(r.exit_code, 2);
   EXPECT_TRUE(r.stdout_text.empty());
+  // GNU getopt_long reports an unknown short option as "invalid option -- 'x'".
   EXPECT_EQ_TEXT(r.stderr_text,
-                 "printenv: unrecognized option '-/'\n"
+                 "printenv: invalid option -- '/'\n"
                  "Try 'printenv --help' for more information.\n");
 }

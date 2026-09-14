@@ -721,8 +721,7 @@ REGISTER_COMMAND(
       if (!arg.starts_with("--")) continue;
       const auto eq = arg.find('=');
       const bool has_arg = eq != std::string_view::npos;
-      const std::string_view name =
-          has_arg ? arg.substr(0, eq) : arg;
+      const std::string_view name = has_arg ? arg.substr(0, eq) : arg;
       if (name.size() <= 2 || !kNoPreserveRoot.starts_with(name)) continue;
       if (has_arg) {
         // getopt_long reports the argument on the *resolved* option name

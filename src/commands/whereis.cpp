@@ -60,7 +60,9 @@ auto constexpr WHEREIS_OPTIONS = std::array{
     OPTION("-M", "", "define a manual lookup directory", STRING_TYPE),
     OPTION("-S", "", "define a source lookup directory", STRING_TYPE),
     OPTION("-f", "", "terminate the last directory list"),
-    OPTION("-l", "", "list the effective lookup paths")};
+    OPTION("-l", "", "list the effective lookup paths"),
+    // [GNU] -g/-h: legacy options accepted and ignored (#1072); hidden
+    OPTION("-g", "", "", BOOL_TYPE), OPTION("-h", "", "", BOOL_TYPE)};
 
 namespace whereis_pipeline {
 namespace cp = core::pipeline;

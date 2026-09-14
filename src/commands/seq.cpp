@@ -100,6 +100,12 @@ struct Config {
   bool equal_width = false;
   bool fixed_default_format = true;
   int default_precision = 0;
+  // [GNU] literal text around the single conversion directive of
+  // --format, counted the way long_double_format() does (each '%%' in the
+  // literal text counts once).  Used to strip the number back out of a
+  // formatted line for the end-of-range check.
+  size_t format_prefix_len = 0;
+  size_t format_suffix_len = 0;
   double first = 1.0;
   double increment = 1.0;
   double last = 1.0;
@@ -414,6 +420,36 @@ auto build_config(const CommandContext<SEQ_OPTIONS.size()>& ctx)
   if (!cfg.format.empty()) {
     auto format = validate_format(cfg.format);
     if (!format) return std::unexpected(format.error());
+
+    // [GNU] record the literal prefix/suffix lengths of the validated
+    // format so the generated text can be split into decoration and the
+    // numeric part again (see print_numbers() in GNU seq.c).
+    const std::string& f = cfg.format;
+    size_t i = 0;
+    for (; i < f.size() && !(f[i] == '%' && f[i + 1] != '%');
+         i += (f[i] == '%') + 1) {
+      ++cfg.format_prefix_len;
+    }
+    ++i;  // skip '%'
+    while (i < f.size() &&
+           std::string_view("-+ #0'").find(f[i]) != std::string_view::npos) {
+      ++i;
+    }
+    while (i < f.size() &&
+           std::isdigit(static_cast<unsigned char>(f[i])) != 0) {
+      ++i;
+    }
+    if (i < f.size() && f[i] == '.') {
+      ++i;
+      while (i < f.size() &&
+             std::isdigit(static_cast<unsigned char>(f[i])) != 0) {
+        ++i;
+      }
+    }
+    ++i;  // skip the conversion character (validate_format ensured it)
+    for (; i < f.size(); i += (f[i] == '%') + 1) {
+      ++cfg.format_suffix_len;
+    }
   }
 
   if (cfg.equal_width && !cfg.format.empty()) {
@@ -421,14 +457,20 @@ auto build_config(const CommandContext<SEQ_OPTIONS.size()>& ctx)
         "format string may not be specified when printing equal width strings");
   }
 
-  for (auto operand : operands) {
-    auto precision = decimal_precision(operand);
+  // [GNU] get_default_format: the default precision is the maximum of
+  // FIRST's and INCREMENT's precision only; LAST's precision never widens
+  // the output (seq 1.5 prints "1", seq 0.5 1.55 prints "0.5 1.5").
+  // LAST still decides whether the fixed-point default format applies.
+  for (size_t k = 0; k < operands.size(); ++k) {
+    auto precision = decimal_precision(operands[k]);
     if (!precision) {
       cfg.fixed_default_format = false;
       cfg.default_precision = 0;
       break;
     }
-    cfg.default_precision = std::max(cfg.default_precision, *precision);
+    if (k + 1 < operands.size()) {
+      cfg.default_precision = std::max(cfg.default_precision, *precision);
+    }
   }
 
   return cfg;
@@ -473,31 +515,48 @@ auto run(const Config& cfg) -> int {
   // Ensure C locale for consistent numeric formatting (decimal point '.')
   setlocale(LC_NUMERIC, "C");
 
-  // Determine direction
-  bool increasing = (cfg.increment > 0);
+  const bool increasing = (cfg.increment > 0);
+  const auto in_range = [&](double x) {
+    return increasing ? x <= cfg.last : x >= cfg.last;
+  };
 
-  // Determine if we should output anything
-  bool should_output = false;
-  if (increasing) {
-    should_output = (cfg.first <= cfg.last);
-  } else {
-    should_output = (cfg.first >= cfg.last);
-  }
-
-  if (!should_output) {
+  if (!in_range(cfg.first)) {
     return 0;
   }
+
+  // [GNU] The value after LAST is printed anyway when its formatted text
+  // parses back to exactly LAST and differs from the previous item.  This
+  // rescues sequences such as `seq 1 0.1 1.3` where binary rounding pushes
+  // the mathematical endpoint slightly past LAST (uutils #7186).
+  const auto formatted_value = [&](const std::string& text) -> double {
+    std::string_view middle(text);
+    if (cfg.format_prefix_len + cfg.format_suffix_len <= middle.size()) {
+      middle.remove_prefix(cfg.format_prefix_len);
+      middle.remove_suffix(cfg.format_suffix_len);
+    }
+    return std::strtod(std::string(middle).c_str(), nullptr);
+  };
+
+  // Returns true when NEXT is the rescued endpoint that must still print.
+  const auto print_extra_number = [&](double next, double prev) -> bool {
+    const std::string next_str = format_number(next, cfg);
+    if (formatted_value(next_str) != cfg.last) return false;
+    return next_str != format_number(prev, cfg);
+  };
 
   // For equal-width mode, first pass to find max width (no storage)
   size_t max_width = 0;
   if (cfg.equal_width && cfg.format.empty()) {
     double current = cfg.first;
-    while ((increasing && current <= cfg.last) ||
-           (!increasing && current >= cfg.last)) {
-      auto formatted = format_number(current, cfg);
-      max_width = std::max(max_width, formatted.size());
-      const double next = current + cfg.increment;
-      if (!std::isfinite(next) || next == current) {
+    for (double i = 1;; ++i) {
+      const double prev = current;
+      max_width = std::max(max_width, format_number(current, cfg).size());
+      const double next = cfg.first + i * cfg.increment;
+      if (!std::isfinite(next) || !in_range(next)) {
+        if (std::isfinite(next) && print_extra_number(next, prev)) {
+          max_width =
+              std::max(max_width, format_number(next, cfg).size());
+        }
         break;
       }
       current = next;
@@ -505,13 +564,12 @@ auto run(const Config& cfg) -> int {
   }
 
   // Second pass: generate and output incrementally (streaming, no memory
-  // blowup)
+  // blowup).  [GNU] iterates x = first + i*step which is mathematically
+  // equivalent to x += step but less subject to accumulated rounding error.
   bool first_item = true;
   double current = cfg.first;
-
-  while ((increasing && current <= cfg.last) ||
-         (!increasing && current >= cfg.last)) {
-    std::string formatted = format_number(current, cfg);
+  const auto emit = [&](double x) {
+    std::string formatted = format_number(x, cfg);
     if (cfg.equal_width && cfg.format.empty()) {
       formatted = zero_pad(std::move(formatted), max_width);
     }
@@ -520,9 +578,20 @@ auto run(const Config& cfg) -> int {
     }
     safePrint(formatted);
     first_item = false;
+  };
 
-    const double next = current + cfg.increment;
-    if (!std::isfinite(next) || next == current) {
+  for (double i = 1;; ++i) {
+    const double prev = current;
+    emit(current);
+
+    const double next = cfg.first + i * cfg.increment;
+    if (!std::isfinite(next)) {
+      break;
+    }
+    if (!in_range(next)) {
+      if (print_extra_number(next, prev)) {
+        emit(next);
+      }
       break;
     }
     current = next;

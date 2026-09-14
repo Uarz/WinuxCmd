@@ -180,7 +180,9 @@ TEST(seq, seq_rejects_zero_increment) {
 
   EXPECT_EQ(r.exit_code, 1);
   EXPECT_TRUE(r.stdout_text.empty());
-  EXPECT_EQ_TEXT(r.stderr_text, "seq: invalid Zero increment value: '0'\n");
+  EXPECT_EQ_TEXT(r.stderr_text,
+                 "seq: invalid Zero increment value: '0'\n"
+                 "Try 'seq --help' for more information.\n");
 }
 
 TEST(seq, seq_negative_decreasing_range) {
@@ -314,7 +316,7 @@ TEST(seq, seq_rejects_format_with_equal_width) {
   EXPECT_EQ_TEXT(
       r.stderr_text,
       "seq: format string may not be specified when printing equal width "
-      "strings\n");
+      "strings\nTry 'seq --help' for more information.\n");
 }
 
 // [GNU] scientific-notation operands keep a fixed-point default format:
@@ -353,4 +355,36 @@ TEST(seq, seq_equal_width_scientific_notation) {
   auto r = p.run();
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_EQ_TEXT(r.stdout_text, "0.80\n0.90\n1.00\n");
+}
+
+// [GNU] the last value must be included when it is reachable in exact
+// arithmetic even though repeated addition accumulates rounding error
+// (issue: 1 + 0.1*k must still print 1.3).
+TEST(seq, seq_fractional_increment_includes_last) {
+  Pipeline p;
+  p.add(L"seq.exe", {L"1", L"0.1", L"1.3"});
+
+  auto r = p.run();
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "1.0\n1.1\n1.2\n1.3\n");
+}
+
+// [GNU] the default precision is derived from FIRST and INCREMENT only,
+// never from LAST.
+TEST(seq, seq_precision_ignores_last_operand) {
+  Pipeline p;
+  p.add(L"seq.exe", {L"0.5", L"1.55"});
+
+  auto r = p.run();
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "0.5\n1.5\n");
+}
+
+TEST(seq, seq_two_digit_increment_precision) {
+  Pipeline p;
+  p.add(L"seq.exe", {L"1", L"0.15", L"1.4"});
+
+  auto r = p.run();
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "1.00\n1.15\n1.30\n");
 }

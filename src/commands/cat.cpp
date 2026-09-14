@@ -340,7 +340,12 @@ REGISTER_COMMAND(cat, "cat",
   auto process_file = [&](std::string_view path,
                           const CommandContext<CAT_OPTIONS.size()> &ctx,
                           CatState &state) -> bool {
-    if (path == "-") {
+    // [GNU] /dev/stdin is a symlink to /proc/self/fd/0, so it means "this
+    // process's own descriptor 0" - exactly what "-" already denotes here.
+    // Routing it through the console device name instead made `cat /dev/stdin`
+    // wait on the console whenever stdin was a pipe or a file (#276 follow-up).
+    if (path == "-" || native_path::standard_stream(path) ==
+                           native_path::StandardStream::in) {
       process_stream(std::cin, ctx, state);
       if (std::cin.bad()) {
         safeErrorPrint("'-\n");

@@ -121,6 +121,10 @@ struct FileStatData {
   uint64_t volume_serial = 0;
   uint32_t hard_links = 1;
   uint32_t io_block_size = 4096;
+  // [GNU] A Windows character device (NUL, CONIN$, CONOUT$) reports
+  // FILE_ATTRIBUTE_ARCHIVE and is indistinguishable from an ordinary file by
+  // attributes alone, but GNU reports /dev/null as a character special file.
+  bool character_device = false;
   std::string owner_name;
   std::string owner_id;
   std::string group_name;
@@ -251,7 +255,9 @@ auto format_permissions(DWORD attrs) -> std::string {
   return perm;
 }
 
-auto file_type_name(DWORD attrs) -> std::string {
+auto file_type_name(const FileStatData& stat) -> std::string {
+  if (stat.character_device) return "character special file";
+  const DWORD attrs = stat.attrs.dwFileAttributes;
   if (attrs & FILE_ATTRIBUTE_DIRECTORY) return "directory";
   if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) return "symbolic link";
   return "regular file";
@@ -297,8 +303,10 @@ auto load_file_stat(const std::filesystem::path& p)
     -> cp::Result<FileStatData> {
   FileStatData stat;
   auto operand = native_path::make_api_path_operand_w(p.wstring());
-  if (!GetFileAttributesExW(operand.extended.c_str(), GetFileExInfoStandard,
-                            &stat.attrs)) {
+  // GetFileAttributesExW rejects DOS device names outright (see
+  // native_path::file_attribute_data_w), so the shared device-aware probe is
+  // what lets `stat /dev/null` report a character device instead of failing.
+  if (!native_path::file_attribute_data_w(operand.extended, stat.attrs)) {
     return std::unexpected("Access denied");
   }
 
@@ -311,6 +319,7 @@ auto load_file_stat(const std::filesystem::path& p)
   stat.size = stat.attrs.nFileSizeLow +
               (static_cast<uint64_t>(stat.attrs.nFileSizeHigh) << 32);
   stat.io_block_size = io_block_size_for(p);
+  stat.character_device = native_path::is_character_device_w(p.wstring());
 
   HANDLE h =
       CreateFileW(operand.extended.c_str(), FILE_READ_ATTRIBUTES,
@@ -520,7 +529,7 @@ auto render_format(std::string_view format, const std::string& filename,
         out += "512";
         break;
       case 'F':
-        out += file_type_name(stat.attrs.dwFileAttributes);
+        out += file_type_name(stat);
         break;
       case 'A':
         out += format_permissions(stat.attrs.dwFileAttributes);
@@ -712,14 +721,22 @@ auto print_file_system_stat(const std::string& filename) -> int {
 }
 
 auto print_stat(const std::string& filename, const Config& cfg) -> int {
-  std::error_code ec;
   std::filesystem::path p(filename);
 
-  if (!std::filesystem::exists(p, ec)) {
-    // [GNU] modern GNU stat uses the statx verb (uutils #13012)
-    safePrint("stat: cannot statx '");
-    safePrint(filename);
-    safePrint("': No such file or directory\n");
+  // [GNU] Existence is decided at the shared operand boundary rather than by
+  // std::filesystem: POSIX pseudo-devices (/dev/null, /dev/tty, ...) have no
+  // directory entry on Windows, so std::filesystem::exists() rejects operands
+  // that every Win32 device-aware call handles fine, and `stat -c %F /dev/null`
+  // reported "cannot statx" instead of "character special file" (#276
+  // follow-up).
+  if (!native_path::valid_attributes(
+          native_path::attributes_w(
+              native_path::make_api_path_operand(filename).extended))) {
+    // [GNU] modern GNU stat uses the statx verb (uutils #13012). Diagnostics
+    // belong on stderr, as in every other coreutils tool.
+    safeErrorPrint("stat: cannot statx '");
+    safeErrorPrint(filename);
+    safeErrorPrint("': No such file or directory\n");
     return 1;
   }
 
@@ -730,9 +747,9 @@ auto print_stat(const std::string& filename, const Config& cfg) -> int {
 
     auto stat_result = load_file_system_stat(filename);
     if (!stat_result) {
-      safePrint("stat: cannot read file system for '");
-      safePrint(filename);
-      safePrintLn("'");
+      safeErrorPrint("stat: cannot read file system for '");
+      safeErrorPrint(filename);
+      safeErrorPrint("'\n");
       return 1;
     }
 
@@ -747,9 +764,9 @@ auto print_stat(const std::string& filename, const Config& cfg) -> int {
 
   auto stat_result = load_file_stat(p);
   if (!stat_result) {
-    safePrint("stat: cannot statx '");
-    safePrint(filename);
-    safePrint("': Permission denied\n");
+    safeErrorPrint("stat: cannot statx '");
+    safeErrorPrint(filename);
+    safeErrorPrint("': Permission denied\n");
     return 1;
   }
   const auto& stat = *stat_result;
@@ -784,7 +801,7 @@ auto print_stat(const std::string& filename, const Config& cfg) -> int {
     safePrint(stat.io_block_size);
     safePrint("\t");
 
-    safePrint(file_type_name(stat.attrs.dwFileAttributes));
+    safePrint(file_type_name(stat));
     safePrint("\n");
 
     safePrint("Access: (");

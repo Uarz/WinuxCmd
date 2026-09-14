@@ -144,26 +144,33 @@ std::vector<std::string> materialize_test_args(
   return args;
 }
 
-// Check if file exists
+// [GNU] Every file predicate goes through the shared operand boundary so that
+// MSYS-style paths and POSIX pseudo-devices resolve exactly as they do in the
+// other tools. Probing GetFileAttributesW directly meant `test -e /dev/null`
+// (and every other /dev/* operand) answered "no such file" (#276 follow-up).
 bool file_exists(const std::string& path) {
-  std::wstring wpath = utf8_to_wstring(path);
-  DWORD attrs = GetFileAttributesW(wpath.c_str());
-  return attrs != INVALID_FILE_ATTRIBUTES;
+  const auto operand = native_path::make_api_path_operand(path);
+  return native_path::valid_attributes(
+      native_path::attributes_w(operand.extended));
 }
 
 // Check if path is a regular file
+//
+// [GNU] A Windows character device reports FILE_ATTRIBUTE_ARCHIVE and would
+// otherwise pass for an ordinary file, but GNU reports /dev/null as a character
+// special file: `test -f /dev/null` is false there.
 bool is_regular_file(const std::string& path) {
-  std::wstring wpath = utf8_to_wstring(path);
-  DWORD attrs = GetFileAttributesW(wpath.c_str());
-  return attrs != INVALID_FILE_ATTRIBUTES &&
-         !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+  if (native_path::is_character_device(path)) return false;
+  const auto operand = native_path::make_api_path_operand(path);
+  return native_path::attributes_are_regular_file(
+      native_path::attributes_w(operand.extended));
 }
 
 // Check if path is a directory
 bool is_directory(const std::string& path) {
-  std::wstring wpath = utf8_to_wstring(path);
-  DWORD attrs = GetFileAttributesW(wpath.c_str());
-  return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+  const auto operand = native_path::make_api_path_operand(path);
+  return native_path::attributes_are_directory(
+      native_path::attributes_w(operand.extended));
 }
 
 // Check if file has size > 0
@@ -272,8 +279,12 @@ bool is_binary_operator(const std::string& op) {
 int evaluate_unary(const std::string& op, const std::string& arg) {
   if (op == "-n") return arg.empty() ? 1 : 0;
   if (op == "-z") return arg.empty() ? 0 : 1;
-  if (op == "-b") return file_exists(arg) ? 0 : 1;  // Simplified on Windows
-  if (op == "-c") return file_exists(arg) ? 0 : 1;  // Simplified on Windows
+  // [GNU] Windows has no block-special files, so -b is always false; -c is true
+  // for the character devices (NUL, CONIN$, CONOUT$) that the POSIX
+  // pseudo-devices resolve onto. GNU reports /dev/null as a character special
+  // file, so `test -c /dev/null` must succeed and `test -b /dev/null` must not.
+  if (op == "-b") return 1;
+  if (op == "-c") return native_path::is_character_device(arg) ? 0 : 1;
   if (op == "-d") return is_directory(arg) ? 0 : 1;
   if (op == "-e") return file_exists(arg) ? 0 : 1;
   if (op == "-f") return is_regular_file(arg) ? 0 : 1;
@@ -283,18 +294,21 @@ int evaluate_unary(const std::string& op, const std::string& arg) {
   if (op == "-k") return 1;  // Not supported on Windows
   if (op == "-p") return 1;  // Not supported on Windows
   if (op == "-r") {
-    std::wstring wpath = utf8_to_wstring(arg);
-    DWORD attrs = GetFileAttributesW(wpath.c_str());
-    return (attrs != INVALID_FILE_ATTRIBUTES) ? 0 : 1;
+    const auto operand = native_path::make_api_path_operand(arg);
+    return native_path::valid_attributes(
+               native_path::attributes_w(operand.extended))
+               ? 0
+               : 1;
   }
   if (op == "-s") return file_has_size(arg) ? 0 : 1;
   if (op == "-S") return 1;  // Not supported on Windows
   if (op == "-t") return 1;  // Not supported on Windows
   if (op == "-u") return 1;  // Not supported on Windows
   if (op == "-w") {
-    std::wstring wpath = utf8_to_wstring(arg);
-    DWORD attrs = GetFileAttributesW(wpath.c_str());
-    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_READONLY)) {
+    const auto operand = native_path::make_api_path_operand(arg);
+    const DWORD attrs = native_path::attributes_w(operand.extended);
+    if (!native_path::valid_attributes(attrs) ||
+        (attrs & FILE_ATTRIBUTE_READONLY) != 0) {
       return 1;
     }
     return 0;

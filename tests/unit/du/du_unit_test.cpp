@@ -35,6 +35,69 @@ auto first_usage_value(const std::string& text) -> std::uintmax_t {
   return value;
 }
 
+// GNU du reports allocated blocks, which WinuxCmd models as the
+// GetCompressedFileSizeW result rounded up to the volume cluster size.
+auto volume_cluster_size(const std::filesystem::path& path) -> uint64_t {
+  std::wstring root = path.root_path().wstring();
+  if (root.empty()) {
+    wchar_t cwd[MAX_PATH];
+    if (GetCurrentDirectoryW(MAX_PATH, cwd) == 0) {
+      return 4096;
+    }
+    root = std::wstring(cwd, 2) + L"\\";
+  }
+  DWORD spc = 0, bps = 0, nu = 0;
+  if (!GetDiskFreeSpaceW(root.c_str(), &spc, &bps, &nu, &nu)) {
+    return 4096;
+  }
+  return static_cast<uint64_t>(spc) * bps;
+}
+
+auto allocated_size(uint64_t logical, const std::filesystem::path& volume)
+    -> uint64_t {
+  const uint64_t cluster = volume_cluster_size(volume);
+  return cluster == 0 ? logical : (logical + cluster - 1) / cluster * cluster;
+}
+
+auto expected_blocks(uint64_t logical, uint64_t block,
+                     const std::filesystem::path& volume) -> uint64_t {
+  const uint64_t allocated = allocated_size(logical, volume);
+  return allocated == 0 ? 0 : 1 + (allocated - 1) / block;
+}
+
+// Mirrors src/commands/du.cpp format_size(): ceiling to tenths of the unit.
+auto format_size_for_test(uint64_t size, bool si) -> std::string {
+  const char* units = si ? "BKMGTPE" : "BKMGTP";
+  const uint64_t base = si ? 1000 : 1024;
+  if (size < base) {
+    return std::to_string(size);
+  }
+  int idx = 0;
+  uint64_t unit = base;
+  while (idx < 6 && size / unit >= base) {
+    unit *= base;
+    ++idx;
+  }
+  ++idx;
+  const uint64_t q = size / unit;
+  const uint64_t r = size % unit;
+  uint64_t tenths = q * 10 + (r * 10 + unit - 1) / unit;
+  while (tenths >= base * 10 && idx < 6) {
+    tenths = (tenths + base - 1) / base;
+    ++idx;
+  }
+  char buf[32];
+  if (tenths < 100) {
+    snprintf(buf, sizeof(buf), "%llu.%llu%c",
+             static_cast<unsigned long long>(tenths / 10),
+             static_cast<unsigned long long>(tenths % 10), units[idx]);
+  } else {
+    snprintf(buf, sizeof(buf), "%llu%c",
+             static_cast<unsigned long long>((tenths + 9) / 10), units[idx]);
+  }
+  return std::string(buf);
+}
+
 auto line_usage_values(const std::string& text) -> std::vector<std::uintmax_t> {
   std::vector<std::uintmax_t> values;
   std::stringstream lines(text);
@@ -279,7 +342,8 @@ TEST(du, du_kilobytes_rounds_up_small_files) {
   TEST_LOG("du.exe -k file output", r.stdout_text);
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_EQ(first_usage_value(r.stdout_text), 1);
+  EXPECT_EQ(first_usage_value(r.stdout_text),
+            expected_blocks(7, 1024, tmp.path));
 }
 
 TEST(du, du_megabytes_uses_1M_blocks) {
@@ -293,7 +357,8 @@ TEST(du, du_megabytes_uses_1M_blocks) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_EQ(first_usage_value(r.stdout_text), 2);
+  EXPECT_EQ(first_usage_value(r.stdout_text),
+            expected_blocks(1200000, 1u << 20, tmp.path));
 }
 
 // GNU appends the unit letter for a bare-suffix block size: "du -BM" prints
@@ -324,7 +389,8 @@ TEST(du, du_integer_block_size_has_no_suffix) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_EQ(first_usage_value(r.stdout_text), 2);
+  EXPECT_EQ(first_usage_value(r.stdout_text),
+            expected_blocks(1200000, 1u << 20, tmp.path));
   EXPECT_EQ(r.stdout_text.find("2M"), std::string::npos);
 }
 
@@ -339,7 +405,8 @@ TEST(du, du_default_uses_1024_byte_blocks) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_EQ(first_usage_value(r.stdout_text), 1);
+  EXPECT_EQ(first_usage_value(r.stdout_text),
+            expected_blocks(600, 1024, tmp.path));
 }
 
 TEST(du, du_H_is_dereference_args_not_si) {
@@ -353,7 +420,8 @@ TEST(du, du_H_is_dereference_args_not_si) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_EQ(first_usage_value(r.stdout_text), 2);
+  EXPECT_EQ(first_usage_value(r.stdout_text),
+            expected_blocks(1500, 1024, tmp.path));
   EXPECT_EQ(r.stdout_text.find("K"), std::string::npos);
 }
 
@@ -368,7 +436,9 @@ TEST(du, du_si_is_long_option_only) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_NE(r.stdout_text.find("1.5K"), std::string::npos);
+  EXPECT_NE(r.stdout_text.find(format_size_for_test(
+                                 allocated_size(1500, tmp.path), true)),
+            std::string::npos);
 }
 
 TEST(du, du_block_size_one_reports_bytes) {
@@ -387,7 +457,8 @@ TEST(du, du_block_size_one_reports_bytes) {
   TEST_LOG("du.exe --block-size=1 output", r.stdout_text);
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_EQ(first_usage_value(r.stdout_text), 6);
+  EXPECT_EQ(first_usage_value(r.stdout_text),
+            expected_blocks(6, 1, tmp.path));
 }
 
 TEST(du, du_apparent_size_is_accepted_as_windows_file_length_mode) {
@@ -412,7 +483,7 @@ TEST(du, du_threshold_positive_excludes_smaller_entries) {
 
   Pipeline p;
   p.set_cwd(tmp.wpath());
-  p.add(L"du.exe", {L"-a", L"--block-size=1", L"--threshold=1000", L"root"});
+  p.add(L"du.exe", {L"-a", L"-b", L"--threshold=1000", L"root"});
 
   auto r = p.run();
 
@@ -429,7 +500,7 @@ TEST(du, du_threshold_negative_excludes_larger_entries) {
 
   Pipeline p;
   p.set_cwd(tmp.wpath());
-  p.add(L"du.exe", {L"-a", L"--block-size=1", L"--threshold=-10", L"root"});
+  p.add(L"du.exe", {L"-a", L"-b", L"--threshold=-10", L"root"});
 
   auto r = p.run();
 
@@ -546,7 +617,8 @@ TEST(du, du_later_block_size_option_overrides_human_readable) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_EQ(first_usage_value(r.stdout_text), 1500);
+  EXPECT_EQ(first_usage_value(r.stdout_text),
+            expected_blocks(1500, 1, tmp.path));
   EXPECT_EQ(r.stdout_text.find("K"), std::string::npos);
 }
 
@@ -561,7 +633,9 @@ TEST(du, du_later_human_readable_overrides_block_size) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_NE(r.stdout_text.find("1.5K"), std::string::npos);
+  EXPECT_NE(r.stdout_text.find(format_size_for_test(
+                                 allocated_size(1500, tmp.path), false)),
+            std::string::npos);
 }
 
 TEST(du, du_later_m_option_overrides_block_size) {
@@ -575,7 +649,8 @@ TEST(du, du_later_m_option_overrides_block_size) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_EQ(first_usage_value(r.stdout_text), 2);
+  EXPECT_EQ(first_usage_value(r.stdout_text),
+            expected_blocks(1200000, 1u << 20, tmp.path));
 }
 
 TEST(du, du_block_size_human_readable_word) {
@@ -589,7 +664,9 @@ TEST(du, du_block_size_human_readable_word) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_NE(r.stdout_text.find("1.5K"), std::string::npos);
+  EXPECT_NE(r.stdout_text.find(format_size_for_test(
+                                 allocated_size(1500, tmp.path), false)),
+            std::string::npos);
 }
 
 TEST(du, du_block_size_si_word) {
@@ -603,7 +680,9 @@ TEST(du, du_block_size_si_word) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_NE(r.stdout_text.find("10K"), std::string::npos);
+  EXPECT_NE(r.stdout_text.find(format_size_for_test(
+                                 allocated_size(10000, tmp.path), true)),
+            std::string::npos);
 }
 
 TEST(du, du_max_depth_zero_emits_only_root_directory) {
@@ -722,7 +801,9 @@ TEST(du, du_separate_dirs) {
 
   Pipeline p;
   p.set_cwd(tmp.wpath());
-  p.add(L"du.exe", {L"-S", L"--block-size=1", L"root"});
+  // -b (--apparent-size --block-size=1) keeps the -S accounting check on
+  // logical sizes so it is independent of the volume cluster rounding.
+  p.add(L"du.exe", {L"-S", L"-b", L"root"});
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);

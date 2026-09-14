@@ -764,10 +764,11 @@ auto configure_du(const CommandContext<DU_OPTIONS.size()>& ctx)
 
   cfg.dereference =
       ctx.get<bool>("--dereference", false) || ctx.get<bool>("-L", false);
-  // -A / --apparent-size: On Windows, file sizes from GetFileAttributesExW
-  // are already logical (apparent) sizes, not disk allocation. Accept as no-op.
+  // -A / --apparent-size selects logical lengths; without it du counts
+  // allocated blocks (see get_file_size). -b/--bytes implies apparent size.
   cfg.apparent_size =
-      ctx.get<bool>("--apparent-size", false) || ctx.get<bool>("-A", false);
+      ctx.get<bool>("--apparent-size", false) || ctx.get<bool>("-A", false) ||
+      ctx.get<bool>("--bytes", false) || ctx.get<bool>("-b", false);
   // -P / --no-dereference: Default behavior on Windows. [DIFFERS]
   cfg.no_dereference =
       ctx.get<bool>("--no-dereference", false) || ctx.get<bool>("-P", false);
@@ -908,11 +909,74 @@ auto get_inode_key(const std::wstring& path) -> std::wstring {
 }
 
 /**
+ * @brief Get the allocation cluster size of the volume containing |path|.
+ * @param path File path
+ * @return Bytes per cluster, or 0 when it cannot be determined
+ */
+auto get_volume_cluster_size(const std::wstring& path) -> uint64_t {
+  // Cache per volume root: du walks many files on the same volume.
+  static std::unordered_map<std::wstring, uint64_t> cache;
+
+  std::wstring root;
+  if (path.size() >= 2 && path[1] == L':') {
+    root = path.substr(0, 2) + L"\\";
+  } else if (path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\') {
+    // UNC \\server\share\... -> root is \\server\share + backslash
+    size_t server_end = path.find(L'\\', 2);
+    if (server_end != std::wstring::npos) {
+      size_t share_end = path.find(L'\\', server_end + 1);
+      if (share_end != std::wstring::npos) {
+        root = path.substr(0, share_end + 1);
+      }
+    }
+  }
+  if (root.empty()) {
+    // Relative path: resolve against the current drive.
+    wchar_t cwd[MAX_PATH];
+    if (GetCurrentDirectoryW(MAX_PATH, cwd) == 0 || cwd[1] != L':') {
+      return 0;
+    }
+    root = std::wstring(cwd, 2) + L"\\";
+  }
+
+  if (auto it = cache.find(root); it != cache.end()) {
+    return it->second;
+  }
+  DWORD sectors_per_cluster = 0;
+  DWORD bytes_per_sector = 0;
+  DWORD unused = 0;
+  uint64_t cluster = 0;
+  if (GetDiskFreeSpaceW(root.c_str(), &sectors_per_cluster, &bytes_per_sector,
+                        &unused, &unused)) {
+    cluster = static_cast<uint64_t>(sectors_per_cluster) * bytes_per_sector;
+  }
+  cache[root] = cluster;
+  return cluster;
+}
+
+/**
  * @brief Get file size
  * @param path File path
+ * @param apparent When true return the logical size; otherwise return the
+ *                 on-disk allocated size like GNU du's st_blocks accounting
  * @return File size or 0 if error
  */
-auto get_file_size(const std::wstring& path) -> uint64_t {
+auto get_file_size(const std::wstring& path, bool apparent) -> uint64_t {
+  if (!apparent) {
+    // [GNU] du counts allocated blocks (st_blocks), not the logical length.
+    // GetCompressedFileSizeW accounts for compression and sparse regions;
+    // round up to the volume cluster to model block allocation.
+    ULARGE_INTEGER allocated{};
+    allocated.LowPart =
+        GetCompressedFileSizeW(path.c_str(), &allocated.HighPart);
+    if (allocated.LowPart != INVALID_FILE_SIZE || GetLastError() == NO_ERROR) {
+      const uint64_t cluster = get_volume_cluster_size(path);
+      if (cluster > 0) {
+        return (allocated.QuadPart + cluster - 1) / cluster * cluster;
+      }
+      return allocated.QuadPart;
+    }
+  }
   WIN32_FILE_ATTRIBUTE_DATA data;
   if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) {
     return 0;
@@ -1011,7 +1075,7 @@ auto calculate_dir_size(const std::wstring& path,
       }
     } else {
       // It's a file
-      uint64_t file_size = get_file_size(full_path);
+      uint64_t file_size = get_file_size(full_path, cfg.apparent_size);
       // [GNU] Hard-linked files are counted once per invocation; later
       // occurrences of the same inode contribute nothing (uutils #9202
       // #10241 #10312 #9871). --count-links opts out.
@@ -1269,7 +1333,7 @@ auto print_disk_usage(const CommandContext<DU_OPTIONS.size()>& ctx)
       }
     } else {
       // It's a file
-      uint64_t file_size = get_file_size(wpath);
+      uint64_t file_size = get_file_size(wpath, cfg.apparent_size);
       // --count-links: multiply by hard link count [DIFFERS]
       if (cfg.count_links) {
         DWORD nlinks = get_hard_link_count(wpath);

@@ -35,6 +35,7 @@
 #include "pch/pch.h"
 // include other header after pch.h
 #include <cerrno>
+
 #include "core/command_macros.h"
 import std;
 import core;
@@ -350,7 +351,8 @@ REGISTER_COMMAND(cat, "cat",
     }
 
     auto operand = native_path::make_api_path_operand(path);
-    const DWORD operand_attrs = native_path::attributes_w(operand.extended);
+    const DWORD operand_attrs =
+        native_path::operand_target_attributes_w(operand);
     if (operand.had_trailing_separator &&
         native_path::attributes_are_regular_file(operand_attrs)) {
       safeErrorPrint("cat: ");
@@ -364,7 +366,8 @@ REGISTER_COMMAND(cat, "cat",
       safeErrorPrint("cat: ");
       safeErrorPrint(path);
       safeErrorPrint(": ");
-      const DWORD attrs = native_path::attributes_w(operand.extended);
+      const DWORD attrs =
+          native_path::operand_target_attributes_w(operand);
       if (operand.had_trailing_separator &&
           native_path::attributes_are_regular_file(attrs)) {
         safeErrorPrint("Not a directory");

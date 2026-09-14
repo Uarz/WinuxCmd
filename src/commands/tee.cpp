@@ -32,10 +32,10 @@
 /// @License: MIT
 /// @Copyright: Copyright © 2026 WinuxCmd
 
-#include <cerrno>
 #include <fcntl.h>
 #include <io.h>
 
+#include <cerrno>
 #include <csignal>
 
 #include "core/command_macros.h"
@@ -145,7 +145,20 @@ REGISTER_COMMAND(
     // Resolve through the shared operand boundary so MSYS-style paths and
     // POSIX pseudo-devices (/dev/null -> NUL) work like other tools (#276).
     // Error messages keep echoing the user-visible operand verbatim.
-    const std::string resolved = native_path::normalize_api_operand(filename);
+    // A trailing separator requires a directory target (ENOTDIR on regular
+    // files); silently stripping it would truncate the file (#1052).
+    const auto operand = native_path::make_api_path_operand(filename);
+    if (const int open_err =
+            native_path::operand_file_open_error(operand, true)) {
+      encountered_error = true;
+      safeErrorPrint("tee: '");
+      safeErrorPrint(filename);
+      safeErrorPrint("': ");
+      safeErrorPrint(strerror(open_err));
+      safeErrorPrint("\n");
+      continue;
+    }
+    const std::string resolved = wstring_to_utf8(operand.extended);
     if (append) {
       file.open(resolved, std::ios::out | std::ios::app | std::ios::binary);
     } else {
@@ -153,10 +166,12 @@ REGISTER_COMMAND(
     }
 
     if (!file.is_open()) {
+      // Capture errno before printing: output helpers can clobber it.
+      const int saved_errno = errno;
       safeErrorPrint("tee: '");
       safeErrorPrint(filename);
       safeErrorPrint("': ");
-      safeErrorPrint(strerror(errno));
+      safeErrorPrint(strerror(saved_errno));
       safeErrorPrint("\n");
       encountered_error = true;
       continue;

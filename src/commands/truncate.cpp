@@ -274,7 +274,8 @@ auto build_config(const CommandContext<TRUNCATE_OPTIONS.size()>& ctx)
     if (!ref_opt.empty()) {
       cfg.reference_file = ref_opt;
     } else {
-      return std::unexpected("you must specify either '--size' or '--reference'");
+      return std::unexpected(
+          "you must specify either '--size' or '--reference'");
     }
   }
 
@@ -303,7 +304,7 @@ auto get_file_size(const std::string& file) -> cp::Result<int64_t> {
   auto operand = native_path::make_api_path_operand(file);
   if (operand.had_trailing_separator &&
       native_path::attributes_are_regular_file(
-          native_path::attributes_w(operand.extended))) {
+          native_path::operand_target_attributes_w(operand))) {
     return std::unexpected("Not a directory");
   }
 
@@ -401,7 +402,7 @@ auto apply_size_mode(int64_t current_size, SizeSpec spec,
 auto set_file_size(const std::string& file, int64_t target_size) -> bool {
   auto operand = native_path::make_api_path_operand(file);
   if (operand.had_trailing_separator) {
-    DWORD attrs = native_path::attributes_w(operand.extended);
+    DWORD attrs = native_path::operand_target_attributes_w(operand);
     if (native_path::attributes_are_regular_file(attrs) ||
         !native_path::valid_attributes(attrs)) {
       return false;
@@ -439,7 +440,7 @@ auto run(const Config& cfg) -> int {
 
   for (const auto& file : cfg.files) {
     auto operand = native_path::make_api_path_operand(file);
-    DWORD attrs = native_path::attributes_w(operand.extended);
+    DWORD attrs = native_path::operand_target_attributes_w(operand);
     if (operand.had_trailing_separator &&
         native_path::attributes_are_regular_file(attrs)) {
       safeErrorPrintLn("truncate: cannot resize '" + file +

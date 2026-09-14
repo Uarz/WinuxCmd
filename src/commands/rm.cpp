@@ -385,7 +385,7 @@ auto remove_path(const std::string& path, const RmConfig& cfg) -> bool {
   // file operations to the corresponding device instead of the actual file.
   auto operand = native_path::make_api_path_operand(path);
   const std::wstring& wpath = operand.extended;
-  DWORD attr = GetFileAttributesW(wpath.c_str());
+  DWORD attr = native_path::operand_target_attributes_w(operand);
 
   if (cfg.recursive &&
       path_is_current_or_parent_directory(utf8_to_wstring(path))) {

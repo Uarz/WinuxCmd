@@ -104,7 +104,14 @@ export auto strip_trailing_separators(std::string_view path)
   return path;
 }
 
+export auto attributes_w(std::wstring_view path) -> DWORD;
+export auto attributes_are_directory(DWORD attrs) -> bool;
+export auto attributes_are_regular_file(DWORD attrs) -> bool;
+export auto valid_attributes(DWORD attrs) -> bool;
+
 export auto normalize_api_operand_w(std::wstring_view path) -> std::wstring {
+  const bool had_trailing_separator =
+      strip_trailing_separators(path).size() != path.size();
   std::wstring normalized(strip_trailing_separators(path));
   if (normalized.size() >= 2 && is_separator(normalized[0]) &&
       ((normalized[1] >= L'a' && normalized[1] <= L'z') ||
@@ -120,7 +127,15 @@ export auto normalize_api_operand_w(std::wstring_view path) -> std::wstring {
     if (normalized.size() > 3) {
       drive_path.append(normalized.substr(3));
     }
-    return normalize_separators(std::move(drive_path));
+    normalized = normalize_separators(std::move(drive_path));
+  }
+  // A trailing separator means the operand must name a directory (POSIX
+  // ENOTDIR). If the stripped target is not a directory, keep a separator so
+  // the OS rejects opens/creates instead of silently touching the regular
+  // file (#1052 — stripping turned "file/" into "file" and truncated it).
+  if (had_trailing_separator &&
+      !attributes_are_directory(attributes_w(normalized))) {
+    normalized.push_back(L'\\');
   }
   return normalized;
 }
@@ -196,12 +211,42 @@ export auto make_api_path_operand_w(std::wstring_view path) -> ApiPathOperand {
   operand.normalized = normalize_api_operand_w(operand.original);
   operand.extended = to_extended_path(operand.normalized);
   operand.had_trailing_separator =
-      operand.normalized.size() != operand.original.size();
+      strip_trailing_separators(std::wstring_view(operand.original)).size() !=
+      operand.original.size();
   return operand;
 }
 
 export auto make_api_path_operand(std::string_view path) -> ApiPathOperand {
   return make_api_path_operand_w(from_utf8(path));
+}
+
+// Probe the target's attributes ignoring the trailing-separator enforcement:
+// extended keeps the separator for non-directory operands (#1052), which
+// GetFileAttributesW rejects, so strip it before probing.
+export auto operand_target_attributes_w(const ApiPathOperand& operand)
+    -> DWORD {
+  const std::wstring_view probe =
+      operand.had_trailing_separator
+          ? strip_trailing_separators(std::wstring_view(operand.extended))
+          : std::wstring_view(operand.extended);
+  return attributes_w(probe);
+}
+
+// errno-style error for opening/creating a file at this operand: 0 when the
+// operand may proceed; ENOTDIR when a trailing separator named a regular
+// file on a read-open; ENOENT when it named a missing path (#1052).
+// For write/create opens GNU mirrors the Linux quirk where O_CREAT on
+// "file/" reports EISDIR, and opening a directory for writing is EISDIR too.
+export auto operand_file_open_error(const ApiPathOperand& operand,
+                                    bool for_write = false) -> int {
+  const DWORD attrs = operand_target_attributes_w(operand);
+  if (operand.had_trailing_separator) {
+    if (!valid_attributes(attrs)) return ENOENT;
+    if (attributes_are_directory(attrs)) return for_write ? EISDIR : 0;
+    return for_write ? EISDIR : ENOTDIR;
+  }
+  if (for_write && attributes_are_directory(attrs)) return EISDIR;
+  return 0;
 }
 
 export auto attributes_w(std::wstring_view path) -> DWORD {

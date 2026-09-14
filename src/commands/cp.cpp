@@ -513,7 +513,7 @@ auto backup_existing_destination(const std::string& destPath,
 
   auto dest_operand = native_path::make_api_path_operand(destPath);
   if (!native_path::valid_attributes(
-          native_path::attributes_w(dest_operand.extended))) {
+          native_path::operand_target_attributes_w(dest_operand))) {
     return true;
   }
 
@@ -630,7 +630,8 @@ auto copy_file(const std::string& srcPath, const std::string& destPath,
   // --remove-destination: remove existing dest before opening
   if (remove_dest) {
     auto dest_operand = native_path::make_api_path_operand(destPath);
-    DWORD dest_attrs = native_path::attributes_w(dest_operand.extended);
+    DWORD dest_attrs =
+        native_path::operand_target_attributes_w(dest_operand);
     if (dest_attrs != INVALID_FILE_ATTRIBUTES) {
       if (dest_attrs & FILE_ATTRIBUTE_DIRECTORY) {
         RemoveDirectoryW(dest_operand.extended.c_str());
@@ -672,9 +673,11 @@ auto copy_file(const std::string& srcPath, const std::string& destPath,
   // Open destination file
   std::ofstream dest = file_io::create_binary_file(destPath);
   if (!dest) {
+    const int open_err = errno;
     bool force = ctx.get<bool>("--force", false) || ctx.get<bool>("-f", false);
     if (!force) {
-      return std::unexpected("cannot open for writing");
+      return std::unexpected("cannot create regular file '" + destPath +
+                             "': " + strerror(open_err));
     }
 
     auto dest_operand = native_path::make_api_path_operand(destPath);
@@ -682,7 +685,8 @@ auto copy_file(const std::string& srcPath, const std::string& destPath,
     DeleteFileW(dest_operand.extended.c_str());
     dest = file_io::create_binary_file(destPath);
     if (!dest) {
-      return std::unexpected("cannot open for writing");
+      return std::unexpected("cannot create regular file '" + destPath +
+                             "': " + strerror(errno));
     }
   }
 
@@ -914,7 +918,9 @@ auto process_source_paths(
         // OPTIMIZED: Avoid wstring concatenation
         safeErrorPrint("cp: error copying file '");
         safeErrorPrint(srcPath);
-        safeErrorPrint("'\n");
+        safeErrorPrint("': ");
+        safeErrorPrint(fileResult.error());
+        safeErrorPrint("\n");
         success = false;
       }
     }

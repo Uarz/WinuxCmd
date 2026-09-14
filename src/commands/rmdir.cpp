@@ -75,7 +75,7 @@ auto remove_one(const std::string& utf8_path, bool ignore_non_empty,
     safePrint("'\n");
   }
 
-  DWORD attrs = GetFileAttributesW(wpath.c_str());
+  DWORD attrs = native_path::operand_target_attributes_w(operand);
   if (operand.had_trailing_separator && attrs != INVALID_FILE_ATTRIBUTES &&
       (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
     safeErrorPrint("rmdir: failed to remove '");

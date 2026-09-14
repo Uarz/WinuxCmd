@@ -305,7 +305,7 @@ auto run(const Config& cfg) -> int {
     auto input_operand = native_path::make_api_path_operand(cfg.input);
     if (input_operand.had_trailing_separator &&
         native_path::attributes_are_regular_file(
-            native_path::attributes_w(input_operand.extended))) {
+            native_path::operand_target_attributes_w(input_operand))) {
       cp::report_custom_error(L"uniq",
                               utf8_to_wstring(cfg.input + ": Not a directory"));
       return 1;

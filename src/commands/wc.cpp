@@ -178,9 +178,14 @@ auto validate_arguments(std::span<const std::string_view> args)
 }
 
 auto wc_input_open_error(std::string_view path) -> std::string {
-  std::error_code ec;
-  auto status = std::filesystem::status(std::filesystem::u8path(path), ec);
-  if (!ec && status.type() == std::filesystem::file_type::directory) {
+  auto operand = native_path::make_api_path_operand(path);
+  const DWORD attrs = native_path::operand_target_attributes_w(operand);
+  if (operand.had_trailing_separator &&
+      native_path::attributes_are_regular_file(attrs)) {
+    return "cannot open '" + std::string(path) +
+           "' for reading: Not a directory";
+  }
+  if (native_path::attributes_are_directory(attrs)) {
     return std::string(path) + ": Is a directory";
   }
   return "cannot open '" + std::string(path) +

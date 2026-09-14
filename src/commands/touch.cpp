@@ -275,8 +275,7 @@ auto env_tz_offset_east() -> std::optional<int> {
     if (close == std::string::npos) return std::nullopt;
     pos = close + 1;
   } else {
-    while (pos < s.size() &&
-           std::isalpha(static_cast<unsigned char>(s[pos]))) {
+    while (pos < s.size() && std::isalpha(static_cast<unsigned char>(s[pos]))) {
       ++pos;
     }
   }
@@ -326,8 +325,7 @@ auto env_tz_offset_east() -> std::optional<int> {
   }
 
   // POSIX: positive offset = west of UTC, so east offset negates it.
-  long long east_seconds =
-      -sign * (hours * 3600LL + minutes * 60LL + seconds);
+  long long east_seconds = -sign * (hours * 3600LL + minutes * 60LL + seconds);
   return static_cast<int>((east_seconds + 30) / 60);
 }
 
@@ -400,8 +398,8 @@ auto parse_fixed_date_time(std::string input) -> std::optional<FILETIME> {
       if (second != std::string::npos &&
           date_part.find('-', second + 1) == std::string::npos) {
         auto y = parse_int(std::string_view(date_part).substr(0, first));
-        auto m = parse_int(std::string_view(date_part).substr(
-            first + 1, second - first - 1));
+        auto m = parse_int(
+            std::string_view(date_part).substr(first + 1, second - first - 1));
         auto d = parse_int(std::string_view(date_part).substr(second + 1));
         if (y && m && d) {
           year = *y;
@@ -578,7 +576,7 @@ auto read_times_from_file(const std::wstring& wpath, bool no_dereference)
   auto operand = native_path::make_api_path_operand_w(wpath);
   if (operand.had_trailing_separator &&
       native_path::attributes_are_regular_file(
-          native_path::attributes_w(operand.extended))) {
+          native_path::operand_target_attributes_w(operand))) {
     return std::nullopt;
   }
 
@@ -608,7 +606,7 @@ auto apply_touch_one(const std::string& path,
                      const std::optional<TimePair>& date_times) -> bool {
   auto operand = native_path::make_api_path_operand(path);
   if (operand.had_trailing_separator) {
-    DWORD attrs = native_path::attributes_w(operand.extended);
+    DWORD attrs = native_path::operand_target_attributes_w(operand);
     if (native_path::attributes_are_regular_file(attrs) ||
         !native_path::valid_attributes(attrs)) {
       if (no_create && !native_path::valid_attributes(attrs)) {
@@ -627,7 +625,7 @@ auto apply_touch_one(const std::string& path,
       create_mode, file_open_flags(no_dereference), nullptr));
 
   if (!h && !no_create && !no_dereference) {
-    DWORD attrs = native_path::attributes_w(operand.extended);
+    DWORD attrs = native_path::operand_target_attributes_w(operand);
     if (attrs != INVALID_FILE_ATTRIBUTES &&
         (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
       h.reset(

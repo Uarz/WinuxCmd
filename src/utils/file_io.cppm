@@ -20,7 +20,7 @@ constexpr size_t kReadChunkSize = 64 * 1024;
 auto read_open_error(std::string_view path,
                      const native_path::ApiPathOperand& operand,
                      unsigned long error) -> std::string {
-  const DWORD attrs = native_path::attributes_w(operand.extended);
+  const DWORD attrs = native_path::operand_target_attributes_w(operand);
   if (operand.had_trailing_separator &&
       native_path::attributes_are_regular_file(attrs)) {
     return winux::i18n::format("utils.file.error.not_directory",
@@ -72,14 +72,33 @@ auto read_handle_to_string(HANDLE file, std::string_view path)
 
 export namespace file_io {
 
+// A trailing separator makes the operand require a directory target
+// (POSIX ENOTDIR). Windows path normalization strips it, which would
+// silently turn "file/" into "file" and read/truncate the regular file
+// (#1052 — data loss). Refuse by returning a failed stream and setting
+// errno so callers report the right diagnostic.
 export auto open_binary_file(std::string_view filename) -> std::ifstream {
   auto operand = native_path::make_api_path_operand(filename);
+  if (int err = native_path::operand_file_open_error(operand)) {
+    errno = err;
+    // A default-constructed stream has goodbit set; callers test `!file`,
+    // so failbit must be raised explicitly.
+    std::ifstream failed;
+    failed.setstate(std::ios::failbit);
+    return failed;
+  }
   return std::ifstream(std::filesystem::path(operand.extended),
                        std::ios::binary);
 }
 
 export auto create_binary_file(std::string_view filename) -> std::ofstream {
   auto operand = native_path::make_api_path_operand(filename);
+  if (int err = native_path::operand_file_open_error(operand, true)) {
+    errno = err;
+    std::ofstream failed;
+    failed.setstate(std::ios::failbit);
+    return failed;
+  }
   return std::ofstream(std::filesystem::path(operand.extended),
                        std::ios::binary | std::ios::trunc);
 }
@@ -108,7 +127,7 @@ auto read_all_file(std::string_view filename)
     -> std::expected<std::string, std::string> {
   auto operand = native_path::make_api_path_operand(filename);
   if (operand.had_trailing_separator) {
-    const DWORD attrs = native_path::attributes_w(operand.extended);
+    const DWORD attrs = native_path::operand_target_attributes_w(operand);
     if (native_path::attributes_are_regular_file(attrs)) {
       return std::unexpected(
           read_open_error(filename, operand, ERROR_DIRECTORY));

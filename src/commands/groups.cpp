@@ -56,6 +56,16 @@ struct Config {
   SmallVector<std::string, 64> users;
 };
 
+// See id.cpp/stat.cpp: the Windows well-known "None" group has no POSIX
+// equivalent and is treated as unresolvable (#1024).
+auto is_none_group_name(std::string_view name) -> bool {
+  return name.size() == 4 &&
+         std::tolower(static_cast<unsigned char>(name[0])) == 'n' &&
+         std::tolower(static_cast<unsigned char>(name[1])) == 'o' &&
+         std::tolower(static_cast<unsigned char>(name[2])) == 'n' &&
+         std::tolower(static_cast<unsigned char>(name[3])) == 'e';
+}
+
 auto build_config(const CommandContext<GROUPS_OPTIONS.size()>& ctx)
     -> cp::Result<Config> {
   Config cfg;
@@ -95,9 +105,20 @@ auto get_user_groups(const std::string& user_str) -> int {
   for (DWORD i = 0; i < entries; ++i) {
     std::wstring wname = groups[i].grui0_name ? groups[i].grui0_name : L"";
     std::string name = wstring_to_utf8(wname);
-    if (!name.empty()) {
-      safePrintLn(name);
+    if (name.empty()) {
+      continue;
     }
+    // [GNU] The default primary group on Windows resolves to a well-known
+    // group literally named "None" which has no POSIX equivalent; print
+    // its numeric id like an unresolvable gid (#1024).
+    if (is_none_group_name(name)) {
+      if (auto account = win32_lookup_account(wname);
+          account && !account->id.empty()) {
+        safePrintLn(account->id);
+      }
+      continue;
+    }
+    safePrintLn(name);
   }
 
   if (raw) NetApiBufferFree(raw);

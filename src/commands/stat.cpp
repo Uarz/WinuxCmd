@@ -98,9 +98,12 @@ auto constexpr STAT_OPTIONS = std::array{
     OPTION("-t", "--terse", "print the information in terse form", BOOL_TYPE),
     OPTION("", "--printf", "like --format, but interpret backslash escapes",
            STRING_TYPE),
+    // [GNU] --cached is a required-argument caching hint (never/always/
+    // default). It is accepted as a no-op on Windows.
     OPTION("", "--cached",
-           "control cached attribute data (unsupported on Windows)",
-           OPTIONAL_STRING_TYPE)};
+           "use cached attribute data WHEN (hint only; always fresh on "
+           "Windows)",
+           STRING_TYPE)};
 
 namespace stat_pipeline {
 namespace cp = core::pipeline;
@@ -116,6 +119,12 @@ struct Config {
 
 struct FileStatData {
   WIN32_FILE_ATTRIBUTE_DATA attrs{};
+  // [GNU] ctime: Windows has no stat() "status change" time. NTFS
+  // ChangeTime (FILE_BASIC_INFO) is the closest analog; filesystems that
+  // do not maintain it report zero and fall back to CreationTime.
+  FILETIME change_time{};
+  // st_blocks source: on-disk allocation in bytes (FILE_STANDARD_INFO).
+  uint64_t allocated_size = 0;
   uint64_t size = 0;
   uint64_t file_index = 0;
   uint64_t volume_serial = 0;
@@ -140,10 +149,19 @@ struct FileSystemStatData {
 auto build_config(const CommandContext<STAT_OPTIONS.size()>& ctx)
     -> cp::Result<Config> {
   Config cfg;
+  // [GNU] --cached=WHEN accepts 'never', 'always' and 'default' as a
+  // read-caching hint (#1069). Windows always queries fresh attributes, so
+  // a valid WHEN is a no-op; anything else is a GNU-style usage error.
   if (ctx.has("--cached")) {
-    return std::unexpected(
-        "--cached is not supported on Windows; file status is always fetched "
-        "fresh");
+    const auto when = ctx.get<std::string>("--cached", "");
+    if (when != "never" && when != "always" && when != "default") {
+      return std::unexpected("invalid argument '" + when +
+                             "' for '--cached'\n"
+                             "Valid arguments are:\n"
+                             "  - 'default'\n"
+                             "  - 'never'\n"
+                             "  - 'always'");
+    }
   }
   cfg.dereference =
       ctx.get<bool>("--dereference", false) || ctx.get<bool>("-L", false);
@@ -202,44 +220,54 @@ auto build_config(const CommandContext<STAT_OPTIONS.size()>& ctx)
   return cfg;
 }
 
-auto format_timestamp(FILETIME ft) -> std::string {
-  FILETIME local{};
-  if (FileTimeToLocalFileTime(&ft, &local)) ft = local;
-  SYSTEMTIME st;
-  FileTimeToSystemTime(&ft, &st);
+auto filetime_to_100ns(FILETIME ft) -> uint64_t {
+  ULARGE_INTEGER value{};
+  value.LowPart = ft.dwLowDateTime;
+  value.HighPart = ft.dwHighDateTime;
+  return value.QuadPart;
+}
 
-  char buf[64];
-  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d", st.wYear,
-           st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+// [GNU] Human-readable timestamps are
+// "YYYY-MM-DD HH:MM:SS.NNNNNNNNN +ZZZZ" (#1022). FILETIME carries 100ns
+// precision, so the nanosecond field always ends in 0. The numeric offset
+// is the local-zone offset in effect at that instant (including DST),
+// derived from the same conversion used for the wall-clock fields.
+auto format_timestamp(FILETIME ft) -> std::string {
+  FILETIME local = ft;
+  FileTimeToLocalFileTime(&ft, &local);
+  SYSTEMTIME st{};
+  FileTimeToSystemTime(&local, &st);
+
+  const int64_t offset_100ns = static_cast<int64_t>(filetime_to_100ns(local)) -
+                               static_cast<int64_t>(filetime_to_100ns(ft));
+  int64_t offset_minutes = offset_100ns / 600000000LL;
+  char sign = '+';
+  if (offset_minutes < 0) {
+    sign = '-';
+    offset_minutes = -offset_minutes;
+  }
+  const uint64_t nanos = (filetime_to_100ns(ft) % 10000000ULL) * 100ULL;
+
+  char buf[80];
+  snprintf(buf, sizeof(buf),
+           "%04d-%02d-%02d %02d:%02d:%02d.%09llu %c%02lld%02lld",
+           static_cast<int>(st.wYear), static_cast<int>(st.wMonth),
+           static_cast<int>(st.wDay), static_cast<int>(st.wHour),
+           static_cast<int>(st.wMinute), static_cast<int>(st.wSecond),
+           static_cast<unsigned long long>(nanos), sign,
+           static_cast<long long>(offset_minutes / 60),
+           static_cast<long long>(offset_minutes % 60));
   return std::string(buf);
 }
 
 auto filetime_to_unix_seconds(FILETIME ft) -> int64_t {
-  ULARGE_INTEGER value{};
-  value.LowPart = ft.dwLowDateTime;
-  value.HighPart = ft.dwHighDateTime;
+  const uint64_t quad = filetime_to_100ns(ft);
   constexpr uint64_t kWindowsToUnixEpoch100ns = 116444736000000000ULL;
-  if (value.QuadPart < kWindowsToUnixEpoch100ns) {
-    return -static_cast<int64_t>((kWindowsToUnixEpoch100ns - value.QuadPart) /
+  if (quad < kWindowsToUnixEpoch100ns) {
+    return -static_cast<int64_t>((kWindowsToUnixEpoch100ns - quad) /
                                  10000000ULL);
   }
-  return static_cast<int64_t>((value.QuadPart - kWindowsToUnixEpoch100ns) /
-                              10000000ULL);
-}
-
-auto format_size(uint64_t size) -> std::string {
-  const char* units[] = {"B", "K", "M", "G", "T"};
-  int unit_index = 0;
-  double dsize = static_cast<double>(size);
-
-  while (dsize >= 1024.0 && unit_index < 4) {
-    dsize /= 1024.0;
-    unit_index++;
-  }
-
-  char buf[64];
-  snprintf(buf, sizeof(buf), "%.2f %s", dsize, units[unit_index]);
-  return std::string(buf);
+  return static_cast<int64_t>((quad - kWindowsToUnixEpoch100ns) / 10000000ULL);
 }
 
 auto format_permissions(DWORD attrs) -> std::string {
@@ -269,6 +297,56 @@ auto format_mode_octal(DWORD attrs) -> std::string {
     return (attrs & FILE_ATTRIBUTE_READONLY) ? "555" : "755";
   }
   return (attrs & FILE_ATTRIBUTE_READONLY) ? "444" : "644";
+}
+
+// [GNU] %f is the raw st_mode in hex (type bits | permission bits), e.g.
+// 81a4 for a 0644 regular file, 41ed for a directory, a1ff for a symlink.
+auto st_mode_bits(DWORD attrs) -> uint32_t {
+  if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) return 0xA000u | 0777u;
+  if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+    return 0x4000u | ((attrs & FILE_ATTRIBUTE_READONLY) ? 0555u : 0755u);
+  }
+  return 0x8000u | ((attrs & FILE_ATTRIBUTE_READONLY) ? 0444u : 0644u);
+}
+
+// [GNU] The default primary group on Windows resolves to a well-known
+// group literally named "None" which has no POSIX equivalent; treat it as
+// unresolvable so it prints like a GNU nameless gid (#1024).
+auto is_none_group_name(std::string_view name) -> bool {
+  return name.size() == 4 &&
+         std::tolower(static_cast<unsigned char>(name[0])) == 'n' &&
+         std::tolower(static_cast<unsigned char>(name[1])) == 'o' &&
+         std::tolower(static_cast<unsigned char>(name[2])) == 'n' &&
+         std::tolower(static_cast<unsigned char>(name[3])) == 'e';
+}
+
+// [GNU] stat prints "UNKNOWN" where the owner/group name cannot be
+// resolved (e.g. `Gid: ( 1234/ UNKNOWN)`).
+auto display_owner_name(std::string_view name) -> std::string {
+  return name.empty() ? "UNKNOWN" : std::string(name);
+}
+
+auto display_group_name(std::string_view name) -> std::string {
+  return (name.empty() || is_none_group_name(name)) ? "UNKNOWN"
+                                                    : std::string(name);
+}
+
+// [GNU] %b is the number of allocated 512B blocks (st_blocks). On Windows
+// this comes from FileStandardInfo AllocationSize; resident files report 0
+// allocated bytes, matching GNU on drvfs/9P mounts.
+auto allocated_block_count(const FileStatData& stat) -> uint64_t {
+  if (stat.attrs.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) return 0;
+  return (stat.allocated_size + 511) / 512;
+}
+
+auto pad_right(std::string s, size_t width) -> std::string {
+  if (s.size() < width) s.append(width - s.size(), ' ');
+  return s;
+}
+
+auto pad_left(std::string s, size_t width) -> std::string {
+  if (s.size() < width) s.insert(0, width - s.size(), ' ');
+  return s;
 }
 
 auto io_block_size_for(const std::filesystem::path& p) -> uint32_t {
@@ -352,10 +430,15 @@ auto load_file_stat(const std::filesystem::path& p, bool lstat_link = false)
   }
   stat.io_block_size = io_block_size_for(p);
 
-  HANDLE h =
-      CreateFileW(operand.extended.c_str(), FILE_READ_ATTRIBUTES,
-                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                  nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  DWORD open_flags = FILE_FLAG_BACKUP_SEMANTICS;
+  if (lstat_link) {
+    // Stat the reparse point itself so inode/change time describe the
+    // link, not its target.
+    open_flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+  }
+  HANDLE h = CreateFileW(operand.extended.c_str(), FILE_READ_ATTRIBUTES,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, OPEN_EXISTING, open_flags, nullptr);
   if (h != INVALID_HANDLE_VALUE) {
     BY_HANDLE_FILE_INFORMATION info{};
     if (GetFileInformationByHandle(h, &info)) {
@@ -364,7 +447,26 @@ auto load_file_stat(const std::filesystem::path& p, bool lstat_link = false)
       stat.volume_serial = info.dwVolumeSerialNumber;
       stat.hard_links = std::max<DWORD>(info.nNumberOfLinks, 1);
     }
+
+    FILE_BASIC_INFO basic{};
+    if (GetFileInformationByHandleEx(h, FileBasicInfo, &basic, sizeof(basic))) {
+      stat.change_time.dwLowDateTime = basic.ChangeTime.LowPart;
+      stat.change_time.dwHighDateTime = basic.ChangeTime.HighPart;
+    }
+    FILE_STANDARD_INFO standard{};
+    if (GetFileInformationByHandleEx(h, FileStandardInfo, &standard,
+                                     sizeof(standard)) &&
+        standard.AllocationSize.QuadPart > 0) {
+      stat.allocated_size =
+          static_cast<uint64_t>(standard.AllocationSize.QuadPart);
+    }
     CloseHandle(h);
+  }
+
+  if (filetime_to_100ns(stat.change_time) == 0) {
+    // Filesystem does not maintain ChangeTime (e.g. FAT32): the closest
+    // remaining analog is the file creation time.
+    stat.change_time = stat.attrs.ftCreationTime;
   }
 
   return stat;
@@ -482,8 +584,136 @@ auto load_file_system_stat(const std::string& filename)
       .fs_name = wstring_to_utf8(fs_name.data())};
 }
 
+// [GNU] %N dereferences symlinks in the output: 'link' -> 'target'
+// (uutils #8789).
+auto read_link_target_utf8(const std::string& filename) -> std::string {
+  const std::wstring wname = utf8_to_wstring(filename);
+  const DWORD link_attrs = native_path::attributes_w(wname);
+  if (link_attrs == INVALID_FILE_ATTRIBUTES ||
+      (link_attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0) {
+    return {};
+  }
+  HANDLE handle = CreateFileW(
+      native_path::to_extended_path(wname).c_str(), 0,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+      nullptr);
+  if (handle == INVALID_HANDLE_VALUE) return {};
+
+  std::string result;
+  std::array<std::byte, 16 * 1024> reparse_buffer{};
+  DWORD returned = 0;
+  if (DeviceIoControl(
+          handle, FSCTL_GET_REPARSE_POINT, nullptr, 0, reparse_buffer.data(),
+          static_cast<DWORD>(reparse_buffer.size()), &returned, nullptr)) {
+    auto* reparse = reinterpret_cast<stat_win32_compat::ReparseDataBuffer*>(
+        reparse_buffer.data());
+    std::wstring target;
+    if (reparse->ReparseTag == IO_REPARSE_TAG_SYMLINK) {
+      const auto& sl = reparse->SymbolicLinkReparseBuffer;
+      target.assign(sl.PathBuffer + sl.PrintNameOffset / sizeof(wchar_t),
+                    sl.PrintNameLength / sizeof(wchar_t));
+    } else if (reparse->ReparseTag == IO_REPARSE_TAG_MOUNT_POINT) {
+      const auto& mp = reparse->MountPointReparseBuffer;
+      target.assign(mp.PathBuffer + mp.PrintNameOffset / sizeof(wchar_t),
+                    mp.PrintNameLength / sizeof(wchar_t));
+    }
+    result = wstring_to_utf8(target);
+  }
+  CloseHandle(handle);
+  return result;
+}
+
+// [GNU] A directive may be preceded by printf-style modifiers:
+// '-' left-justify, '0' zero-pad numbers, '#' alternate form (0x for hex,
+// leading 0 for octal %a), a decimal field width and a '.precision'
+// (min digit count for numbers, max length for strings).
+struct DirectiveSpec {
+  bool left = false;
+  bool zero = false;
+  bool alter = false;
+  size_t width = 0;
+  int precision = -1;
+  bool any = false;  // at least one modifier present
+};
+
+// `i` points at the directive char position following '%' on entry; on
+// return it is the index of the final directive letter.
+auto parse_directive_spec(std::string_view format, size_t& i) -> DirectiveSpec {
+  DirectiveSpec spec;
+  size_t j = i;
+  while (j < format.size()) {
+    switch (format[j]) {
+      case '-':
+        spec.left = true;
+        break;
+      case '0':
+        spec.zero = true;
+        break;
+      case '#':
+        spec.alter = true;
+        break;
+      case '+':
+      case ' ':
+        break;  // accepted, no effect for our fields
+      default:
+        goto flags_done;
+    }
+    spec.any = true;
+    ++j;
+  }
+flags_done:
+  while (j < format.size() && format[j] >= '0' && format[j] <= '9') {
+    spec.width = spec.width * 10 + static_cast<size_t>(format[j++] - '0');
+    spec.any = true;
+  }
+  if (j < format.size() && format[j] == '.') {
+    ++j;
+    spec.precision = 0;
+    spec.any = true;
+    while (j < format.size() && format[j] >= '0' && format[j] <= '9') {
+      spec.precision = spec.precision * 10 + (format[j++] - '0');
+      spec.any = true;
+    }
+  }
+  i = j;
+  return spec;
+}
+
+auto apply_directive_spec(std::string value, const DirectiveSpec& spec,
+                          char code, bool numeric) -> std::string {
+  if (numeric) {
+    if (spec.precision >= 0 &&
+        value.size() < static_cast<size_t>(spec.precision)) {
+      value.insert(0, static_cast<size_t>(spec.precision) - value.size(), '0');
+    }
+    if (spec.alter) {
+      if ((code == 'f' || code == 'D' || code == 't' || code == 'T') &&
+          value != "0") {
+        value.insert(0, "0x");
+      } else if (code == 'a' && (value.empty() || value.front() != '0')) {
+        value.insert(0, "0");
+      }
+    }
+  } else if (spec.precision >= 0 &&
+             value.size() > static_cast<size_t>(spec.precision)) {
+    value.resize(static_cast<size_t>(spec.precision));
+  }
+  if (value.size() < spec.width) {
+    const char pad = (spec.zero && numeric) ? '0' : ' ';
+    if (spec.left) {
+      value.append(spec.width - value.size(), pad);
+    } else {
+      value.insert(0, spec.width - value.size(), pad);
+    }
+  }
+  return value;
+}
+
+// Returns the rendered text; `ctx_failed` is set when %C was requested
+// (GNU reports a hard failure when the security context is unavailable).
 auto render_format(std::string_view format, const std::string& filename,
-                   const FileStatData& stat) -> std::string {
+                   const FileStatData& stat, bool& ctx_failed) -> std::string {
   std::string out;
   out.reserve(format.size() + filename.size());
 
@@ -493,138 +723,148 @@ auto render_format(std::string_view format, const std::string& filename,
       continue;
     }
 
-    char code = format[++i];
+    size_t pos = i + 1;
+    const DirectiveSpec spec = parse_directive_spec(format, pos);
+    if (pos >= format.size()) {
+      out.push_back('%');
+      break;
+    }
+    const char code = format[pos];
+    i = pos;
+
+    // Whether the directive produces a number for '0'/precision padding.
+    const bool numeric = std::string_view("abdfghiorstTuDXYZW").find(code) !=
+                         std::string_view::npos;
+
+    std::string value;
+    bool handled = true;
     switch (code) {
       case '%':
-        out.push_back('%');
+        value = "%";
         break;
       case 'n':
-        out += filename;
+        value = filename;
         break;
       case 'N': {
-        out += "'";
-        out += filename;
-        out += "'";
-        // [GNU] %N dereferences symlinks in the output: 'l' -> 'target'
-        // (uutils #8789).
-        const std::wstring wname = utf8_to_wstring(filename);
-        const DWORD link_attrs = native_path::attributes_w(wname);
-        if (link_attrs != INVALID_FILE_ATTRIBUTES &&
-            (link_attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-          HANDLE handle = CreateFileW(
-              native_path::to_extended_path(wname).c_str(), 0,
-              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-              OPEN_EXISTING,
-              FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-              nullptr);
-          if (handle != INVALID_HANDLE_VALUE) {
-            std::array<std::byte, 16 * 1024> reparse_buffer{};
-            DWORD returned = 0;
-            if (DeviceIoControl(handle, FSCTL_GET_REPARSE_POINT, nullptr, 0,
-                                reparse_buffer.data(),
-                                static_cast<DWORD>(reparse_buffer.size()),
-                                &returned, nullptr)) {
-              auto* reparse =
-                  reinterpret_cast<stat_win32_compat::ReparseDataBuffer*>(
-                      reparse_buffer.data());
-              std::wstring target;
-              if (reparse->ReparseTag == IO_REPARSE_TAG_SYMLINK) {
-                const auto& sl = reparse->SymbolicLinkReparseBuffer;
-                target.assign(
-                    sl.PathBuffer + sl.PrintNameOffset / sizeof(wchar_t),
-                    sl.PrintNameLength / sizeof(wchar_t));
-              } else if (reparse->ReparseTag == IO_REPARSE_TAG_MOUNT_POINT) {
-                const auto& mp = reparse->MountPointReparseBuffer;
-                target.assign(
-                    mp.PathBuffer + mp.PrintNameOffset / sizeof(wchar_t),
-                    mp.PrintNameLength / sizeof(wchar_t));
-              }
-              if (!target.empty()) {
-                out += " -> '";
-                out += wstring_to_utf8(target);
-                out += "'";
-              }
-            }
-            CloseHandle(handle);
+        const std::string target = read_link_target_utf8(filename);
+        if (spec.any) {
+          // [GNU] modifiers suppress quoting; name and target are each
+          // padded to the field width.
+          value = apply_directive_spec(filename, spec, code, false);
+          if (!target.empty()) {
+            value += " -> ";
+            value += apply_directive_spec(target, spec, code, false);
           }
+        } else {
+          value = "'" + filename + "'";
+          if (!target.empty()) value += " -> '" + target + "'";
         }
         break;
       }
       case 's':
-        out += std::to_string(stat.size);
+        value = std::to_string(stat.size);
         break;
       case 'b':
-        out += std::to_string((stat.size + 511) / 512);
+        value = std::to_string(allocated_block_count(stat));
         break;
       case 'B':
-        out += "512";
+        value = "512";
         break;
       case 'F':
-        out += file_type_name(stat.attrs.dwFileAttributes);
+        value = file_type_name(stat.attrs.dwFileAttributes);
         break;
       case 'A':
-        out += format_permissions(stat.attrs.dwFileAttributes);
+        value = format_permissions(stat.attrs.dwFileAttributes);
         break;
       case 'a':
-        out += format_mode_octal(stat.attrs.dwFileAttributes);
+        value = format_mode_octal(stat.attrs.dwFileAttributes);
+        break;
+      case 'f': {
+        // [GNU] %f: raw mode in hex.
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%x",
+                 static_cast<unsigned int>(
+                     st_mode_bits(stat.attrs.dwFileAttributes)));
+        value = buf;
+        break;
+      }
+      case 'c':
+        // [GNU] %c: SELinux security context string; none on Windows.
+        value = "?";
+        break;
+      case 'C':
+        // [GNU] %C: SELinux security context; GNU reports a failure when
+        // it cannot be read, so flag it and let the caller set rc=1.
+        value = "?";
+        ctx_failed = true;
+        break;
+      case 'r':
+        // [GNU] %r: device number (st_rdev) in decimal. Windows has no
+        // block/character special files, so it is always 0.
+        value = "0";
+        break;
+      case 't':
+      case 'T':
+        // [GNU] %t/%T: major/minor device type in hex for special files;
+        // 0 for everything else (Windows has no special files).
+        value = "0";
         break;
       case 'h':
-        out += std::to_string(stat.hard_links);
+        value = std::to_string(stat.hard_links);
         break;
       case 'i':
-        out += std::to_string(stat.file_index);
+        value = std::to_string(stat.file_index);
         break;
       case 'd':
-        out += std::to_string(stat.volume_serial);
+        value = std::to_string(stat.volume_serial);
         break;
       case 'D': {
         char buf[32];
         snprintf(buf, sizeof(buf), "%llx",
                  static_cast<unsigned long long>(stat.volume_serial));
-        out += buf;
+        value = buf;
         break;
       }
       case 'o':
-        out += std::to_string(stat.io_block_size);
+        value = std::to_string(stat.io_block_size);
         break;
       case 'u':
-        out += stat.owner_id.empty() ? "0" : stat.owner_id;
+        value = stat.owner_id.empty() ? "0" : stat.owner_id;
         break;
       case 'g':
-        out += stat.group_id.empty() ? "0" : stat.group_id;
+        value = stat.group_id.empty() ? "0" : stat.group_id;
         break;
       case 'U':
-        out += stat.owner_name.empty() ? "?" : stat.owner_name;
+        value = display_owner_name(stat.owner_name);
         break;
       case 'G':
-        out += stat.group_name.empty() ? "?" : stat.group_name;
+        value = display_group_name(stat.group_name);
         break;
       case 'x':
-        out += format_timestamp(stat.attrs.ftLastAccessTime);
+        value = format_timestamp(stat.attrs.ftLastAccessTime);
         break;
       case 'y':
-        out += format_timestamp(stat.attrs.ftLastWriteTime);
+        value = format_timestamp(stat.attrs.ftLastWriteTime);
         break;
       case 'w':
-        out += format_timestamp(stat.attrs.ftCreationTime);
+        value = format_timestamp(stat.attrs.ftCreationTime);
         break;
       case 'z':
-        out += format_timestamp(stat.attrs.ftLastAccessTime);
+        value = format_timestamp(stat.change_time);
         break;
       case 'X':
-        out += std::to_string(
+        value = std::to_string(
             filetime_to_unix_seconds(stat.attrs.ftLastAccessTime));
         break;
       case 'Y':
-        out += std::to_string(
+        value = std::to_string(
             filetime_to_unix_seconds(stat.attrs.ftLastWriteTime));
         break;
       case 'Z':
-        out += std::to_string(
-            filetime_to_unix_seconds(stat.attrs.ftLastAccessTime));
+        value = std::to_string(filetime_to_unix_seconds(stat.change_time));
         break;
       case 'W':
-        out +=
+        value =
             std::to_string(filetime_to_unix_seconds(stat.attrs.ftCreationTime));
         break;
       case 'm': {
@@ -633,16 +873,24 @@ auto render_format(std::string_view format, const std::string& filename,
         auto operand = native_path::make_api_path_operand(filename);
         if (GetVolumePathNameW(operand.extended.c_str(), volume.data(),
                                static_cast<DWORD>(volume.size()))) {
-          out += wstring_to_utf8(volume.data());
+          value = wstring_to_utf8(volume.data());
         } else {
-          out += "/";
+          value = "/";
         }
         break;
       }
       default:
-        out.push_back('%');
-        out.push_back(code);
+        // [GNU] unrecognized format directives print '?'.
+        handled = false;
         break;
+    }
+
+    if (handled) {
+      out += (code == 'N')
+                 ? value
+                 : apply_directive_spec(std::move(value), spec, code, numeric);
+    } else {
+      out += apply_directive_spec("?", spec, code, false);
     }
   }
 
@@ -685,7 +933,7 @@ auto render_file_system_format(std::string_view format,
         break;
       case 'i': {
         char buf[16];
-        snprintf(buf, sizeof(buf), "%08lx",
+        snprintf(buf, sizeof(buf), "%lx",
                  static_cast<unsigned long>(stat.serial));
         out += buf;
         break;
@@ -700,19 +948,17 @@ auto render_file_system_format(std::string_view format,
       case 'S':
         out += std::to_string(stat.block_size);
         break;
-      case 't': {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%lx",
-                 static_cast<unsigned long>(stat.serial));
-        out += buf;
+      case 't':
+        // [GNU] %t in file-system mode is the fs magic number in hex
+        // (e.g. ef53); Windows exposes no such identifier.
+        out += '0';
         break;
-      }
       case 'T':
         out += stat.fs_name;
         break;
       default:
-        out.push_back('%');
-        out.push_back(code);
+        // [GNU] unrecognized format directives print '?'.
+        out.push_back('?');
         break;
     }
   }
@@ -720,34 +966,46 @@ auto render_file_system_format(std::string_view format,
   return out;
 }
 
-auto print_file_system_stat(const std::string& filename) -> int {
-  auto stat_result = load_file_system_stat(filename);
-  if (!stat_result) {
-    safeErrorPrint("stat: cannot read file system for '");
-    safeErrorPrint(filename);
-    safeErrorPrintLn("'");
-    return 1;
-  }
-  const auto& stat = *stat_result;
+// [GNU] -f default layout (#1023):
+//     File: "<n>"
+//       ID: %-8i Namelen: %-7l Type: %T
+//   Block size: %-10s Fundamental block size: %S
+//   Blocks: Total: %-10b Free: %-10f Available: %a
+//   Inodes: Total: %-10c Free: %d
+auto print_file_system_stat(const std::string& filename,
+                            const FileSystemStatData& stat) -> int {
+  auto blocks = [&](uint64_t bytes) -> uint64_t {
+    return stat.block_size == 0 ? 0 : bytes / stat.block_size;
+  };
+
+  char id_buf[32];
+  snprintf(id_buf, sizeof(id_buf), "%lx",
+           static_cast<unsigned long>(stat.serial));
 
   safePrint("  File: \"");
   safePrint(filename);
   safePrintLn("\"");
-  char serial_buf[16];
-  snprintf(serial_buf, sizeof(serial_buf), "%08lx",
-           static_cast<unsigned long>(stat.serial));
   safePrint("    ID: ");
-  safePrint(serial_buf);
-  safePrint("\tNamelen: ");
-  safePrint(stat.max_component);
-  safePrint("\tType: ");
+  safePrint(pad_right(id_buf, 8));
+  safePrint(" Namelen: ");
+  safePrint(pad_right(std::to_string(stat.max_component), 7));
+  safePrint(" Type: ");
   safePrintLn(stat.fs_name);
   safePrint("Block size: ");
-  safePrint(stat.block_size);
-  safePrint("\tTotal bytes: ");
-  safePrint(stat.total_bytes);
-  safePrint("\tFree bytes: ");
-  safePrintLn(stat.total_free);
+  safePrint(pad_right(std::to_string(stat.block_size), 10));
+  safePrint(" Fundamental block size: ");
+  safePrintLn(std::to_string(stat.block_size));
+  safePrint("Blocks: Total: ");
+  safePrint(pad_right(std::to_string(blocks(stat.total_bytes)), 10));
+  safePrint(" Free: ");
+  safePrint(pad_right(std::to_string(blocks(stat.total_free)), 10));
+  safePrint(" Available: ");
+  safePrintLn(std::to_string(blocks(stat.free_available)));
+  // [GNU] POSIX inode counts have no Windows equivalent; report 0.
+  safePrint("Inodes: Total: ");
+  safePrint(pad_right("0", 10));
+  safePrint(" Free: ");
+  safePrintLn("0");
   return 0;
 }
 
@@ -788,16 +1046,23 @@ auto print_stat(const std::string& filename, const Config& cfg) -> int {
   }
 
   if (cfg.file_system) {
-    if (cfg.format.empty()) {
-      return print_file_system_stat(filename);
-    }
-
     auto stat_result = load_file_system_stat(filename);
     if (!stat_result) {
       safeErrorPrint("stat: cannot read file system for '");
       safeErrorPrint(filename);
       safeErrorPrintLn("'");
       return 1;
+    }
+
+    if (cfg.terse) {
+      // [GNU] -f -t: %n %i %l %t %s %S %b %f %a %c %d
+      safePrint(render_file_system_format("%n %i %l %t %s %S %b %f %a %c %d",
+                                          filename, *stat_result));
+      safePrint("\n");
+      return 0;
+    }
+    if (cfg.format.empty()) {
+      return print_file_system_stat(filename, *stat_result);
     }
 
     auto format =
@@ -830,22 +1095,34 @@ auto print_stat(const std::string& filename, const Config& cfg) -> int {
   }
 
   if (cfg.terse) {
-    // Terse format
-    safePrint(filename);
-    safePrint(" ");
-    safePrint(stat.size);
-    safePrint(" ");
-    safePrint(format_timestamp(stat.attrs.ftLastWriteTime));
+    // [GNU] -t: %n %s %b %f %u %g %D %i %h %t %T %X %Y %Z %W %o (#1023)
+    bool ctx_failed = false;
+    safePrint(render_format("%n %s %b %f %u %g %D %i %h %t %T %X %Y %Z %W %o",
+                            filename, stat, ctx_failed));
     safePrint("\n");
   } else if (!cfg.format.empty()) {
     auto format =
         cfg.printf_format ? expand_backslash_escapes(cfg.format) : cfg.format;
-    safePrint(render_format(format, filename, stat));
+    bool ctx_failed = false;
+    safePrint(render_format(format, filename, stat, ctx_failed));
     if (!cfg.printf_format) {
       safePrint("\n");
     }
+    if (ctx_failed) {
+      // [GNU] %C without an SELinux context:
+      // "stat: failed to get security context of 'F': No data available"
+      safeErrorPrint("stat: failed to get security context of '");
+      safeErrorPrint(filename);
+      safeErrorPrint("': No data available\n");
+      return 1;
+    }
   } else {
-    // Default format
+    // [GNU] default layout (#1023):
+    //   File: <n>[ -> <target>]
+    //   Size: %-10s\tBlocks: %-10b IO Block: %-6o %F
+    // Device: <dev>,<sub>\tInode: %-11i Links: %h
+    // Access: (%04a/%A)  Uid: (%5u/%8U)   Gid: (%5g/%8G)
+    // Access/Modify/Change/ Birth timestamps
     safePrint("  File: ");
     safePrint(filename);
     if (!link_target.empty()) {
@@ -853,28 +1130,61 @@ auto print_stat(const std::string& filename, const Config& cfg) -> int {
       safePrint(link_target);
     }
     safePrint("\n");
+
     safePrint("  Size: ");
-    safePrint(format_size(stat.size));
+    safePrint(pad_right(std::to_string(stat.size), 10));
     safePrint("\t");
     safePrint("Blocks: ");
-    safePrint((stat.size + 511) / 512);
-    safePrint("\t");
-    safePrint("IO Block: ");
-    safePrint(stat.io_block_size);
-    safePrint("\t");
-
+    safePrint(pad_right(std::to_string(allocated_block_count(stat)), 10));
+    safePrint(" IO Block: ");
+    safePrint(pad_right(std::to_string(stat.io_block_size), 6));
+    safePrint(" ");
     safePrint(file_type_name(stat.attrs.dwFileAttributes));
     safePrint("\n");
 
+    // [GNU] "Device: <major>,<minor>". Windows exposes a single device
+    // identifier (the volume serial number); it is reported as the device
+    // with subunit 0.
+    safePrint("Device: ");
+    safePrint(stat.volume_serial);
+    safePrint(",0\t");
+    safePrint("Inode: ");
+    safePrint(pad_right(std::to_string(stat.file_index), 11));
+    safePrint(" Links: ");
+    safePrint(stat.hard_links);
+    safePrint("\n");
+
+    char mode_buf[8];
+    snprintf(mode_buf, sizeof(mode_buf), "%04o",
+             st_mode_bits(stat.attrs.dwFileAttributes) & 07777u);
+    const std::string uid = stat.owner_id.empty() ? "0" : stat.owner_id;
+    const std::string gid = stat.group_id.empty() ? "0" : stat.group_id;
     safePrint("Access: (");
+    safePrint(mode_buf);
+    safePrint("/");
     safePrint(format_permissions(stat.attrs.dwFileAttributes));
+    safePrint(")  ");
+    safePrint("Uid: (");
+    safePrint(pad_left(uid, 5));
+    safePrint("/");
+    safePrint(pad_left(display_owner_name(stat.owner_name), 8));
+    safePrint(")   ");
+    safePrint("Gid: (");
+    safePrint(pad_left(gid, 5));
+    safePrint("/");
+    safePrint(pad_left(display_group_name(stat.group_name), 8));
     safePrint(")\n");
 
+    safePrint("Access: ");
+    safePrint(format_timestamp(stat.attrs.ftLastAccessTime));
+    safePrint("\n");
     safePrint("Modify: ");
     safePrint(format_timestamp(stat.attrs.ftLastWriteTime));
     safePrint("\n");
-
-    safePrint("Birth: ");
+    safePrint("Change: ");
+    safePrint(format_timestamp(stat.change_time));
+    safePrint("\n");
+    safePrint(" Birth: ");
     safePrint(format_timestamp(stat.attrs.ftCreationTime));
     safePrint("\n");
   }
@@ -909,10 +1219,10 @@ REGISTER_COMMAND(stat, "stat", "stat [OPTION]... FILE...",
   if (!cfg_result) {
     if (cfg_result.error() == "missing operand") {
       safeErrorPrint("stat: missing operand\n");
-      safeErrorPrint("Try 'stat --help' for more information.\n");
     } else {
       cp::report_error(cfg_result, L"stat");
     }
+    safeErrorPrintLn("Try 'stat --help' for more information.");
     return 1;
   }
 

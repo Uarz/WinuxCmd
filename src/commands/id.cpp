@@ -151,14 +151,32 @@ auto build_config(const CommandContext<ID_OPTIONS.size()>& ctx)
   return cfg;
 }
 
+// The default primary group on Windows resolves to a well-known group
+// literally named "None" which has no POSIX equivalent; treat it as
+// unresolvable so it prints like a GNU nameless gid (#1024).
+auto is_none_group_name(std::string_view name) -> bool {
+  return name.size() == 4 &&
+         std::tolower(static_cast<unsigned char>(name[0])) == 'n' &&
+         std::tolower(static_cast<unsigned char>(name[1])) == 'o' &&
+         std::tolower(static_cast<unsigned char>(name[2])) == 'n' &&
+         std::tolower(static_cast<unsigned char>(name[3])) == 'e';
+}
+
+auto account_name_resolved(const AccountInfo& account) -> bool {
+  return !account.name.empty() && !is_none_group_name(account.name);
+}
+
 auto format_account(const AccountInfo& account, bool use_name) -> std::string {
-  if (use_name) return account.name.empty() ? account.id : account.name;
+  // [GNU] prints the numeric id when no name can be resolved.
+  if (use_name && account_name_resolved(account)) return account.name;
   return account.id;
 }
 
 auto format_full_account(const AccountInfo& account) -> std::string {
+  // [GNU] prints "id(name)" only when the name resolves; otherwise the
+  // bare numeric id.
   std::string out = account.id;
-  if (!account.name.empty()) {
+  if (account_name_resolved(account)) {
     out += "(";
     out += account.name;
     out += ")";

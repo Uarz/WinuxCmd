@@ -187,10 +187,16 @@ auto build_config(const CommandContext<COMM_OPTIONS.size()>& ctx)
     add_file_arg(cfg, arg);
   }
 
+  // Keep these diagnostics as English fallbacks here; they are routed
+  // through i18n::translate_error / i18n::format at the print site so the
+  // handler can still recognize them in any locale.
+  if (cfg.files.empty()) {
+    return std::unexpected(std::string("missing operand"));
+  }
   if (cfg.files.size() < 2) {
-    return std::unexpected("missing operand after '" +
-                           (cfg.files.empty() ? std::string() : cfg.files[0]) +
-                           "'");
+    // [GNU] comm.c: "missing operand after %s" quotes argv[argc - 1] after
+    // getopt permutation, i.e. the last operand.
+    return std::unexpected("missing operand after '" + cfg.files.back() + "'");
   }
   if (cfg.files.size() > 2) {
     return std::unexpected("extra operand '" + cfg.files[2] + "'");
@@ -289,26 +295,11 @@ auto read_lines(const std::string& filename, char delimiter)
   return lines;
 }
 
-auto check_sorted(const SmallVector<std::string, 1024>& lines)
-    -> cp::Result<void> {
-  for (size_t i = 1; i < lines.size(); ++i) {
-    if (lines[i - 1] > lines[i]) {
-      return std::unexpected("input is not in sorted order");
-    }
-  }
-  return {};
-}
-
-auto has_disorder(const SmallVector<std::string, 1024>& lines) -> bool {
-  for (size_t i = 1; i < lines.size(); ++i) {
-    if (lines[i - 1] > lines[i]) return true;
-  }
-  return false;
-}
-
 void report_disorder(int file_number) {
-  safeErrorPrint("comm: file " + std::to_string(file_number) +
-                 " is not in sorted order\n");
+  // [GNU] "comm: file N is not in sorted order"
+  safeErrorPrintLn(winux::i18n::format("command.comm.error.file_not_sorted",
+                                       "comm: file {} is not in sorted order",
+                                       std::to_string(file_number)));
 }
 
 void print_record(const std::string& text, char delimiter) {
@@ -330,6 +321,8 @@ auto run(const Config& cfg) -> int {
   const std::string& file1 = cfg.files[0];
   const std::string& file2 = cfg.files[1];
 
+  // [GNU] comm.c: both operands "-" share the stdin stream; the first read
+  // consumes it and the second sees EOF, so every line lands in column 1.
   auto lines1_result = read_lines(file1, record_delim);
   if (!lines1_result) {
     cp::report_error(lines1_result, L"comm");
@@ -344,50 +337,57 @@ auto run(const Config& cfg) -> int {
 
   const auto& lines1 = *lines1_result;
   const auto& lines2 = *lines2_result;
+  const size_t n1 = lines1.size();
+  const size_t n2 = lines2.size();
 
-  const bool disorder1 = has_disorder(lines1);
-  const bool disorder2 = has_disorder(lines2);
-  if (cfg.order_check == OrderCheckMode::Enabled && (disorder1 || disorder2)) {
-    if (disorder1) report_disorder(1);
-    if (disorder2) report_disorder(2);
-    return 1;
-  }
+  const bool check_enabled = cfg.order_check == OrderCheckMode::Enabled;
+  const bool check_disabled = cfg.order_check == OrderCheckMode::Disabled;
+  bool seen_unpairable = false;
+  bool issued_disorder[2] = {false, false};
+
+  // [GNU] comm.c check_order(): the line at CURRENT is compared with its
+  // predecessor in the same file.  With --check-order disorder is fatal
+  // (the offending line is never emitted, but output already produced is
+  // kept); in the default mode the warning is issued at most once per file
+  // and only once an unpairable line has been seen.  Returns true when the
+  // merge must stop.
+  auto check_order = [&](int which, size_t current) -> bool {
+    const auto& lines = which == 1 ? lines1 : lines2;
+    if (!check_disabled && (check_enabled || seen_unpairable) &&
+        !issued_disorder[which - 1] && lines[current - 1] > lines[current]) {
+      issued_disorder[which - 1] = true;
+      report_disorder(which);
+      return check_enabled;
+    }
+    return false;
+  };
+
+  // Advance file WHICH past its just-consumed line, mirroring GNU comm.c
+  // fill_up: the newly read line is order-checked, and at end of file the
+  // last line pair is re-checked because seen_unpairable may have become
+  // true after that pair's earlier (silent) check.
+  auto advance = [&](int which, size_t& cursor, size_t total) -> bool {
+    ++cursor;
+    if (cursor < total) return check_order(which, cursor);
+    if (total >= 2) return check_order(which, total - 1);
+    return false;
+  };
 
   // Merge and compare
   size_t i = 0, j = 0;
-  bool seen_unpairable = false;
   size_t count_col1 = 0, count_col2 = 0, count_col3 = 0;
-  while (i < lines1.size() || j < lines2.size()) {
+  while (i < n1 || j < n2) {
     int cmp_result = 0;
 
-    if (i >= lines1.size()) {
+    if (i >= n1) {
       cmp_result = 1;
-    } else if (j >= lines2.size()) {
+    } else if (j >= n2) {
       cmp_result = -1;
     } else {
       cmp_result = lines1[i].compare(lines2[j]);
     }
 
-    if (cmp_result < 0) {
-      // Line only in file1
-      ++count_col1;
-      if (!cfg.suppress_col1) {
-        print_record(lines1[i], record_delim);
-      }
-      i++;
-      seen_unpairable = true;
-    } else if (cmp_result > 0) {
-      // Line only in file2
-      ++count_col2;
-      if (!cfg.suppress_col2) {
-        std::string output;
-        append_column_prefix(output, cfg, 2);
-        output += lines2[j];
-        print_record(output, record_delim);
-      }
-      j++;
-      seen_unpairable = true;
-    } else {
+    if (cmp_result == 0) {
       // Line in both files
       ++count_col3;
       if (!cfg.suppress_col3) {
@@ -396,9 +396,28 @@ auto run(const Config& cfg) -> int {
         output += lines1[i];
         print_record(output, record_delim);
       }
-      i++;
-      j++;
+    } else {
+      seen_unpairable = true;
+      if (cmp_result < 0) {
+        // Line only in file1
+        ++count_col1;
+        if (!cfg.suppress_col1) {
+          print_record(lines1[i], record_delim);
+        }
+      } else {
+        // Line only in file2
+        ++count_col2;
+        if (!cfg.suppress_col2) {
+          std::string output;
+          append_column_prefix(output, cfg, 2);
+          output += lines2[j];
+          print_record(output, record_delim);
+        }
+      }
     }
+
+    if (cmp_result <= 0 && advance(1, i, n1)) return 1;
+    if (cmp_result >= 0 && advance(2, j, n2)) return 1;
   }
 
   if (cfg.total) {
@@ -412,11 +431,10 @@ auto run(const Config& cfg) -> int {
     print_record(output, record_delim);
   }
 
-  if (cfg.order_check == OrderCheckMode::Default && seen_unpairable &&
-      (disorder1 || disorder2)) {
-    if (disorder1) report_disorder(1);
-    if (disorder2) report_disorder(2);
-    safeErrorPrintLn("comm: input is not in sorted order");
+  if (issued_disorder[0] || issued_disorder[1]) {
+    // [GNU] "comm: input is not in sorted order"
+    safeErrorPrintLn(winux::i18n::translate(
+        "command.comm.error.not_sorted", "comm: input is not in sorted order"));
     return 1;
   }
 
@@ -447,14 +465,18 @@ REGISTER_COMMAND(
   auto cfg_result = build_config(ctx);
   if (!cfg_result) {
     if (cfg_result.error().starts_with("missing operand")) {
-      cp::report_custom_error(L"comm", L"missing operand");
-      safeErrorPrintLn("Try 'comm --help' for more information.");
+      // [GNU] "comm: missing operand" / "comm: missing operand after 'FILE'"
+      safeErrorPrint("comm: ");
+      safeErrorPrintLn(winux::i18n::translate_error(cfg_result.error()));
+      safeErrorPrintLn(winux::i18n::format(
+          "common.try_help", "Try '{} --help' for more information.", "comm"));
       return 1;
     }
     if (cfg_result.error().starts_with("extra operand '")) {
       safeErrorPrint("comm: ");
-      safeErrorPrintLn(cfg_result.error());
-      safeErrorPrintLn("Try 'comm --help' for more information.");
+      safeErrorPrintLn(winux::i18n::translate_error(cfg_result.error()));
+      safeErrorPrintLn(winux::i18n::format(
+          "common.try_help", "Try '{} --help' for more information.", "comm"));
       return 1;
     }
     cp::report_error(cfg_result, L"comm");

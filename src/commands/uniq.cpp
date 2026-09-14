@@ -344,11 +344,13 @@ auto run(const Config& cfg) -> int {
   auto emit_group = [&](const std::vector<std::string>& records) {
     const size_t count = records.size();
     if (should_emit(count, cfg)) {
-      if (cfg.group_mode == GroupMode::separate && first_emitted_group) {
-        emit_group_separator(*out, cfg);
-      }
+      // [GNU] uniq.c: a separator precedes the group for prepend/both, and
+      // (once a group has been printed) also for append/separate, so groups
+      // are separated by exactly one blank line even under --group=both.
       if (cfg.group_mode == GroupMode::prepend ||
-          cfg.group_mode == GroupMode::both) {
+          cfg.group_mode == GroupMode::both ||
+          (first_emitted_group && (cfg.group_mode == GroupMode::append ||
+                                   cfg.group_mode == GroupMode::separate))) {
         emit_group_separator(*out, cfg);
       }
 
@@ -369,10 +371,6 @@ auto run(const Config& cfg) -> int {
         }
       }
 
-      if (cfg.group_mode == GroupMode::append ||
-          cfg.group_mode == GroupMode::both) {
-        emit_group_separator(*out, cfg);
-      }
       first_emitted_group = true;
     }
   };
@@ -394,6 +392,12 @@ auto run(const Config& cfg) -> int {
     return 1;
   }
   if (!group.empty()) emit_group(group);
+
+  // [GNU] append/both end the output with a single trailing separator.
+  if (first_emitted_group && (cfg.group_mode == GroupMode::append ||
+                              cfg.group_mode == GroupMode::both)) {
+    emit_group_separator(*out, cfg);
+  }
 
   out->flush();
   if (stdout_mode != -1) _setmode(_fileno(stdout), stdout_mode);

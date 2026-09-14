@@ -280,3 +280,18 @@ TEST(uniq, uniq_file_with_trailing_separator_reports_not_directory) {
   EXPECT_TRUE(r.stderr_text.find("uniq: file.txt/: Not a directory") !=
               std::string::npos);
 }
+
+TEST(uniq, uniq_group_both_separates_groups_with_single_blank_lines) {
+  // [GNU] uniq.c: --group=both emits exactly one separator before and one
+  // after each group, never two blank lines between adjacent groups.
+  TempDir tmp;
+  tmp.write("a.txt", "a\na\nb\nb\nc\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"uniq.exe", {L"--group=both", L"a.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "\na\na\n\nb\nb\n\nc\n\n");
+}

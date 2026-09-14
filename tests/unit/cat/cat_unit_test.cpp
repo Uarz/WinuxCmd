@@ -226,6 +226,131 @@ TEST(cat, cat_char_class_prefers_glob_over_same_spelling_literal_path) {
   EXPECT_TRUE(r.stdout_text.find("literal") == std::string::npos);
 }
 
+TEST(cat, cat_wildcard_star_excludes_leading_dot_files) {
+  TempDir tmp;
+  tmp.write("visible.txt", "visible\n");
+  tmp.write(".hidden.txt", "hidden\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"cat.exe", {L"*.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "visible\n");
+}
+
+TEST(cat, cat_wildcard_star_does_not_match_via_dos_short_names) {
+  // Regression: FindFirstFileW also matches 8.3 short names, so "*1" used to
+  // hit ".dot"/"plainfile" through generated names like "DOT~1"/"PLAINF~1".
+  TempDir tmp;
+  tmp.write("x1", "x1-content\n");
+  tmp.write(".dot", "dot-content\n");
+  tmp.write("plainfile", "plain-content\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"cat.exe", {L"*1"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "x1-content\n");
+}
+
+TEST(cat, cat_wildcard_bracket_dot_class_cannot_match_leading_dot) {
+  // GNU: "[.]x" does not match ".x" — a leading dot requires a literal '.'
+  // in the pattern, and a bracket expression does not bypass the rule.
+  TempDir tmp;
+  tmp.write(".x", "dotx\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"cat.exe", {L"[.]x"});
+
+  auto r = p.run();
+
+  EXPECT_NE(r.exit_code, 0);
+  EXPECT_TRUE(r.stderr_text.find("[.]x") != std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("dotx") == std::string::npos);
+}
+
+TEST(cat, cat_wildcard_literal_dot_matches_dotfiles) {
+  TempDir tmp;
+  tmp.write(".x", "dotx\n");
+  tmp.write("plain", "plain\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"cat.exe", {L".*"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "dotx\n");
+}
+
+TEST(cat, cat_wildcard_in_subdirectory_excludes_dotfiles) {
+  TempDir tmp;
+  tmp.write("sub/visible", "visible\n");
+  tmp.write("sub/.hidden", "hidden\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"cat.exe", {L"sub/*"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "visible\n");
+}
+
+TEST(cat, cat_wildcard_star_is_case_sensitive) {
+  TempDir tmp;
+  tmp.write("CASE.TXT", "upper\n");
+  tmp.write("lower.txt", "lower\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"cat.exe", {L"*.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "lower\n");
+}
+
+TEST(cat, cat_wildcard_star_uppercase_pattern_is_case_sensitive) {
+  TempDir tmp;
+  tmp.write("CASE.TXT", "upper\n");
+  tmp.write("lower.txt", "lower\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"cat.exe", {L"*.TXT"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "upper\n");
+}
+
+TEST(cat, cat_wildcard_char_class_is_case_sensitive) {
+  TempDir tmp;
+  tmp.write("UPPER.txt", "upper\n");
+  tmp.write("lower.txt", "lower\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"cat.exe", {L"[A-Z]*"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "upper\n");
+}
+
 TEST(cat, cat_directory_input_reports_is_a_directory) {
   TempDir tmp;
   tmp.mkdir("indir");

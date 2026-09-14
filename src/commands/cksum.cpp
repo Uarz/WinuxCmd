@@ -195,14 +195,8 @@ struct FileData {
 };
 
 auto input_open_error(std::string_view path) -> std::string {
-  std::error_code ec;
-  if (std::filesystem::is_directory(std::filesystem::u8path(path), ec) && !ec) {
-    return "cannot open '" + std::string(path) +
-           "' for reading: Is a directory";
-  }
-
-  return "cannot open '" + std::string(path) +
-         "' for reading: No such file or directory";
+  // [GNU] diagnostics use "cksum: FILE: <strerror>" wording.
+  return std::string(path) + ": " + portable_digest::open_error_reason(path);
 }
 
 auto read_file(const std::string& filename) -> cp::Result<FileData> {

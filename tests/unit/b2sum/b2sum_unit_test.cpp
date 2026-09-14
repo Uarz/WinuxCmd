@@ -31,9 +31,8 @@ TEST(b2sum, b2sum_missing_input_reports_no_such_file) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 1);
-  EXPECT_TRUE(r.stderr_text.find(
-                  "b2sum: cannot open 'missing.txt' for reading: No such "
-                  "file or directory") != std::string::npos);
+  EXPECT_TRUE(r.stderr_text.find("b2sum: missing.txt: No such "
+                                 "file or directory") != std::string::npos);
 }
 
 TEST(b2sum, b2sum_directory_input_reports_is_a_directory) {
@@ -47,8 +46,7 @@ TEST(b2sum, b2sum_directory_input_reports_is_a_directory) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 1);
-  EXPECT_TRUE(r.stderr_text.find(
-                  "b2sum: cannot open 'indir' for reading: Is a directory") !=
+  EXPECT_TRUE(r.stderr_text.find("b2sum: indir: Is a directory") !=
               std::string::npos);
 }
 
@@ -113,11 +111,13 @@ TEST(b2sum, b2sum_quiet) {
 
   Pipeline p;
   p.set_cwd(tmp.wpath());
-  p.add(L"b2sum.exe", {L"-q", L"test.txt"});
+  p.add(L"b2sum.exe", {L"--quiet", L"test.txt"});
   auto r = p.run();
 
-  EXPECT_EQ(r.exit_code, 0);
-  EXPECT_TRUE(r.stdout_text.find("test.txt") != std::string::npos);
+  // [GNU] --quiet is rejected outside check mode.
+  EXPECT_NE(r.exit_code, 0);
+  EXPECT_TRUE(r.stderr_text.find("meaningful only when verifying checksums") !=
+              std::string::npos);
 }
 
 TEST(b2sum, b2sum_length) {
@@ -271,7 +271,11 @@ TEST(b2sum, b2sum_check_quiet_suppresses_ok_lines_only) {
   EXPECT_NE(bad_result.exit_code, 0);
   EXPECT_TRUE(bad_result.stdout_text.find("check.txt: FAILED") !=
               std::string::npos);
-  EXPECT_EQ_TEXT(bad_result.stderr_text, "");
+  // [GNU] --quiet suppresses "OK" lines only; the mismatch WARNING summary
+  // still goes to stderr (verified against GNU coreutils 9.4).
+  EXPECT_TRUE(bad_result.stderr_text.find(
+                  "b2sum: WARNING: 1 computed checksum did NOT match") !=
+              std::string::npos);
 }
 
 TEST(b2sum, b2sum_check_directory_input_reports_is_a_directory) {
@@ -284,10 +288,8 @@ TEST(b2sum, b2sum_check_directory_input_reports_is_a_directory) {
   auto result = check.run();
 
   EXPECT_EQ(result.exit_code, 1);
-  EXPECT_TRUE(
-      result.stderr_text.find(
-          "b2sum: cannot open 'checkdir' for reading: Is a directory") !=
-      std::string::npos);
+  EXPECT_TRUE(result.stderr_text.find("b2sum: checkdir: read error") !=
+              std::string::npos);
 }
 
 TEST(b2sum, b2sum_check_reports_unreadable_listed_files) {
@@ -303,10 +305,11 @@ TEST(b2sum, b2sum_check_reports_unreadable_listed_files) {
   auto result = check.run();
 
   EXPECT_NE(result.exit_code, 0);
-  EXPECT_EQ_TEXT(result.stdout_text, "");
-  EXPECT_TRUE(
-      result.stderr_text.find("cannot open 'missing.txt' for reading") !=
-      std::string::npos);
+  EXPECT_TRUE(result.stdout_text.find("missing.txt: FAILED open or read") !=
+              std::string::npos);
+  EXPECT_TRUE(result.stderr_text.find(
+                  "b2sum: missing.txt: No such file or directory") !=
+              std::string::npos);
   EXPECT_TRUE(result.stderr_text.find(
                   "b2sum: WARNING: 1 listed file could not be read") !=
               std::string::npos);
@@ -324,9 +327,10 @@ TEST(b2sum, b2sum_check_ignore_missing_skips_missing_files) {
   check.add(L"b2sum.exe", {L"--ignore-missing", L"-c", L"check.b2"});
   auto result = check.run();
 
-  EXPECT_EQ(result.exit_code, 0);
+  EXPECT_NE(result.exit_code, 0);
   EXPECT_EQ_TEXT(result.stdout_text, "");
-  EXPECT_EQ_TEXT(result.stderr_text, "");
+  EXPECT_TRUE(result.stderr_text.find("no file was verified") !=
+              std::string::npos);
 }
 
 TEST(b2sum, b2sum_check_accepts_binary_marker_lines) {
@@ -361,9 +365,9 @@ TEST(b2sum, b2sum_check_warn_reports_malformed_line_locations) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_TRUE(
-      r.stderr_text.find("check.b2: 1: improperly formatted checksum line") !=
-      std::string::npos);
+  EXPECT_TRUE(r.stderr_text.find(
+                  "check.b2: 1: improperly formatted BLAKE2b checksum line") !=
+              std::string::npos);
   EXPECT_TRUE(r.stderr_text.find("WARNING: 1 line is improperly formatted") !=
               std::string::npos);
   EXPECT_TRUE(r.stdout_text.find("test.txt: OK") != std::string::npos);
@@ -380,10 +384,9 @@ TEST(b2sum, b2sum_check_without_valid_lines_reports_error) {
 
   EXPECT_NE(r.exit_code, 0);
   EXPECT_EQ_TEXT(r.stdout_text, "");
-  EXPECT_TRUE(
-      r.stderr_text.find(
-          "b2sum: check.b2: no properly formatted checksum lines found") !=
-      std::string::npos);
+  EXPECT_TRUE(r.stderr_text.find(
+                  "b2sum: check.b2: no properly formatted checksum lines "
+                  "found") != std::string::npos);
 }
 
 TEST(b2sum, b2sum_check_strict_rejects_malformed_lines) {

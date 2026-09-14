@@ -134,69 +134,11 @@ auto encode_base64(std::string_view input, std::string_view alphabet, int wrap)
       reinterpret_cast<const uint8_t*>(input.data()), input.size());
   return encoding::base64_encode(data, alphabet, wrap);
 }
+// GNU decodes quantum units of 4 characters and keeps every byte decoded
+// before the first error (uutils #6008, #12204).
 auto decode_base64(std::string_view input, std::string_view alphabet,
-                   bool ignore_garbage)
-    -> std::expected<std::string, std::string> {
-  std::string clean;
-  clean.reserve(input.size());
-  bool saw_padding = false;
-  int padding = 0;
-
-  for (unsigned char c : input) {
-    if (c == '\n' || c == '\r') continue;
-
-    if (alphabet.find(static_cast<char>(c)) != std::string_view::npos) {
-      if (saw_padding) return std::unexpected("invalid input");
-      clean.push_back(static_cast<char>(c));
-      continue;
-    }
-
-    if (c == '=') {
-      saw_padding = true;
-      ++padding;
-      if (padding > 2) return std::unexpected("invalid input");
-      clean.push_back('=');
-      continue;
-    }
-
-    if (!ignore_garbage) return std::unexpected("invalid input");
-  }
-
-  const size_t data_chars = clean.find('=');
-  const size_t encoded_chars =
-      data_chars == std::string::npos ? clean.size() : data_chars;
-
-  if (clean.size() % 4 == 1 || encoded_chars % 4 == 1) {
-    return std::unexpected("invalid input");
-  }
-  if (padding > 0 && clean.size() % 4 != 0) {
-    return std::unexpected("invalid input");
-  }
-  if ((padding == 1 && encoded_chars % 4 != 3) ||
-      (padding == 2 && encoded_chars % 4 != 2)) {
-    return std::unexpected("invalid input");
-  }
-
-  std::string output;
-  output.reserve((encoded_chars / 4) * 3 + 2);
-  uint32_t accumulator = 0;
-  int bits = 0;
-
-  for (char c : clean.substr(0, encoded_chars)) {
-    accumulator = (accumulator << 6) | static_cast<uint32_t>(alphabet.find(c));
-    bits += 6;
-
-    if (bits >= 8) {
-      bits -= 8;
-      output.push_back(static_cast<char>((accumulator >> bits) & 0xff));
-    }
-  }
-
-  if (bits > 0 && (accumulator & ((uint32_t{1} << bits) - 1)) != 0) {
-    return std::unexpected("invalid input");
-  }
-
-  return output;
+                   bool ignore_garbage) -> encoding::GnuDecodeResult {
+  return encoding::base64_decode_gnu(input, alphabet, ignore_garbage);
 }
 
 auto encode_base32(std::string_view input, std::string_view alphabet, int wrap)
@@ -205,73 +147,11 @@ auto encode_base32(std::string_view input, std::string_view alphabet, int wrap)
       reinterpret_cast<const uint8_t*>(input.data()), input.size());
   return encoding::base32_encode(data, alphabet, wrap);
 }
+// GNU decodes quantum units of 8 characters (uppercase alphabet only — no
+// case folding) and fails a trailing partial unit.
 auto decode_base32(std::string_view input, std::string_view alphabet,
-                   bool ignore_garbage)
-    -> std::expected<std::string, std::string> {
-  std::string clean;
-  clean.reserve(input.size());
-  bool saw_padding = false;
-  int padding = 0;
-
-  for (unsigned char c : input) {
-    if (c == '\n' || c == '\r') continue;
-
-    char upper = static_cast<char>(std::toupper(c));
-    if (alphabet.find(upper) != std::string_view::npos) {
-      if (saw_padding) return std::unexpected("invalid input");
-      clean.push_back(upper);
-      continue;
-    }
-
-    if (c == '=') {
-      saw_padding = true;
-      ++padding;
-      if (padding > 6) return std::unexpected("invalid input");
-      clean.push_back('=');
-      continue;
-    }
-
-    if (!ignore_garbage) return std::unexpected("invalid input");
-  }
-
-  const size_t data_chars = clean.find('=');
-  const size_t encoded_chars =
-      data_chars == std::string::npos ? clean.size() : data_chars;
-  const size_t encoded_mod = encoded_chars % 8;
-
-  if (encoded_mod == 1 || encoded_mod == 3 || encoded_mod == 6) {
-    return std::unexpected("invalid input");
-  }
-  if (padding > 0 && clean.size() % 8 != 0) {
-    return std::unexpected("invalid input");
-  }
-  if ((padding == 1 && encoded_mod != 7) ||
-      (padding == 3 && encoded_mod != 5) ||
-      (padding == 4 && encoded_mod != 4) ||
-      (padding == 6 && encoded_mod != 2) || (padding == 2 || padding == 5)) {
-    return std::unexpected("invalid input");
-  }
-
-  std::string output;
-  output.reserve((encoded_chars * 5) / 8);
-  uint32_t accumulator = 0;
-  int bits = 0;
-
-  for (char c : clean.substr(0, encoded_chars)) {
-    accumulator = (accumulator << 5) | static_cast<uint32_t>(alphabet.find(c));
-    bits += 5;
-
-    if (bits >= 8) {
-      bits -= 8;
-      output.push_back(static_cast<char>((accumulator >> bits) & 0xff));
-    }
-  }
-
-  if (bits > 0 && (accumulator & ((uint32_t{1} << bits) - 1)) != 0) {
-    return std::unexpected("invalid input");
-  }
-
-  return output;
+                   bool ignore_garbage) -> encoding::GnuDecodeResult {
+  return encoding::base32_decode_gnu(input, alphabet, ignore_garbage);
 }
 
 auto encode_base16(std::string_view input, int wrap) -> std::string {
@@ -286,37 +166,10 @@ auto encode_base16(std::string_view input, int wrap) -> std::string {
   return apply_wrap(result, wrap);
 }
 
+// GNU accepts uppercase hex only and emits bytes as they decode.
 auto decode_base16(std::string_view input, bool ignore_garbage)
-    -> std::expected<std::string, std::string> {
-  std::string output;
-  int high_nibble = -1;
-
-  auto hex_value = [](unsigned char c) -> int {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    return -1;
-  };
-
-  for (unsigned char c : input) {
-    if (c == '\n' || c == '\r') continue;
-
-    int value = hex_value(c);
-    if (value < 0) {
-      if (ignore_garbage) continue;
-      return std::unexpected("invalid input");
-    }
-
-    if (high_nibble < 0) {
-      high_nibble = value;
-    } else {
-      output.push_back(static_cast<char>((high_nibble << 4) | value));
-      high_nibble = -1;
-    }
-  }
-
-  if (high_nibble >= 0) return std::unexpected("invalid input");
-  return output;
+    -> encoding::GnuDecodeResult {
+  return encoding::base16_decode_gnu(input, ignore_garbage);
 }
 
 auto encode_base2(std::string_view input, bool least_significant_first,
@@ -340,38 +193,9 @@ auto encode_base2(std::string_view input, bool least_significant_first,
 }
 
 auto decode_base2(std::string_view input, bool least_significant_first,
-                  bool ignore_garbage)
-    -> std::expected<std::string, std::string> {
-  std::string bits;
-  bits.reserve(input.size());
-
-  for (unsigned char c : input) {
-    if (c == '\n' || c == '\r') continue;
-    if (c == '0' || c == '1') {
-      bits.push_back(static_cast<char>(c));
-      continue;
-    }
-    if (!ignore_garbage) return std::unexpected("invalid input");
-  }
-
-  if (bits.size() % 8 != 0) return std::unexpected("invalid input");
-
-  std::string output;
-  output.reserve(bits.size() / 8);
-  for (size_t i = 0; i < bits.size(); i += 8) {
-    uint8_t value = 0;
-    for (int bit = 0; bit < 8; ++bit) {
-      if (bits[i + bit] != '1') continue;
-      if (least_significant_first) {
-        value |= static_cast<uint8_t>(1u << bit);
-      } else {
-        value |= static_cast<uint8_t>(1u << (7 - bit));
-      }
-    }
-    output.push_back(static_cast<char>(value));
-  }
-
-  return output;
+                  bool ignore_garbage) -> encoding::GnuDecodeResult {
+  return encoding::base2_decode_gnu(input, least_significant_first,
+                                    ignore_garbage);
 }
 
 auto encode_base58(std::string_view input, int wrap) -> std::string {
@@ -411,7 +235,7 @@ auto encode_base58(std::string_view input, int wrap) -> std::string {
 }
 
 auto decode_base58(std::string_view input, bool ignore_garbage)
-    -> std::expected<std::string, std::string> {
+    -> encoding::GnuDecodeResult {
   std::array<int, 256> map;
   map.fill(-1);
   for (size_t i = 0; i < BASE58_ALPHABET.size(); ++i) {
@@ -426,9 +250,14 @@ auto decode_base58(std::string_view input, bool ignore_garbage)
       clean.push_back(static_cast<char>(c));
       continue;
     }
-    if (!ignore_garbage) return std::unexpected("invalid input");
+    if (!ignore_garbage) {
+      encoding::GnuDecodeResult failed;
+      failed.ok = false;
+      return failed;
+    }
   }
 
+  encoding::GnuDecodeResult result;
   size_t leading_zeroes = 0;
   while (leading_zeroes < clean.size() && clean[leading_zeroes] == '1') {
     ++leading_zeroes;
@@ -453,10 +282,11 @@ auto decode_base58(std::string_view input, bool ignore_garbage)
   auto first = bytes.begin() + static_cast<std::ptrdiff_t>(bytes.size() - used);
   while (first != bytes.end() && *first == 0) ++first;
 
-  std::string result(leading_zeroes, '\0');
-  result.reserve(leading_zeroes + static_cast<size_t>(bytes.end() - first));
+  result.output.assign(leading_zeroes, '\0');
+  result.output.reserve(leading_zeroes +
+                        static_cast<size_t>(bytes.end() - first));
   for (; first != bytes.end(); ++first) {
-    result.push_back(static_cast<char>(*first));
+    result.output.push_back(static_cast<char>(*first));
   }
   return result;
 }
@@ -486,45 +316,8 @@ auto encode_z85(std::string_view input, int wrap)
 }
 
 auto decode_z85(std::string_view input, bool ignore_garbage)
-    -> std::expected<std::string, std::string> {
-  std::array<int, 256> map;
-  map.fill(-1);
-  for (size_t i = 0; i < Z85_ALPHABET.size(); ++i) {
-    map[static_cast<unsigned char>(Z85_ALPHABET[i])] = static_cast<int>(i);
-  }
-
-  std::string clean;
-  clean.reserve(input.size());
-  for (unsigned char c : input) {
-    if (c == '\n' || c == '\r') continue;
-    if (map[c] >= 0) {
-      clean.push_back(static_cast<char>(c));
-      continue;
-    }
-    if (!ignore_garbage) return std::unexpected("invalid input");
-  }
-
-  if (clean.size() % 5 != 0) {
-    return std::unexpected("invalid input length for z85 decoding");
-  }
-
-  std::string result;
-  result.reserve((clean.size() / 5) * 4);
-  for (size_t i = 0; i < clean.size(); i += 5) {
-    uint64_t value = 0;
-    for (size_t j = 0; j < 5; ++j) {
-      value = value * 85 + static_cast<uint32_t>(
-                               map[static_cast<unsigned char>(clean[i + j])]);
-    }
-    if (value > std::numeric_limits<uint32_t>::max()) {
-      return std::unexpected("invalid input");
-    }
-
-    for (int shift = 24; shift >= 0; shift -= 8) {
-      result.push_back(static_cast<char>((value >> shift) & 0xff));
-    }
-  }
-  return result;
+    -> encoding::GnuDecodeResult {
+  return encoding::z85_decode_gnu(input, Z85_ALPHABET, ignore_garbage);
 }
 
 auto parse_legacy_selector(std::string_view selector)
@@ -629,39 +422,43 @@ auto build_config(const CommandContext<BASENC_OPTIONS.size()>& ctx)
 }
 
 auto process(const Config& cfg, std::string_view input)
-    -> std::expected<std::string, std::string> {
+    -> std::expected<encoding::GnuDecodeResult, std::string> {
+  auto encoded = [](std::string s) {
+    return encoding::GnuDecodeResult{std::move(s), true};
+  };
+
   switch (cfg.encoding) {
     case Encoding::Base64:
       if (cfg.decode)
         return decode_base64(input, BASE64_ALPHABET, cfg.ignore_garbage);
-      return encode_base64(input, BASE64_ALPHABET, cfg.wrap);
+      return encoded(encode_base64(input, BASE64_ALPHABET, cfg.wrap));
     case Encoding::Base64Url:
       if (cfg.decode)
         return decode_base64(input, BASE64URL_ALPHABET, cfg.ignore_garbage);
-      return encode_base64(input, BASE64URL_ALPHABET, cfg.wrap);
+      return encoded(encode_base64(input, BASE64URL_ALPHABET, cfg.wrap));
     case Encoding::Base32:
       if (cfg.decode)
         return decode_base32(input, BASE32_ALPHABET, cfg.ignore_garbage);
-      return encode_base32(input, BASE32_ALPHABET, cfg.wrap);
+      return encoded(encode_base32(input, BASE32_ALPHABET, cfg.wrap));
     case Encoding::Base32Hex:
       if (cfg.decode)
         return decode_base32(input, BASE32HEX_ALPHABET, cfg.ignore_garbage);
-      return encode_base32(input, BASE32HEX_ALPHABET, cfg.wrap);
+      return encoded(encode_base32(input, BASE32HEX_ALPHABET, cfg.wrap));
     case Encoding::Base16:
       if (cfg.decode) return decode_base16(input, cfg.ignore_garbage);
-      return encode_base16(input, cfg.wrap);
+      return encoded(encode_base16(input, cfg.wrap));
     case Encoding::Base2Lsbf:
       if (cfg.decode) return decode_base2(input, true, cfg.ignore_garbage);
-      return encode_base2(input, true, cfg.wrap);
+      return encoded(encode_base2(input, true, cfg.wrap));
     case Encoding::Base2Msbf:
       if (cfg.decode) return decode_base2(input, false, cfg.ignore_garbage);
-      return encode_base2(input, false, cfg.wrap);
+      return encoded(encode_base2(input, false, cfg.wrap));
     case Encoding::Base58:
       if (cfg.decode) return decode_base58(input, cfg.ignore_garbage);
-      return encode_base58(input, cfg.wrap);
+      return encoded(encode_base58(input, cfg.wrap));
     case Encoding::Z85:
       if (cfg.decode) return decode_z85(input, cfg.ignore_garbage);
-      return encode_z85(input, cfg.wrap);
+      return encode_z85(input, cfg.wrap).transform(encoded);
   }
 
   return std::unexpected("invalid encoding");
@@ -681,10 +478,16 @@ auto run(const Config& cfg) -> int {
   }
 
   if (cfg.decode) {
-    safePrint(*output);
+    // GNU writes every byte decoded before the first error and only then
+    // reports "invalid input" (uutils #6008, #12204).
+    if (!output->output.empty()) safePrint(output->output);
+    if (!output->ok) {
+      safeErrorPrintLn("basenc: invalid input");
+      return 1;
+    }
   } else {
-    if (!output->empty() && cfg.wrap > 0) output->push_back('\n');
-    safePrint(*output);
+    if (!output->output.empty() && cfg.wrap > 0) output->output.push_back('\n');
+    safePrint(output->output);
   }
 
   return 0;

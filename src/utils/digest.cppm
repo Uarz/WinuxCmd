@@ -35,6 +35,7 @@ module;
 
 export module utils:digest;
 import std;
+import :console;
 import :native_path;
 
 export namespace portable_digest {
@@ -48,15 +49,39 @@ struct PosixCksumResult {
 
 namespace detail {
 
-auto input_open_error(std::string_view path) -> std::string {
+// [GNU] strerror-style reason for a failed input open(): "Is a directory"
+// for a directory (EISDIR), "Not a directory" when any path component —
+// including a trailing '/' on a regular file — is a non-directory
+// (ENOTDIR), "Permission denied" for an existing file that cannot be
+// opened (EACCES), otherwise "No such file or directory" (ENOENT).
+auto open_failure_reason(std::string_view path) -> std::string {
   std::error_code ec;
-  if (std::filesystem::is_directory(std::filesystem::u8path(path), ec) && !ec) {
-    return "cannot open '" + std::string(path) +
-           "' for reading: Is a directory";
+  const std::filesystem::path fs_path = std::filesystem::u8path(path);
+  if (std::filesystem::is_directory(fs_path, ec) && !ec) {
+    return "Is a directory";
   }
+  ec.clear();
+  if (std::filesystem::exists(fs_path, ec) && !ec) {
+    return "Permission denied";
+  }
+  // Walk the ancestors: the deepest existing component decides between
+  // ENOTDIR (it is not a directory) and ENOENT.
+  for (std::filesystem::path dir = fs_path.parent_path(); !dir.empty();
+       dir = dir.parent_path()) {
+    ec.clear();
+    if (std::filesystem::exists(dir, ec) && !ec) {
+      ec.clear();
+      return std::filesystem::is_directory(dir, ec) && !ec
+                 ? "No such file or directory"
+                 : "Not a directory";
+    }
+    if (dir == dir.parent_path()) break;  // reached a filesystem root
+  }
+  return "No such file or directory";
+}
 
-  return "cannot open '" + std::string(path) +
-         "' for reading: No such file or directory";
+auto input_open_error(std::string_view path) -> std::string {
+  return std::string(path) + ": " + open_failure_reason(path);
 }
 
 auto to_hex(std::span<const uint8_t> bytes) -> std::string {
@@ -797,6 +822,382 @@ auto posix_cksum_stream(std::istream& in)
   }
   if (in.bad()) return std::unexpected("error reading input");
   return accumulator.final();
+}
+
+// [GNU] strerror-style reason for a failed input open(), for commands
+// that print "cmd: FILE: <reason>" diagnostics.  See
+// detail::open_failure_reason for the rules.
+auto open_error_reason(std::string_view path) -> std::string {
+  return detail::open_failure_reason(path);
+}
+
+// ===== GNU-compatible "--check" verification (src/cksum.c digest_check) =====
+//
+// Shared by the *sum commands.  Mirrors GNU semantics:
+//   * '#' comments and blank lines are skipped; trailing '\r' is stripped.
+//   * split_3(): leading blanks skipped, optional '\' escape prefix, BSD
+//     "TAG (file) = hex" and OpenSSL "TAG(file)= hex" forms, otherwise the
+//     untagged "hex [' '|'*']file" form.  The untagged form is remembered per
+//     invocation (bsd_reversed) and mixing it with the single-blank form in
+//     one direction is rejected.
+//   * Per-line results go to stdout ("name: OK"/"FAILED"/"FAILED open or
+//     read"), diagnostics to stderr, and a properly-formatted file produces
+//     up to three WARNING summary lines (improperly formatted / could not be
+//     read / did NOT match).
+struct SumCheckFlags {
+  bool status_only = false;
+  bool quiet = false;
+  bool warn = false;
+  bool strict = false;
+  bool ignore_missing = false;
+};
+
+struct SumCheckLine {
+  std::string expected_hash;
+  std::string filename;
+  size_t digest_bytes = 0;  // detected digest length (bytes) for this line
+};
+
+namespace detail {
+
+auto sum_is_blank(char c) -> bool { return c == ' ' || c == '\t'; }
+
+// GNU quotef(): print a file name verbatim unless it needs quoting.
+auto sum_quotef(std::string_view name) -> std::string {
+  if (name.empty()) return "''";
+  const bool simple = std::ranges::all_of(name, [](unsigned char c) {
+    return c > 0x20 && c != '\'' && c != '\\' && c != '"' && c != '|' &&
+           c != '&' && c != ';' && c != '<' && c != '>' && c != '(' &&
+           c != ')' && c != '$' && c != '`' && c != '*' && c != '?' &&
+           c != '[' && c != '#' && c != '~' && c != '=' && c != '!' &&
+           c != '^' && c != '{' && c != '}';
+  });
+  if (simple) return std::string(name);
+  std::string out = "'";
+  for (char c : name) {
+    if (c == '\'')
+      out += "'\\''";
+    else
+      out.push_back(c);
+  }
+  out.push_back('\'');
+  return out;
+}
+
+// GNU filename_unescape(): translate \\, \n and \r escapes introduced when
+// the check line started with '\'.  Returns nullopt on a bad escape.
+auto sum_unescape_filename(std::string_view s) -> std::optional<std::string> {
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] != '\\') {
+      out.push_back(s[i]);
+      continue;
+    }
+    if (++i >= s.size()) return std::nullopt;
+    switch (s[i]) {
+      case '\\':
+        out.push_back('\\');
+        break;
+      case 'n':
+        out.push_back('\n');
+        break;
+      case 'r':
+        out.push_back('\r');
+        break;
+      default:
+        return std::nullopt;
+    }
+  }
+  return out;
+}
+
+auto sum_open_reason(std::string_view path) -> std::string {
+  return open_failure_reason(path);
+}
+
+auto sum_all_hex(std::string_view s) -> bool {
+  return !s.empty() && std::ranges::all_of(s, [](unsigned char c) {
+    return std::isxdigit(c) != 0;
+  });
+}
+
+// GNU bsd_split_3(): S is the part after "TAG ("; find the last ')', take
+// everything before it as the file name, then require blanks, '=', blanks
+// and a valid digest.
+auto sum_bsd_split(std::string_view s, size_t digest_hex_bytes,
+                   bool escaped_filename) -> std::optional<SumCheckLine> {
+  if (s.empty()) return std::nullopt;
+
+  size_t i = s.size() - 1;
+  while (i > 0 && s[i] != ')') --i;
+  if (s[i] != ')') return std::nullopt;
+
+  std::string_view filename = s.substr(0, i);
+  ++i;
+  while (i < s.size() && sum_is_blank(s[i])) ++i;
+  if (i >= s.size() || s[i] != '=') return std::nullopt;
+  ++i;
+  while (i < s.size() && sum_is_blank(s[i])) ++i;
+
+  std::string_view digest = s.substr(i);
+  const size_t hex_len =
+      digest_hex_bytes != 0 ? digest_hex_bytes : digest.size();
+  if (digest.size() != hex_len || !sum_all_hex(digest)) return std::nullopt;
+  if (digest_hex_bytes == 0 &&
+      (digest.size() % 2 != 0 || digest.size() > 128)) {
+    return std::nullopt;
+  }
+
+  if (escaped_filename) {
+    auto unescaped = sum_unescape_filename(filename);
+    if (!unescaped) return std::nullopt;
+    return SumCheckLine{std::string(digest), *unescaped, digest.size() / 2};
+  }
+  return SumCheckLine{std::string(digest), std::string(filename),
+                      digest.size() / 2};
+}
+
+}  // namespace detail
+
+// GNU split_3() for a fixed-length hex digest command.  Pass
+// digest_hex_bytes == 0 to auto-detect any even hex length <= 128 (the b2sum
+// behaviour).  bsd_reversed is GNU's format-consistency latch (-1 initial,
+// then 0 or 1) shared across all check files of one invocation.
+inline auto sum_parse_check_line(std::string_view line,
+                                 std::string_view algo_tag,
+                                 size_t digest_hex_bytes, int& bsd_reversed)
+    -> std::optional<SumCheckLine> {
+  size_t i = 0;
+  while (i < line.size() && detail::sum_is_blank(line[i])) ++i;
+
+  bool escaped_filename = false;
+  if (i < line.size() && line[i] == '\\') {
+    ++i;
+    escaped_filename = true;
+  }
+
+  // BSD/OpenSSL tagged form: "TAG (file) = hex" or "TAG(file)= hex".
+  const size_t parse_offset = i;
+  if (line.substr(i).starts_with(algo_tag)) {
+    size_t j = i + algo_tag.size();
+    size_t tag_hex_bytes = digest_hex_bytes;
+    // "TAG-<bits>" length suffix (GNU supports it for blake2/sha2 tags).
+    if (digest_hex_bytes == 0 && j < line.size() && line[j] == '-') {
+      ++j;
+      const size_t num_start = j;
+      while (j < line.size() && std::isdigit(line[j])) ++j;
+      if (j == num_start) return std::nullopt;
+      long bits = 0;
+      std::from_chars(line.data() + num_start, line.data() + j, bits);
+      if (bits <= 0 || bits % 8 != 0 || bits > 512) return std::nullopt;
+      tag_hex_bytes = static_cast<size_t>(bits / 4);
+    }
+    if (j < line.size() && line[j] == ' ') ++j;
+    if (j < line.size() && line[j] == '(') {
+      return detail::sum_bsd_split(line.substr(j + 1), tag_hex_bytes,
+                                   escaped_filename);
+    }
+    i = parse_offset;
+  }
+
+  // Untagged form needs at least "<hex> <file>".
+  const size_t min_len = (digest_hex_bytes != 0 ? digest_hex_bytes : 2) + 2;
+  if (line.size() - i < min_len) return std::nullopt;
+
+  const size_t digest_start = i;
+  while (i < line.size() && !detail::sum_is_blank(line[i])) ++i;
+  if (i == line.size()) return std::nullopt;  // digest must be followed by ws
+
+  const std::string_view digest = line.substr(digest_start, i - digest_start);
+  if (digest_hex_bytes != 0) {
+    if (digest.size() != digest_hex_bytes || !detail::sum_all_hex(digest)) {
+      return std::nullopt;
+    }
+  } else if (digest.size() < 2 || digest.size() % 2 != 0 ||
+             digest.size() > 128 || !detail::sum_all_hex(digest)) {
+    return std::nullopt;
+  }
+  ++i;  // consume the single separator blank
+
+  std::string_view filename;
+  if (line.size() - i <= 1 ||
+      (i < line.size() && line[i] != ' ' && line[i] != '*')) {
+    // BSD-reversed form: separator was the only blank.
+    if (bsd_reversed == 0) return std::nullopt;
+    bsd_reversed = 1;
+    filename = line.substr(i);
+  } else if (bsd_reversed != 1) {
+    bsd_reversed = 0;
+    ++i;  // consume the ' ' or '*' mode marker
+    filename = line.substr(i);
+  } else {
+    filename = line.substr(i);
+  }
+
+  if (escaped_filename) {
+    auto unescaped = detail::sum_unescape_filename(filename);
+    if (!unescaped) return std::nullopt;
+    return SumCheckLine{std::string(digest), *unescaped, digest.size() / 2};
+  }
+  return SumCheckLine{std::string(digest), std::string(filename),
+                      digest.size() / 2};
+}
+
+// GNU digest_check(): verify every properly formatted line of one check
+// file.  hash_fn(filename, digest_bytes) must return the hex digest or an
+// error when the file cannot be opened/read.
+template <typename HashFn>
+auto sum_digest_check(const std::string& program, const std::string& algo_tag,
+                      size_t digest_hex_bytes, const SumCheckFlags& flags,
+                      const std::string& checkfile_name, int& bsd_reversed,
+                      HashFn&& hash_fn) -> bool {
+  intmax_t n_misformatted_lines = 0;
+  intmax_t n_mismatched_checksums = 0;
+  intmax_t n_open_or_read_failures = 0;
+  bool properly_formatted_lines = false;
+  bool matched_checksums = false;
+
+  const bool is_stdin = checkfile_name == "-";
+  std::string display_name = checkfile_name;
+  std::istream* input = &std::cin;
+  std::ifstream checkfile;
+  if (is_stdin) {
+    display_name = "standard input";
+  } else {
+    checkfile.open(native_path::normalize_api_operand(checkfile_name));
+    if (!checkfile) {
+      std::error_code ec;
+      // [GNU] fopen() succeeds on a directory and the first getline() then
+      // fails: GNU reports "<file>: read error", not "Is a directory".
+      if (std::filesystem::is_directory(
+              std::filesystem::u8path(checkfile_name), ec) &&
+          !ec) {
+        safeErrorPrintLn(program + ": " +
+                         detail::sum_quotef(checkfile_name) + ": read error");
+      } else {
+        safeErrorPrintLn(program + ": " + detail::sum_quotef(checkfile_name) +
+                         ": " + detail::sum_open_reason(checkfile_name));
+      }
+      return false;
+    }
+    input = &checkfile;
+  }
+
+  std::string line;
+  intmax_t line_number = 0;
+  while (std::getline(*input, line)) {
+    ++line_number;
+    if (!line.empty() && line.front() == '#') continue;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty()) continue;
+
+    auto parsed =
+        sum_parse_check_line(line, algo_tag, digest_hex_bytes, bsd_reversed);
+    if (!parsed || (is_stdin && parsed->filename == "-")) {
+      ++n_misformatted_lines;
+      if (flags.warn) {
+        safeErrorPrintLn(program + ": " + detail::sum_quotef(display_name) +
+                         ": " + std::to_string(line_number) +
+                         ": improperly formatted " + algo_tag +
+                         " checksum line");
+      }
+      continue;
+    }
+
+    properly_formatted_lines = true;
+
+    bool missing = false;
+    if (flags.ignore_missing && parsed->filename != "-") {
+      std::error_code ec;
+      missing = !std::filesystem::exists(
+          std::filesystem::u8path(parsed->filename), ec);
+    }
+
+    if (!missing) {
+      auto hash_result = hash_fn(parsed->filename, parsed->digest_bytes);
+      if (!hash_result) {
+        ++n_open_or_read_failures;
+        safeErrorPrintLn(program + ": " + detail::sum_quotef(parsed->filename) +
+                         ": " + detail::sum_open_reason(parsed->filename));
+        if (!flags.status_only) {
+          safePrintLn(detail::sum_quotef(parsed->filename) +
+                      ": FAILED open or read");
+        }
+        continue;
+      }
+
+      const bool match =
+          hash_result->size() == parsed->expected_hash.size() &&
+          std::equal(hash_result->begin(), hash_result->end(),
+                     parsed->expected_hash.begin(), [](char a, char b) {
+                       return std::tolower(static_cast<unsigned char>(a)) ==
+                              std::tolower(static_cast<unsigned char>(b));
+                     });
+      if (match) {
+        matched_checksums = true;
+      } else {
+        ++n_mismatched_checksums;
+      }
+
+      if (!flags.status_only) {
+        if (!match || !flags.quiet) {
+          safePrintLn(detail::sum_quotef(parsed->filename) +
+                      (match ? ": OK" : ": FAILED"));
+        }
+      }
+    }
+  }
+
+  if (!properly_formatted_lines) {
+    // [GNU] this diagnostic does not include the algorithm name.
+    safeErrorPrintLn(program + ": " + detail::sum_quotef(display_name) +
+                     ": no properly formatted checksum lines found");
+  } else if (!flags.status_only) {
+    if (n_misformatted_lines != 0) {
+      safeErrorPrintLn(
+          program + ": WARNING: " + std::to_string(n_misformatted_lines) +
+          (n_misformatted_lines == 1 ? " line is improperly formatted"
+                                     : " lines are improperly formatted"));
+    }
+    if (n_open_or_read_failures != 0) {
+      safeErrorPrintLn(
+          program + ": WARNING: " + std::to_string(n_open_or_read_failures) +
+          (n_open_or_read_failures == 1 ? " listed file could not be read"
+                                        : " listed files could not be read"));
+    }
+    if (n_mismatched_checksums != 0) {
+      safeErrorPrintLn(
+          program + ": WARNING: " + std::to_string(n_mismatched_checksums) +
+          (n_mismatched_checksums == 1 ? " computed checksum did NOT match"
+                                       : " computed checksums did NOT match"));
+    }
+    if (flags.ignore_missing && !matched_checksums) {
+      safeErrorPrintLn(program + ": " + detail::sum_quotef(display_name) +
+                       ": no file was verified");
+    }
+  }
+
+  return properly_formatted_lines && matched_checksums &&
+         n_mismatched_checksums == 0 && n_open_or_read_failures == 0 &&
+         (!flags.strict || n_misformatted_lines == 0);
+}
+
+// Verify all check files (GNU loops over every operand; "-" or no operand
+// means standard input).  Returns the process exit code.
+template <typename HashFn>
+auto sum_check_main(const std::string& program, const std::string& algo_tag,
+                    size_t digest_hex_bytes, const SumCheckFlags& flags,
+                    std::span<const std::string> checkfiles, HashFn&& hash_fn)
+    -> int {
+  int bsd_reversed = -1;
+  bool ok = true;
+  for (const auto& checkfile : checkfiles) {
+    ok = sum_digest_check(program, algo_tag, digest_hex_bytes, flags, checkfile,
+                          bsd_reversed, hash_fn) &&
+         ok;
+  }
+  return ok ? 0 : 1;
 }
 
 }  // namespace portable_digest

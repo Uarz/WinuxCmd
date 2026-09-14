@@ -102,17 +102,9 @@ auto build_config(const CommandContext<SUM_OPTIONS.size()>& ctx)
 
 auto calculate_checksum(const std::string& filename, uint32_t& block_count,
                         Config::Algorithm algorithm) -> cp::Result<uint16_t> {
+  // [GNU] diagnostics use "sum: FILE: <strerror>" wording.
   auto input_open_error = [](std::string_view path) -> std::string {
-    const std::string quote(1, char{39});
-    std::error_code ec;
-    if (std::filesystem::is_directory(std::filesystem::u8path(path), ec) &&
-        !ec) {
-      return std::string("cannot open ") + quote + std::string(path) + quote +
-             " for reading: Is a directory";
-    }
-
-    return std::string("cannot open ") + quote + std::string(path) + quote +
-           " for reading: No such file or directory";
+    return std::string(path) + ": " + portable_digest::open_error_reason(path);
   };
 
   std::istream* input = &std::cin;

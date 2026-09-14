@@ -545,3 +545,124 @@ TEST(cp, cp_attributes_only_creates_missing_destination) {
   EXPECT_TRUE(std::filesystem::exists(tmp.path / "dest.txt"));
   EXPECT_EQ(tmp.read("dest.txt"), "");
 }
+
+// [GNU 9.4] operand diagnostics must be byte-exact (uutils #995 family).
+TEST(cp, cp_no_operands_reports_missing_file_operand) {
+  TempDir tmp;
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"cp.exe", {});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stdout_text.empty());
+  EXPECT_EQ_TEXT(r.stderr_text,
+                 "cp: missing file operand\n"
+                 "Try 'cp --help' for more information.\n");
+}
+
+TEST(cp, cp_single_operand_reports_missing_destination) {
+  TempDir tmp;
+  tmp.write("only.txt", "x");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"cp.exe", {L"only.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stdout_text.empty());
+  EXPECT_EQ_TEXT(r.stderr_text,
+                 "cp: missing destination file operand after 'only.txt'\n"
+                 "Try 'cp --help' for more information.\n");
+}
+
+TEST(cp, cp_multi_source_missing_target_reports_errno) {
+  TempDir tmp;
+  tmp.write("a.txt", "a");
+  tmp.write("b.txt", "b");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"cp.exe", {L"a.txt", L"b.txt", L"notdir"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_EQ_TEXT(r.stderr_text,
+                 "cp: target 'notdir': No such file or directory\n");
+}
+
+TEST(cp, cp_directory_without_recursive_uses_gnu_wording) {
+  TempDir tmp;
+  std::filesystem::create_directory(tmp.path / "srcdir");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"cp.exe", {L"srcdir", L"dest"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_EQ_TEXT(r.stderr_text,
+                 "cp: -r not specified; omitting directory 'srcdir'\n");
+}
+
+// [GNU 9.4] -n prints the deprecation warning and still copies.
+TEST(cp, cp_no_clobber_emits_deprecation_warning) {
+  TempDir tmp;
+  tmp.write("src.txt", "data");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"cp.exe", {L"-n", L"src.txt", L"out.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(
+      r.stderr_text,
+      "cp: warning: behavior of -n is non-portable and may change in "
+      "future; use --update=none instead\n");
+  EXPECT_EQ(tmp.read("out.txt"), "data");
+}
+
+// [GNU] -Z/--context is a silent no-op on non-SELinux systems (#995).
+TEST(cp, cp_context_option_is_silent_noop) {
+  TempDir tmp;
+  tmp.write("src.txt", "data");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"cp.exe", {L"-Z", L"src.txt", L"out.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stdout_text.empty());
+  EXPECT_TRUE(r.stderr_text.empty());
+  EXPECT_EQ(tmp.read("out.txt"), "data");
+}
+
+// [GNU copy.c] -s with a relative SOURCE refuses when DEST lands outside
+// the current directory (#218/#274).
+TEST(cp, cp_symbolic_link_relative_source_outside_cwd_fails) {
+  TempDir tmp;
+  tmp.write("f.txt", "data");
+  std::filesystem::create_directory(tmp.path / "sub");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"cp.exe", {L"-s", L"f.txt", L"sub"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_NE(r.stderr_text.find(
+                "can make relative symbolic links only in current directory"),
+            std::string::npos);
+  EXPECT_FALSE(std::filesystem::exists(tmp.path / "sub" / "f.txt"));
+}

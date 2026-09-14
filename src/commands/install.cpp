@@ -126,6 +126,24 @@ struct ModeState {
   bool other_write = false;
 };
 
+// [GNU] quoteaf-style escaping for mode diagnostics: non-printable bytes
+// are rendered as \ooo octal escapes (uutils#13834).
+auto quote_mode_text(std::string_view text) -> std::string {
+  std::string out = "'";
+  for (unsigned char ch : text) {
+    if (ch < 0x20 || ch == 0x7f) {
+      char esc[8];
+      std::snprintf(esc, sizeof(esc), "\\%03o",
+                    static_cast<unsigned>(ch));
+      out += esc;
+    } else {
+      out.push_back(static_cast<char>(ch));
+    }
+  }
+  out += "'";
+  return out;
+}
+
 auto parse_install_mode(std::string_view mode_text) -> cp::Result<ModeState> {
   ModeState state{};
   if (mode_text.empty()) {
@@ -161,7 +179,7 @@ auto parse_install_mode(std::string_view mode_text) -> cp::Result<ModeState> {
             ? std::string_view(mode_string).substr(start)
             : std::string_view(mode_string).substr(start, comma - start);
     if (clause.empty()) {
-      return std::unexpected("invalid mode '" + mode_string + "'");
+      return std::unexpected("invalid mode " + quote_mode_text(mode_string));
     }
 
     size_t i = 0;
@@ -189,7 +207,7 @@ auto parse_install_mode(std::string_view mode_text) -> cp::Result<ModeState> {
 
     if (i >= clause.size() ||
         (clause[i] != '+' && clause[i] != '-' && clause[i] != '=')) {
-      return std::unexpected("invalid mode '" + mode_string + "'");
+      return std::unexpected("invalid mode " + quote_mode_text(mode_string));
     }
     char op = clause[i++];
 
@@ -222,11 +240,12 @@ auto parse_install_mode(std::string_view mode_text) -> cp::Result<ModeState> {
           perm_write = perm_write || state.other_write;
           break;
         default:
-          return std::unexpected("invalid mode '" + mode_string + "'");
+          return std::unexpected("invalid mode " +
+                                 quote_mode_text(mode_string));
       }
     }
     if (!saw_perm) {
-      return std::unexpected("invalid mode '" + mode_string + "'");
+      return std::unexpected("invalid mode " + quote_mode_text(mode_string));
     }
 
     auto apply_write = [op, perm_write](bool current) -> bool {
@@ -258,8 +277,15 @@ auto parse_install_mode(std::string_view mode_text) -> cp::Result<ModeState> {
   return state;
 }
 
+// Wide + \\?\-extended attribute probe so deep paths and non-ASCII names
+// work (uutils#8963).
+auto native_attributes(const std::string& path) -> DWORD {
+  return native_path::operand_target_attributes_w(
+      native_path::make_api_path_operand(path));
+}
+
 auto file_owner_writable(const std::string& path) -> std::optional<bool> {
-  DWORD attrs = GetFileAttributesA(path.c_str());
+  DWORD attrs = native_attributes(path);
   if (attrs == INVALID_FILE_ATTRIBUTES) {
     return std::nullopt;
   }
@@ -268,7 +294,8 @@ auto file_owner_writable(const std::string& path) -> std::optional<bool> {
 
 auto apply_mode_state(const std::string& path, const ModeState& mode_state)
     -> bool {
-  DWORD attrs = GetFileAttributesA(path.c_str());
+  auto operand = native_path::make_api_path_operand(path);
+  DWORD attrs = native_path::operand_target_attributes_w(operand);
   if (attrs == INVALID_FILE_ATTRIBUTES) {
     return false;
   }
@@ -282,7 +309,69 @@ auto apply_mode_state(const std::string& path, const ModeState& mode_state)
   if (new_attrs == attrs) {
     return true;
   }
-  return SetFileAttributesA(path.c_str(), new_attrs) != 0;
+  return SetFileAttributesW(operand.extended.c_str(), new_attrs) != 0;
+}
+
+// [GNU] mkancesdirs-style creation: every missing leading component is
+// created.  Uses \\?\ extended paths so trees deeper than MAX_PATH work
+// (uutils#8963).  Components actually created are appended to `created`
+// (top-down) when non-null.  Returns false on failure.
+auto create_directories_gnu(const std::string& path,
+                            std::vector<std::string>* created) -> bool {
+  std::string cur;
+  for (size_t i = 0; i < path.size(); ++i) {
+    char ch = path[i];
+    cur.push_back(ch);
+    const bool at_sep = (ch == '/' || ch == '\\');
+    const bool last = (i + 1 == path.size());
+    if (!at_sep && !last) continue;
+    std::string comp = at_sep ? cur.substr(0, cur.size() - 1) : cur;
+    if (comp.empty() || comp == "." || comp == "..") continue;
+    if (comp.size() == 2 && comp[1] == ':') continue;  // drive root "C:"
+    DWORD attrs = native_attributes(comp);
+    if (attrs != INVALID_FILE_ATTRIBUTES) {
+      if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) return false;  // ENOTDIR
+      continue;
+    }
+    auto operand = native_path::make_api_path_operand(comp);
+    if (!CreateDirectoryW(operand.extended.c_str(), nullptr)) {
+      DWORD err = GetLastError();
+      if (err == ERROR_ALREADY_EXISTS) continue;  // racing creators (#330)
+      return false;
+    }
+    if (created) created->push_back(comp);
+  }
+  return true;
+}
+
+// [GNU] install copies /dev/stdin like any other file (uutils#12407).
+// On Windows there is no /dev, so stdin aliases are streamed from the
+// process' own stdin handle.
+auto is_stdin_alias(std::string_view source) -> bool {
+  return source == "/dev/stdin" || source == "/dev/fd/0" ||
+         source == "/proc/self/fd/0";
+}
+
+auto copy_stdin_to_dest(const std::string& dest) -> bool {
+  HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+  if (in == nullptr || in == INVALID_HANDLE_VALUE) return false;
+  auto dst_operand = native_path::make_api_path_operand(dest);
+  HANDLE out =
+      CreateFileW(dst_operand.extended.c_str(), GENERIC_WRITE, 0, nullptr,
+                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (out == INVALID_HANDLE_VALUE) return false;
+  char buf[64 * 1024];
+  DWORD got = 0;
+  bool ok = true;
+  while (ReadFile(in, buf, sizeof(buf), &got, nullptr) && got > 0) {
+    DWORD written = 0;
+    if (!WriteFile(out, buf, got, &written, nullptr) || written != got) {
+      ok = false;
+      break;
+    }
+  }
+  CloseHandle(out);
+  return ok;
 }
 
 void append_source_operand(Config& cfg, const std::string& file_arg) {
@@ -353,11 +442,13 @@ auto build_config(const CommandContext<INSTALL_OPTIONS.size()>& ctx)
   cfg.target_dir = target_opt;
   if (!cfg.target_dir.empty() && cfg.no_target_directory) {
     return std::unexpected(
-        "cannot combine --target-directory and --no-target-directory");
+        "cannot combine --target-directory (-t) and --no-target-directory "
+        "(-T)\nTry 'install --help' for more information.");
   }
 
   if (ctx.positionals.empty()) {
-    return std::unexpected("missing file operand");
+    return std::unexpected(
+        "missing file operand\nTry 'install --help' for more information.");
   }
 
   if (cfg.directory_mode) {
@@ -376,8 +467,11 @@ auto build_config(const CommandContext<INSTALL_OPTIONS.size()>& ctx)
   }
 
   if (ctx.positionals.size() == 1) {
-    cfg.sources.push_back(std::string(ctx.positionals[0]));
-    return cfg;
+    // GNU: a single operand in copy mode is a missing destination.
+    return std::unexpected(
+        "missing destination file operand after '" +
+        std::string(ctx.positionals[0]) +
+        "'\nTry 'install --help' for more information.");
   }
 
   for (size_t i = 0; i + 1 < ctx.positionals.size(); ++i) {
@@ -427,18 +521,20 @@ auto files_match(const std::string& lhs, const std::string& rhs) -> bool {
 
 auto preserve_timestamps(const std::string& source, const std::string& dest)
     -> bool {
-  HANDLE hSource =
-      CreateFileA(source.c_str(), GENERIC_READ,
-                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  auto src_operand = native_path::make_api_path_operand(source);
+  auto dst_operand = native_path::make_api_path_operand(dest);
+  HANDLE hSource = CreateFileW(
+      src_operand.extended.c_str(), GENERIC_READ,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (hSource == INVALID_HANDLE_VALUE) {
     return false;
   }
 
-  HANDLE hDest =
-      CreateFileA(dest.c_str(), FILE_WRITE_ATTRIBUTES,
-                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  HANDLE hDest = CreateFileW(
+      dst_operand.extended.c_str(), FILE_WRITE_ATTRIBUTES,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (hDest == INVALID_HANDLE_VALUE) {
     CloseHandle(hSource);
     return false;
@@ -480,15 +576,24 @@ auto run(const Config& cfg) -> int {
 
   if (cfg.directory_mode) {
     for (const auto& dir : cfg.sources) {
-      if (cfg.verbose) {
-        safePrint("install: creating directory '");
-        safePrint(dir);
-        safePrintLn("'");
-      }
-
-      std::error_code ec;
-      if (!std::filesystem::create_directories(dir, ec) && ec) {
+      std::vector<std::string> created;
+      if (!create_directories_gnu(dir, &created)) {
         safeErrorPrint("install: cannot create directory '");
+        safeErrorPrint(dir);
+        safeErrorPrintLn("'");
+        return 1;
+      }
+      if (cfg.verbose) {
+        // GNU announces every component it actually creates.
+        for (const auto& comp : created) {
+          safePrint("install: creating directory '");
+          safePrint(comp);
+          safePrintLn("'");
+        }
+      }
+      // [GNU] -m applies to the named directory itself (uutils#9302).
+      if (!apply_mode_state(dir, desired_mode)) {
+        safeErrorPrint("install: cannot change permissions of '");
         safeErrorPrint(dir);
         safeErrorPrintLn("'");
         return 1;
@@ -506,30 +611,47 @@ auto run(const Config& cfg) -> int {
   sources.pop_back();
 
   if (cfg.no_target_directory && sources.size() > 1) {
-    safeErrorPrintLn("install: too many sources for -T/--no-target-directory");
+    safeErrorPrint("install: extra operand '" + sources[1] +
+                   "'\nTry 'install --help' for more information.\n");
     return 1;
   }
 
-  DWORD attrs = GetFileAttributesA(target.c_str());
+  DWORD attrs = native_attributes(target);
   bool target_is_dir = !cfg.no_target_directory &&
                        (attrs != INVALID_FILE_ATTRIBUTES) &&
                        (attrs & FILE_ATTRIBUTE_DIRECTORY);
   if (!cfg.target_dir.empty()) {
     if (!target_is_dir && cfg.create_leading_dirs) {
-      std::error_code ec;
-      std::filesystem::create_directories(target, ec);
-      attrs = GetFileAttributesA(target.c_str());
-      target_is_dir = !ec && (attrs != INVALID_FILE_ATTRIBUTES) &&
+      std::vector<std::string> created;
+      create_directories_gnu(target, &created);
+      attrs = native_attributes(target);
+      target_is_dir = (attrs != INVALID_FILE_ATTRIBUTES) &&
                       (attrs & FILE_ATTRIBUTE_DIRECTORY);
     }
 
     if (!target_is_dir) {
-      safeErrorPrintLn("install: target is not a directory");
+      // GNU: install -t reports "failed to access".
+      safeErrorPrintLn("install: failed to access '" + target +
+                       (attrs == INVALID_FILE_ATTRIBUTES
+                            ? "': No such file or directory"
+                            : "': Not a directory"));
       return 1;
     }
   }
   if (!target_is_dir && sources.size() > 1) {
-    safeErrorPrintLn("install: target is not a directory");
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+      safeErrorPrintLn("install: target '" + target +
+                       "': No such file or directory");
+    } else {
+      safeErrorPrintLn("install: target '" + target + "': Not a directory");
+    }
+    return 1;
+  }
+  // GNU: install -T onto an existing directory is an error.
+  if (cfg.no_target_directory && attrs != INVALID_FILE_ATTRIBUTES &&
+      (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+    safeErrorPrintLn("install: cannot overwrite directory '" + target +
+                     "' with non-directory");
     return 1;
   }
 
@@ -565,39 +687,73 @@ auto run(const Config& cfg) -> int {
       std::filesystem::path dest_path(dest);
       auto parent = dest_path.parent_path();
       if (!parent.empty()) {
-        std::error_code ec;
-        std::filesystem::create_directories(parent, ec);
+        std::vector<std::string> created;
+        if (!create_directories_gnu(parent.string(), &created)) {
+          safeErrorPrint("install: cannot create directory '");
+          safeErrorPrint(parent.string());
+          safeErrorPrintLn("'");
+          return 1;
+        }
+        if (cfg.verbose) {
+          for (const auto& comp : created) {
+            safePrint("install: creating directory '");
+            safePrint(comp);
+            safePrintLn("'");
+          }
+        }
       }
     }
 
     if (cfg.backup) {
-      DWORD dest_attrs = GetFileAttributesA(dest.c_str());
+      DWORD dest_attrs = native_attributes(dest);
       if (dest_attrs != INVALID_FILE_ATTRIBUTES) {
         std::string backup_path = dest + cfg.backup_suffix;
-        if (MoveFileExA(dest.c_str(), backup_path.c_str(),
+        auto dest_operand = native_path::make_api_path_operand(dest);
+        auto backup_operand =
+            native_path::make_api_path_operand(backup_path);
+        if (MoveFileExW(dest_operand.extended.c_str(),
+                        backup_operand.extended.c_str(),
                         MOVEFILE_REPLACE_EXISTING)) {
           if (cfg.verbose) {
-            safePrint("created backup: ");
-            safePrintLn(backup_path);
+            safePrintLn("(backup: '" + backup_path + "')");
           }
         }
       }
     }
 
     if (cfg.verbose) {
-      safePrint("installing: ");
+      // GNU: 'src' -> 'dest'
+      safePrint("'");
       safePrint(source);
-      safePrint(" -> ");
-      safePrintLn(dest);
+      safePrint("' -> '");
+      safePrint(dest);
+      safePrintLn("'");
     }
 
-    if (!CopyFileA(source.c_str(), dest.c_str(), FALSE)) {
-      safeErrorPrint("install: cannot copy '");
-      safeErrorPrint(source);
-      safeErrorPrint("' to '");
-      safeErrorPrint(dest);
-      safeErrorPrintLn("'");
-      return 1;
+    if (is_stdin_alias(source)) {
+      // [GNU] install copies /dev/stdin contents like a regular file
+      // (uutils#12407).
+      if (!copy_stdin_to_dest(dest)) {
+        safeErrorPrintLn("install: cannot create regular file '" + dest +
+                         "'");
+        return 1;
+      }
+    } else {
+      DWORD src_attrs = native_attributes(source);
+      if (src_attrs == INVALID_FILE_ATTRIBUTES) {
+        safeErrorPrintLn("install: cannot stat '" + source +
+                         "': No such file or directory");
+        return 1;
+      }
+      auto src_operand = native_path::make_api_path_operand(source);
+      auto dst_operand = native_path::make_api_path_operand(dest);
+      if (!CopyFileW(src_operand.extended.c_str(),
+                     dst_operand.extended.c_str(), FALSE)) {
+        safeErrorPrintLn("install: cannot create regular file '" + dest +
+                         "': " +
+                         win32_posix_error_text(GetLastError()));
+        return 1;
+      }
     }
 
     if (cfg.preserve_timestamps && !preserve_timestamps(source, dest)) {

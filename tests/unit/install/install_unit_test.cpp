@@ -319,6 +319,93 @@ TEST(install, install_multiple_sources_require_existing_directory) {
   EXPECT_FALSE(std::filesystem::exists(tmp.path / "missing_dir"));
 }
 
+// [GNU 9.4] single copy-mode operand is a missing destination.
+TEST(install, install_single_operand_reports_missing_destination) {
+  TempDir tmp;
+  tmp.write("only.txt", "x\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"install.exe", {L"only.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_EQ_TEXT(r.stderr_text,
+                 "install: missing destination file operand after "
+                 "'only.txt'\n"
+                 "Try 'install --help' for more information.\n");
+}
+
+// [GNU quoteaf] control bytes in -m are octal-escaped (uutils#13834).
+TEST(install, install_invalid_mode_octal_escapes_control_byte) {
+  TempDir tmp;
+  tmp.write("a.txt", "x\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"install.exe", {L"-m", L"\x01", L"a.txt", L"b.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_EQ_TEXT(r.stderr_text, "install: invalid mode '\\001'\n");
+}
+
+// [GNU] -T onto an existing directory is refused.
+TEST(install, install_no_target_directory_refuses_existing_directory) {
+  TempDir tmp;
+  tmp.write("a.txt", "x\n");
+  std::filesystem::create_directory(tmp.path / "destdir");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"install.exe", {L"-T", L"a.txt", L"destdir"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_EQ_TEXT(r.stderr_text,
+                 "install: cannot overwrite directory 'destdir' with "
+                 "non-directory\n");
+}
+
+// [GNU] -d -v announces every component it creates (uutils#8963 family).
+TEST(install, install_directory_verbose_announces_each_component) {
+  TempDir tmp;
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"install.exe", {L"-d", L"-v", L"aa/bb"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text,
+                 "install: creating directory 'aa'\n"
+                 "install: creating directory 'aa/bb'\n");
+}
+
+// [GNU] -d -m applies the mode to the named directory only; ancestors use
+// the default mode (mkdir-p semantics, uutils#9302).
+TEST(install, install_directory_mode_applies_to_final_dir_only) {
+  TempDir tmp;
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"install.exe", {L"-d", L"-m", L"555", L"pp/qq"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  auto parent = tmp.path / "pp";
+  auto leaf = tmp.path / "pp" / "qq";
+  DWORD pattrs = GetFileAttributesW(parent.wstring().c_str());
+  DWORD lattrs = GetFileAttributesW(leaf.wstring().c_str());
+  EXPECT_TRUE((pattrs & FILE_ATTRIBUTE_READONLY) == 0);
+  EXPECT_TRUE((lattrs & FILE_ATTRIBUTE_READONLY) != 0);
+}
+
 TEST(install, install_wildcard_multiple_sources_require_existing_directory) {
   TempDir tmp;
   tmp.write("a.txt", "alpha\n");

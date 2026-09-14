@@ -339,3 +339,46 @@ TEST(mv, mv_wildcard_multiple_sources_require_existing_directory) {
   EXPECT_EQ(tmp.read("b.txt"), "beta");
   EXPECT_FALSE(std::filesystem::exists(tmp.path / "missing_dir"));
 }
+
+// [GNU 9.4] a trailing separator forces a directory operand: a regular
+// file with a trailing slash fails at stat time (uutils#10026 family).
+TEST(mv, mv_trailing_slash_on_file_reports_not_a_directory) {
+  TempDir tmp;
+  tmp.write("file.txt", "data");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"mv.exe", {L"file.txt/", L"renamed.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_EQ_TEXT(r.stderr_text,
+                 "mv: cannot stat 'file.txt/': Not a directory\n");
+  EXPECT_EQ(tmp.read("file.txt"), "data");
+}
+
+// [GNU] a read-only destination is replaced without prompting when stdin
+// is not a terminal (uutils#11321).  The test harness pipes stdin, so no
+// "overriding mode" prompt may appear.
+TEST(mv, mv_readonly_destination_no_prompt_on_non_tty) {
+  TempDir tmp;
+  tmp.write("src.txt", "new");
+  tmp.write("dest.txt", "old");
+  auto dest = tmp.path / "dest.txt";
+  DWORD attrs = GetFileAttributesW(dest.wstring().c_str());
+  SetFileAttributesW(dest.wstring().c_str(),
+                   attrs | FILE_ATTRIBUTE_READONLY);
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.set_stdin("");  // guarantee a piped, non-tty stdin
+  p.add(L"mv.exe", {L"src.txt", L"dest.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ(r.stderr_text.find("overriding mode"), std::string::npos);
+  EXPECT_EQ(tmp.read("dest.txt"), "new");
+  EXPECT_FALSE(std::filesystem::exists(tmp.path / "src.txt"));
+}

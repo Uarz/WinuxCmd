@@ -330,9 +330,11 @@ REGISTER_COMMAND(
   }
 
   if (!target_dir.empty() && no_target_dir) {
+    // GNU 9.11 ln.c: "cannot combine --target-directory and
+    // --no-target-directory"
     safeErrorPrint(
-        "ln: cannot combine --target-directory (-t) and "
-        "--no-target-directory (-T)\n");
+        "ln: cannot combine --target-directory "
+        "and --no-target-directory\n");
     return 1;
   }
 
@@ -340,15 +342,20 @@ REGISTER_COMMAND(
 
   if (!target_dir.empty()) {
     if (ctx.positionals.empty()) {
-      safeErrorPrint("ln: missing operand\n");
+      safeErrorPrint("ln: missing file operand\n");
       safeErrorPrint("Try 'ln --help' for more information.\n");
       return 1;
     }
-    // Check if target_dir exists and is a directory
+    // GNU 9.11 ln.c: missing -t dir reports "failed to access"; an
+    // existing non-directory reports "target 'x' is not a directory".
     std::wstring wtd = utf8_to_wstring(target_dir);
     DWORD td_attrs = GetFileAttributesW(wtd.c_str());
-    if (td_attrs == INVALID_FILE_ATTRIBUTES ||
-        !(td_attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+    if (td_attrs == INVALID_FILE_ATTRIBUTES) {
+      safeErrorPrint("ln: failed to access '" + target_dir +
+                     "': No such file or directory\n");
+      return 1;
+    }
+    if (!(td_attrs & FILE_ATTRIBUTE_DIRECTORY)) {
       safeErrorPrint("ln: target '" + target_dir + "' is not a directory\n");
       return 1;
     }
@@ -357,7 +364,13 @@ REGISTER_COMMAND(
       link_jobs.emplace_back(source, join_target_path(target_dir, source));
     }
   } else if (ctx.positionals.empty()) {
-    safeErrorPrint("ln: missing operand\n");
+    safeErrorPrint("ln: missing file operand\n");
+    safeErrorPrint("Try 'ln --help' for more information.\n");
+    return 1;
+  } else if (no_target_dir && ctx.positionals.size() == 1) {
+    // GNU: -T requires exactly two operands.
+    safeErrorPrint("ln: missing destination file operand after '" +
+                   std::string(ctx.positionals[0]) + "'\n");
     safeErrorPrint("Try 'ln --help' for more information.\n");
     return 1;
   } else if (ctx.positionals.size() == 1) {
@@ -393,7 +406,11 @@ REGISTER_COMMAND(
     DWORD td_attrs = GetFileAttributesW(wtd.c_str());
     if (td_attrs == INVALID_FILE_ATTRIBUTES ||
         !(td_attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-      safeErrorPrint("ln: target '" + target_dir + "' is not a directory\n");
+      // GNU 9.11 ln.c: errno-style "target 'x': <reason>".
+      safeErrorPrint("ln: target '" + target_dir +
+                     (td_attrs == INVALID_FILE_ATTRIBUTES
+                          ? "': No such file or directory\n"
+                          : "': Not a directory\n"));
       return 1;
     }
 
@@ -416,6 +433,21 @@ REGISTER_COMMAND(
       if (!source_ec) source = wstring_to_utf8(resolved.wstring());
     }
     if (symbolic && relative) source = relative_symlink_target(source, target);
+
+    // [GNU] For hard links, ln stats the source first so a missing TARGET
+    // reports "failed to access 'src'".  FindFirstFileW is the lstat
+    // equivalent here: a dangling symlink still counts as existing.
+    if (!symbolic) {
+      WIN32_FIND_DATAW sfd{};
+      HANDLE sh = FindFirstFileW(utf8_to_wstring(source).c_str(), &sfd);
+      if (sh == INVALID_HANDLE_VALUE) {
+        safeErrorPrint("ln: failed to access '" + source +
+                       "': No such file or directory\n");
+        error_count++;
+        continue;
+      }
+      FindClose(sh);
+    }
 
     // Check if target exists
     std::wstring wtarget = utf8_to_wstring(target);

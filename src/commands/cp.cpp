@@ -236,22 +236,38 @@ auto validate_arguments(const CommandContext<CP_OPTIONS.size()>& ctx)
                                ctx.get<bool>("--no-target-directory", false);
     if (no_target_directory) {
       return std::unexpected(
-          "cannot combine --target-directory and --no-target-directory");
+          "cannot combine --target-directory (-t) and --no-target-directory "
+          "(-T)\nTry 'cp --help' for more information.");
     }
 
     DWORD attr = native_path::attributes_w(utf8_to_wstring(target_dir));
-    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-      return std::unexpected("target is not a directory");
+    if (attr == INVALID_FILE_ATTRIBUTES) {
+      return std::unexpected("target directory '" + target_dir +
+                             "': No such file or directory");
+    }
+    if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+      return std::unexpected("target directory '" + target_dir +
+                             "': Not a directory");
     }
 
     destPath = target_dir;
     for (auto arg : ctx.positionals) {
       append_expanded_source(sourcePaths, arg);
     }
+    if (sourcePaths.empty()) {
+      return std::unexpected(
+          "missing file operand\nTry 'cp --help' for more information.");
+    }
   } else {
     // Regular case: last argument is destination
+    if (ctx.positionals.empty()) {
+      return std::unexpected(
+          "missing file operand\nTry 'cp --help' for more information.");
+    }
     if (ctx.positionals.size() < 2) {
-      return std::unexpected("missing file operand");
+      return std::unexpected("missing destination file operand after '" +
+                             std::string(ctx.positionals[0]) +
+                             "'\nTry 'cp --help' for more information.");
     }
 
     for (size_t i = 0; i < ctx.positionals.size() - 1; ++i) {
@@ -267,7 +283,8 @@ auto validate_arguments(const CommandContext<CP_OPTIONS.size()>& ctx)
   }
 
   if (sourcePaths.empty()) {
-    return std::unexpected("missing file operand");
+    return std::unexpected(
+        "missing file operand\nTry 'cp --help' for more information.");
   }
 
   return std::pair{sourcePaths, destPath};
@@ -287,7 +304,12 @@ auto check_destination(
                    (attr & FILE_ATTRIBUTE_DIRECTORY);
 
   if (sourcePaths.size() > 1 && !destIsDir) {
-    return std::unexpected("target is not a directory");
+    // GNU 9.4: errno-style diagnostics naming the target operand.
+    if (attr == INVALID_FILE_ATTRIBUTES) {
+      return std::unexpected("target '" + destPath +
+                             "': No such file or directory");
+    }
+    return std::unexpected("target '" + destPath + "': Not a directory");
   }
 
   return std::tuple{sourcePaths, destPath, destIsDir};
@@ -327,6 +349,17 @@ auto create_directory_recursive(const std::string& path) -> cp::Result<bool> {
 // 4. Check if path exists
 // ----------------------------------------------
 auto path_exists(const std::string& path) -> cp::Result<bool> {
+  // Pseudo-device operands (NUL, /dev/null, /dev/std*, /proc/*/fd/N) carry
+  // no file attributes but are valid copy sources like under GNU
+  // (#1055/#1056).
+  if (native_path::resolve_pseudo_device_w(native_path::from_utf8(path))) {
+    if (native_path::pseudo_device_std_fd(path) == std::optional<int>(0)) {
+      // /dev/stdin dangles (ENOENT) when fd 0 is closed — GNU reports
+      // "cannot stat ... No such file or directory".
+      return !file_io::stdin_is_bad();
+    }
+    return true;
+  }
   return native_path::valid_attributes(
       native_path::attributes_w(utf8_to_wstring(path)));
 }
@@ -531,12 +564,14 @@ auto backup_existing_destination(const std::string& destPath,
   return true;
 }
 
-auto copy_self_with_backup(const std::string& path,
+auto copy_self_with_backup(const std::string& path, const std::string& destPath,
                            const CommandContext<CP_OPTIONS.size()>& ctx)
     -> cp::Result<bool> {
   bool force = ctx.get<bool>("--force", false) || ctx.get<bool>("-f", false);
   if (!force || !backup_enabled(ctx)) {
-    return std::unexpected("source and destination are the same file");
+    // GNU: cp: 'a' and 'b' are the same file
+    return std::unexpected("'" + path + "' and '" + destPath +
+                           "' are the same file");
   }
 
   std::wstring wpath = utf8_to_wstring(path);
@@ -549,6 +584,94 @@ auto copy_self_with_backup(const std::string& path,
   }
   if (!CopyFileW(wpath.c_str(), (*backup_path)->c_str(), FALSE)) {
     return std::unexpected("cannot create backup for destination");
+  }
+  return true;
+}
+
+// lstat-style existence probe: a (possibly dangling) symlink itself counts.
+auto lexists(const std::string& path) -> bool {
+  std::error_code ec;
+  auto status = std::filesystem::symlink_status(utf8_to_wstring(path), ec);
+  return !ec && status.type() != std::filesystem::file_type::not_found;
+}
+
+auto is_symlink_path(const std::string& path) -> bool {
+  std::error_code ec;
+  return std::filesystem::is_symlink(
+      std::filesystem::symlink_status(utf8_to_wstring(path), ec));
+}
+
+// [GNU] An existing destination is removed before a link is created.
+// Directories (real ones) are not silently removed: GNU reports
+// "cannot overwrite directory ... with non-directory" instead.
+auto remove_destination_entry(const std::string& destPath) -> cp::Result<bool> {
+  auto dest_operand = native_path::make_api_path_operand(destPath);
+  DWORD attrs = native_path::operand_target_attributes_w(dest_operand);
+  if (attrs == INVALID_FILE_ATTRIBUTES) {
+    return true;
+  }
+  if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+    // A directory symlink is removed like a directory; a real directory is
+    // left alone so the caller can report the GNU diagnostic.
+    if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0) {
+      return std::unexpected("cannot overwrite directory '" + destPath +
+                             "' with non-directory");
+    }
+    if (!RemoveDirectoryW(dest_operand.extended.c_str())) {
+      return std::unexpected("cannot remove '" + destPath +
+                             "': " + win32_posix_error_text(GetLastError()));
+    }
+    return true;
+  }
+  SetFileAttributesW(dest_operand.extended.c_str(), FILE_ATTRIBUTE_NORMAL);
+  if (!DeleteFileW(dest_operand.extended.c_str())) {
+    return std::unexpected("cannot remove '" + destPath +
+                           "': " + win32_posix_error_text(GetLastError()));
+  }
+  return true;
+}
+
+// [GNU] -s: a relative SOURCE may only be linked into the current
+// directory; anything else would produce a broken link (#218, #274).
+auto dest_in_current_directory(const std::string& destPath) -> bool {
+  std::filesystem::path parent =
+      std::filesystem::path(utf8_to_wstring(destPath)).parent_path();
+  if (parent.empty()) {
+    return true;
+  }
+  std::error_code ec;
+  auto cwd = std::filesystem::current_path(ec);
+  if (ec) return true;
+  auto parent_abs = std::filesystem::absolute(parent, ec);
+  if (ec) return true;
+  // GNU: failure to stat the destination parent is ignored here; the
+  // subsequent link creation reports its own error.
+  if (!native_path::valid_attributes(
+          native_path::attributes_w(parent_abs.wstring()))) {
+    return true;
+  }
+  std::error_code eq_ec;
+  return std::filesystem::equivalent(cwd, parent_abs, eq_ec) && !eq_ec;
+}
+
+auto create_symlink_copy(const std::string& srcPath,
+                         const std::string& destPath,
+                         const std::wstring& link_target, bool src_is_dir,
+                         bool verbose) -> cp::Result<bool> {
+  std::wstring wdest = utf8_to_wstring(destPath);
+  DWORD flags = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+  if (src_is_dir) flags |= SYMBOLIC_LINK_FLAG_DIRECTORY;
+  if (!CreateSymbolicLinkW(wdest.c_str(), link_target.c_str(), flags)) {
+    return std::unexpected("cannot create symbolic link '" + destPath +
+                           "' to '" + srcPath +
+                           "': " + win32_posix_error_text(GetLastError()));
+  }
+  if (verbose) {
+    safePrint("'");
+    safePrint(srcPath);
+    safePrint("' -> '");
+    safePrint(destPath);
+    safePrint("'\n");
   }
   return true;
 }
@@ -567,36 +690,35 @@ auto copy_file(const std::string& srcPath, const std::string& destPath,
   bool update = ctx.get<bool>("-u", false) || ctx.get<bool>("--update", false);
   bool remove_dest = ctx.has("--remove-destination");
   bool attrs_only = ctx.has("--attributes-only");
+  bool hard_link = ctx.get<bool>("--link", false) || ctx.get<bool>("-l", false);
+  bool symbolic_link =
+      ctx.get<bool>("--symbolic-link", false) || ctx.get<bool>("-s", false);
+  bool force = ctx.get<bool>("--force", false) || ctx.get<bool>("-f", false);
+  // -d and -a imply --no-dereference: symlink sources are recreated as links.
+  bool no_deref = ctx.get<bool>("-P", false) ||
+                  ctx.get<bool>("--no-dereference", false) ||
+                  ctx.get<bool>("-d", false) || archive_enabled(ctx);
 
   std::error_code equivalent_ec;
-  if (std::filesystem::exists(srcPath) && std::filesystem::exists(destPath) &&
+  // Use the error_code overload: pseudo-device operands such as "NUL" make
+  // GetFileAttributesExW report ERROR_INVALID_PARAMETER, which the throwing
+  // overload turns into an uncaught filesystem_error.
+  if (!hard_link && !symbolic_link &&
+      std::filesystem::exists(srcPath, equivalent_ec) && !equivalent_ec &&
+      lexists(destPath) &&
       std::filesystem::equivalent(srcPath, destPath, equivalent_ec) &&
       !equivalent_ec) {
-    return copy_self_with_backup(srcPath, ctx);
+    return copy_self_with_backup(srcPath, destPath, ctx);
   }
 
-  if (ctx.get<bool>("--link", false) || ctx.get<bool>("-l", false)) {
-    std::wstring source = utf8_to_wstring(srcPath);
-    std::wstring dest = utf8_to_wstring(destPath);
-    if (CreateHardLinkW(dest.c_str(), source.c_str(), nullptr)) return true;
-    return std::unexpected("cannot create hard link");
-  }
+  bool src_is_symlink = is_symlink_path(srcPath);
+  bool dest_exists = lexists(destPath);
 
-  if (ctx.get<bool>("--symbolic-link", false) || ctx.get<bool>("-s", false)) {
-    std::wstring source = utf8_to_wstring(srcPath);
-    std::wstring dest = utf8_to_wstring(destPath);
-    DWORD attrs = FILE_ATTRIBUTE_NORMAL;
-    auto is_dir = path_exists_and_is_directory(srcPath);
-    if (is_dir && *is_dir) attrs |= SYMBOLIC_LINK_FLAG_DIRECTORY;
-    if (CreateSymbolicLinkW(dest.c_str(), source.c_str(), attrs)) return true;
-    return std::unexpected("cannot create symbolic link");
-  }
-
-  if (no_clobber && std::filesystem::exists(destPath)) {
+  if (no_clobber && dest_exists) {
     return true;
   }
 
-  if (update && std::filesystem::exists(destPath)) {
+  if (update && dest_exists) {
     WIN32_FILE_ATTRIBUTE_DATA src_data{};
     WIN32_FILE_ATTRIBUTE_DATA dest_data{};
     auto src_operand = native_path::make_api_path_operand(srcPath);
@@ -612,23 +734,19 @@ auto copy_file(const std::string& srcPath, const std::string& destPath,
     }
   }
 
-  if (interactive) {
-    std::ifstream destTest(destPath);
-    if (destTest.good()) {
-      // OPTIMIZED: Avoid wstring concatenation
-      safeErrorPrint("cp: overwrite '");
-      safeErrorPrint(destPath);
-      safeErrorPrint("'? (y/n) ");
-      char response;
-      std::cin.get(response);
-      if (response != 'y' && response != 'Y') {
-        return true;
-      }
+  if (interactive && dest_exists) {
+    safeErrorPrint("cp: overwrite '");
+    safeErrorPrint(destPath);
+    safeErrorPrint("'? ");
+    char response;
+    std::cin.get(response);
+    if (response != 'y' && response != 'Y') {
+      return true;
     }
   }
 
   // --remove-destination: remove existing dest before opening
-  if (remove_dest) {
+  if (remove_dest && dest_exists) {
     auto dest_operand = native_path::make_api_path_operand(destPath);
     DWORD dest_attrs =
         native_path::operand_target_attributes_w(dest_operand);
@@ -648,6 +766,115 @@ auto copy_file(const std::string& srcPath, const std::string& destPath,
     return backupResult;
   }
 
+  dest_exists = lexists(destPath);
+
+  if (hard_link) {
+    std::wstring dest = utf8_to_wstring(destPath);
+    std::wstring link_source = utf8_to_wstring(srcPath);
+    // GNU -l dereferences the source by default; only -P/-d/-a link the
+    // symlink itself.  CreateHardLinkW on a symlink operand links the
+    // reparse point, which is exactly the no-dereference behaviour.
+    if (!no_deref && src_is_symlink) {
+      std::error_code res_ec;
+      auto resolved =
+          std::filesystem::canonical(utf8_to_wstring(srcPath), res_ec);
+      if (!res_ec) link_source = resolved.wstring();
+    }
+    if (CreateHardLinkW(dest.c_str(), link_source.c_str(), nullptr)) {
+      if (verbose) {
+        safePrint("'");
+        safePrint(srcPath);
+        safePrint("' -> '");
+        safePrint(destPath);
+        safePrint("'\n");
+      }
+      return true;
+    }
+    DWORD link_err = GetLastError();
+    if (dest_exists && (force || (no_deref && src_is_symlink))) {
+      // -f, or a technically-different symlink destination being replaced
+      // by a hardlink-copy of a symlink source (uutils#6531).
+      auto rm = remove_destination_entry(destPath);
+      if (!rm) return rm;
+      if (CreateHardLinkW(dest.c_str(), link_source.c_str(), nullptr)) {
+        if (verbose) {
+          safePrint("'");
+          safePrint(srcPath);
+          safePrint("' -> '");
+          safePrint(destPath);
+          safePrint("'\n");
+        }
+        return true;
+      }
+      link_err = GetLastError();
+    }
+    return std::unexpected("cannot create hard link '" + destPath + "' to '" +
+                           srcPath + "': " + win32_posix_error_text(link_err));
+  }
+
+  if (symbolic_link) {
+    std::wstring source = utf8_to_wstring(srcPath);
+    // [GNU] refuse a relative SOURCE unless DEST lands in the current
+    // directory; otherwise the link text would resolve to the wrong place.
+    bool src_absolute = std::filesystem::path(source).is_absolute() ||
+                        source[0] == L'/' || source[0] == L'\\';
+    if (!src_absolute && !dest_in_current_directory(destPath)) {
+      return std::unexpected(
+          destPath +
+          ": can make relative symbolic links only in current directory");
+    }
+    if (dest_exists) {
+      if (!force) {
+        return std::unexpected("cannot create symbolic link '" + destPath +
+                               "' to '" + srcPath + "': File exists");
+      }
+      auto rm = remove_destination_entry(destPath);
+      if (!rm) return rm;
+    }
+    DWORD attrs = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+    if (path_exists_and_is_directory(srcPath).value_or(false)) {
+      attrs |= SYMBOLIC_LINK_FLAG_DIRECTORY;
+    }
+    if (CreateSymbolicLinkW(utf8_to_wstring(destPath).c_str(), source.c_str(),
+                            attrs)) {
+      if (verbose) {
+        safePrint("'");
+        safePrint(srcPath);
+        safePrint("' -> '");
+        safePrint(destPath);
+        safePrint("'\n");
+      }
+      return true;
+    }
+    return std::unexpected("cannot create symbolic link '" + destPath +
+                           "' to '" + srcPath +
+                           "': " + win32_posix_error_text(GetLastError()));
+  }
+
+  // [GNU] -P/-d/-a: a symlink source is recreated as a link (the link text
+  // is copied verbatim), not followed.
+  if (no_deref && src_is_symlink) {
+    std::error_code rl_ec;
+    auto target =
+        std::filesystem::read_symlink(utf8_to_wstring(srcPath), rl_ec);
+    if (rl_ec) {
+      return std::unexpected("cannot read symbolic link '" + srcPath +
+                             "': " + std::string(rl_ec.message()));
+    }
+    if (dest_exists) {
+      auto rm = remove_destination_entry(destPath);
+      if (!rm) return rm;
+    }
+    bool src_is_dir = false;
+    {
+      DWORD sattrs = GetFileAttributesW(utf8_to_wstring(srcPath).c_str());
+      src_is_dir = sattrs != INVALID_FILE_ATTRIBUTES &&
+                   (sattrs & FILE_ATTRIBUTE_DIRECTORY);
+    }
+    return create_symlink_copy(srcPath, destPath, target.wstring(), src_is_dir,
+                               verbose);
+  }
+
   if (attrs_only) {
     // --attributes-only: copy only metadata, not file data
     {
@@ -665,16 +892,17 @@ auto copy_file(const std::string& srcPath, const std::string& destPath,
   }
 
   // Check if source file exists and is readable
+  errno = 0;
   std::ifstream src = file_io::open_binary_file(srcPath);
   if (!src) {
-    return std::unexpected("cannot open for reading");
+    return std::unexpected("cannot open '" + srcPath +
+                           "' for reading: " + strerror(errno));
   }
 
   // Open destination file
   std::ofstream dest = file_io::create_binary_file(destPath);
   if (!dest) {
     const int open_err = errno;
-    bool force = ctx.get<bool>("--force", false) || ctx.get<bool>("-f", false);
     if (!force) {
       return std::unexpected("cannot create regular file '" + destPath +
                              "': " + strerror(open_err));
@@ -693,7 +921,7 @@ auto copy_file(const std::string& srcPath, const std::string& destPath,
   // Copy file content
   dest << src.rdbuf();
   if (dest.bad()) {
-    return std::unexpected("error writing");
+    return std::unexpected("error writing '" + destPath + "'");
   }
 
   // Flush and close the files
@@ -765,6 +993,9 @@ auto copy_directory_helper(const std::string& srcPath,
 
   bool success = true;
   bool verbose = verbose_enabled(ctx);
+  bool no_deref = ctx.get<bool>("-P", false) ||
+                  ctx.get<bool>("--no-dereference", false) ||
+                  ctx.get<bool>("-d", false) || archive_enabled(ctx);
 
   // Process each item in the directory
   do {
@@ -791,14 +1022,16 @@ auto copy_directory_helper(const std::string& srcPath,
     std::string srcItemPath = srcPath + "\\" + fileName;
     std::string destItemPath = destPath + "\\" + fileName;
 
-    // Check if it's a directory
-    if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-      // Skip . and .. directories (already handled earlier)
-      if (wcscmp(findData.cFileName, L".") == 0 ||
-          wcscmp(findData.cFileName, L"..") == 0) {
-        continue;
-      }
+    bool is_dir_child =
+        (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    // [GNU] -P/-d/-a: a symlink child is recreated as a link, not followed.
+    bool link_child =
+        no_deref &&
+        (findData.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+        findData.dwReserved0 == IO_REPARSE_TAG_SYMLINK;
 
+    // Check if it's a directory
+    if (is_dir_child && !link_child) {
       // Verify it's actually a directory
       DWORD attr = native_path::attributes_w(utf8_to_wstring(srcItemPath));
       if (attr != INVALID_FILE_ATTRIBUTES &&
@@ -811,9 +1044,12 @@ auto copy_directory_helper(const std::string& srcPath,
         }
       }
     } else {
-      // Copy file
+      // Copy file (or recreate the symlink under -P/-d/-a)
       auto fileResult = copy_file(srcItemPath, destItemPath, ctx);
       if (!fileResult) {
+        safeErrorPrint("cp: ");
+        safeErrorPrint(fileResult.error());
+        safeErrorPrint("\n");
         success = false;
       }
     }
@@ -847,12 +1083,17 @@ auto process_source_paths(
   recursive |= ctx.get<bool>("-r", false);
   recursive |= ctx.get<bool>("-R", false);
   recursive |= archive_enabled(ctx);
+  bool no_deref = ctx.get<bool>("-P", false) ||
+                  ctx.get<bool>("--no-dereference", false) ||
+                  ctx.get<bool>("-d", false) || archive_enabled(ctx);
   bool success = true;
 
   for (const auto& srcPath : sourcePaths) {
-    // Check if source path exists
-    auto existsResult = path_exists(srcPath);
-    if (!existsResult || !*existsResult) {
+    // Check if source path exists; under -P/-d/-a a dangling symlink still
+    // counts because the link itself is copied.
+    bool src_exists =
+        no_deref ? lexists(srcPath) : path_exists(srcPath).value_or(false);
+    if (!src_exists) {
       // OPTIMIZED: Avoid wstring concatenation
       safeErrorPrint("cp: cannot stat '");
       safeErrorPrint(srcPath);
@@ -895,6 +1136,15 @@ auto process_source_paths(
       }
     }
 
+    // [GNU] -P/-d/-a never follow a symlink source: the link itself is
+    // recreated at the destination, even when it points at a directory.
+    if (srcIsDir && is_symlink_path(srcPath) &&
+        (ctx.get<bool>("-P", false) ||
+         ctx.get<bool>("--no-dereference", false) ||
+         ctx.get<bool>("-d", false) || archive_enabled(ctx))) {
+      srcIsDir = false;
+    }
+
     if (srcIsDir) {
       if (recursive) {
         auto dirResult = copy_directory(srcPath, finalDestPath, ctx);
@@ -907,7 +1157,7 @@ auto process_source_paths(
         }
       } else {
         // OPTIMIZED: Avoid wstring concatenation
-        safeErrorPrint("cp: omitting directory '");
+        safeErrorPrint("cp: -r not specified; omitting directory '");
         safeErrorPrint(srcPath);
         safeErrorPrint("'\n");
         success = false;
@@ -915,9 +1165,10 @@ auto process_source_paths(
     } else {
       auto fileResult = copy_file(srcPath, finalDestPath, ctx);
       if (!fileResult) {
-        safeErrorPrintLn(winux::i18n::format(
-            "command.cp.error.copying_file",
-            "cp: error copying file '{}': {}", srcPath, fileResult.error()));
+        // copy_file errors are already complete GNU-style diagnostics.
+        safeErrorPrint("cp: ");
+        safeErrorPrint(fileResult.error());
+        safeErrorPrint("\n");
         success = false;
       }
     }
@@ -931,17 +1182,12 @@ auto process_source_paths(
 // ----------------------------------------------
 template <size_t N>
 auto process_command(const CommandContext<N>& ctx) -> cp::Result<bool> {
-  if (ctx.has("-Z")) {
-    return std::unexpected(
-        "SELinux security contexts are not supported on Windows");
-  }
-
-  // [DIFFERS] -c/--context: SELinux context options are not applicable on
-  // Windows. Treat them identically to -Z.
-  if (ctx.has("--context") || ctx.has("-c")) {
-    return std::unexpected(
-        "SELinux security contexts are not supported on Windows");
-  }
+  // [DIFFERS] -Z/--context: SELinux does not exist on Windows.  GNU cp on a
+  // non-SELinux system accepts -Z as a silent no-op, so scripts passing it
+  // must not fail (#995).
+  (void)ctx.get<bool>("-Z", false);
+  (void)ctx.get<bool>("--context", false);
+  (void)ctx.get<bool>("-c", false);
 
   // [DIFFERS] --keep-directory-symlink: on Windows directory symlinks are
   // followed by default, so this flag is silently accepted as a no-op.
@@ -958,39 +1204,37 @@ auto process_command(const CommandContext<N>& ctx) -> cp::Result<bool> {
   (void)ctx.get<bool>("-L", false);
   (void)ctx.get<bool>("--dereference", false);
 
-  // [DIFFERS] -P/--no-dereference: never follow symbolic links in SOURCE.
-  // Windows requires FILE_FLAG_OPEN_REPARSE_POINT to open the reparse point
-  // itself; this behaviour is not yet implemented.
-  if (ctx.get<bool>("-P", false) || ctx.get<bool>("--no-dereference", false)) {
-    return std::unexpected(
-        "cp: --no-dereference (-P) is not supported on Windows");
-  }
+  // -P/--no-dereference and -d are handled inside copy_file: a symbolic-link
+  // source is recreated as a link at the destination instead of being
+  // followed (GNU -d = --no-dereference --preserve=links; -a implies -d).
+  // The hardlink-preservation half of --preserve=links has no Windows
+  // equivalent worth emulating here.
 
-  // [DIFFERS] -d: same as --no-dereference --preserve=links.
-  // Not supported because --no-dereference is not implemented on Windows.
-  if (ctx.get<bool>("-d", false)) {
+  // [GNU] -s and -l are mutually exclusive.
+  if ((ctx.get<bool>("-s", false) || ctx.get<bool>("--symbolic-link", false)) &&
+      (ctx.get<bool>("-l", false) || ctx.get<bool>("--link", false))) {
     return std::unexpected(
-        "cp: -d (--no-dereference --preserve=links) is not supported on "
-        "Windows");
+        "cannot make both hard and symbolic links\n"
+        "Try 'cp --help' for more information.");
   }
 
   // [DIFFERS] --sparse: control creation of sparse files.
   // Not yet implemented; would require DeviceIoControl(SET_SPARSE).
   if (ctx.has("--sparse")) {
-    return std::unexpected("cp: --sparse is not supported on Windows");
+    return std::unexpected("--sparse is not supported on Windows");
   }
 
   // [DIFFERS] --reflink: control clone/CoW copies.
   // Not yet implemented; would require CopyFile2 or equivalent.
   if (ctx.has("--reflink")) {
-    return std::unexpected("cp: --reflink is not supported on Windows");
+    return std::unexpected("--reflink is not supported on Windows");
   }
 
   // [DIFFERS] --copy-contents: copy contents of special files when recursive.
   // Windows special files (named pipes, device files) differ from POSIX;
   // this flag is not applicable.
   if (ctx.has("--copy-contents")) {
-    return std::unexpected("cp: --copy-contents is not supported on Windows");
+    return std::unexpected("--copy-contents is not supported on Windows");
   }
 
   // [COMPAT NO-OP] -g/--progress-bar: WinuxCmd extension for progress display.
@@ -999,9 +1243,17 @@ auto process_command(const CommandContext<N>& ctx) -> cp::Result<bool> {
 
   bool no_clobber =
       ctx.get<bool>("--no-clobber", false) || ctx.get<bool>("-n", false);
+  if (no_clobber) {
+    // [GNU 9.4] -n is deprecated in favour of --update=none.
+    safeErrorPrintLn(
+        "cp: warning: behavior of -n is non-portable and may change in "
+        "future; use --update=none instead");
+  }
   if (no_clobber && backup_enabled(ctx)) {
+    // GNU >=9.10 rephrased this diagnostic; the 8.32 wording is kept.
     return std::unexpected(
-        "options --backup and --no-clobber are mutually exclusive");
+        "options --backup and --no-clobber are mutually exclusive\n"
+        "Try 'cp --help' for more information.");
   }
 
   bool no_target_directory = ctx.get<bool>("-T", false) ||

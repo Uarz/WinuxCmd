@@ -358,7 +358,7 @@ auto confirm_overwrite(const std::string& dest_path) -> cp::Result<bool> {
   // OPTIMIZED: Avoid wstring concatenation
   safeErrorPrint("mv: overwrite '");
   safeErrorPrint(dest_path);
-  safeErrorPrint("'? (y/n) ");
+  safeErrorPrint("'? ");
   char response;
   std::cin.get(response);
   std::cin.ignore(1024, '\n');
@@ -422,6 +422,25 @@ auto move_single_path(const std::string& src_path, const std::string& dest_path,
   if (update_mode == UpdateMode::older && dest_exists &&
       !is_source_newer(wsrc_path, wdest_path)) {
     return true;
+  }
+
+  // [GNU] With no -f/-i/-n/-I, an unwritable destination is confirmed once
+  // when stdin is a terminal; non-tty stdin proceeds without prompting.
+  if (overwrite_mode == OverwriteMode::default_mode && dest_exists &&
+      _isatty(_fileno(stdin))) {
+    DWORD attrs = GetFileAttributesW(wdest_path.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES &&
+        (attrs & FILE_ATTRIBUTE_READONLY)) {
+      safeErrorPrint("mv: replace '");
+      safeErrorPrint(dest_path);
+      safeErrorPrint("', overriding mode 0444 (r--r--r--)? ");
+      char response = '\0';
+      std::cin.get(response);
+      std::cin.ignore(1024, '\n');
+      if (response != 'y' && response != 'Y') {
+        return true;
+      }
+    }
   }
 
   if (overwrite_mode == OverwriteMode::interactive_always) {
@@ -529,6 +548,35 @@ auto process_single_source(const std::string& src_path,
                            const MoveContext& move_ctx, bool dest_is_dir,
                            const CommandContext<MV_OPTIONS.size()>& ctx,
                            OverwriteMode overwrite_mode) -> cp::Result<bool> {
+  // [GNU] A trailing separator forces a directory operand: a regular file
+  // fails at stat time, while a symlink/junction passes stat but the rename
+  // fails ENOTDIR (uutils#10026).
+  bool trailing_sep =
+      src_path.size() > 1 &&
+      (src_path.back() == '/' || src_path.back() == '\\');
+  if (trailing_sep) {
+    std::string stripped = strip_trailing_slashes(src_path);
+    DWORD attrs = GetFileAttributesW(utf8_to_wstring(stripped).c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+      return std::unexpected("cannot stat '" + src_path +
+                             "': No such file or directory");
+    }
+    if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+      return std::unexpected("cannot stat '" + src_path +
+                             "': Not a directory");
+    }
+    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+      std::string final_dest = move_ctx.dest_path;
+      if (dest_is_dir) {
+        std::wstring wsrc = utf8_to_wstring(stripped);
+        final_dest += "\\" + wstring_to_utf8(PathFindFileNameW(wsrc.data()));
+      }
+      return std::unexpected("cannot move '" + src_path + "' to '" +
+                             final_dest + "': Not a directory");
+    }
+    // A real directory keeps moving normally.
+  }
+
   auto src_exists = check_path_exists(src_path);
   if (!src_exists) {
     return std::unexpected(src_exists.error());
@@ -596,7 +644,7 @@ auto process_command(const CommandContext<N>& ctx) -> cp::Result<bool> {
             safeErrorPrint(std::to_string(move_ctx.source_paths.size()));
             safeErrorPrint(" arguments");
           }
-          safeErrorPrint("? (y/n) ");
+          safeErrorPrint("? ");
           char response = '\0';
           std::cin >> response;
           if (response != 'y' && response != 'Y') {

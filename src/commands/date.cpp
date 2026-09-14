@@ -1164,8 +1164,15 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
   }
 
   // [GNU] military timezone specs: <digits><letter>, e.g. 9a, 1230z.
-  // A-I = UTC+1..+9, K-M = UTC+10..+12, N-Y = UTC-1..-12, Z = UTC;
-  // J is skipped and must be rejected (uutils #12684, #12895)
+  // A-I = UTC+1..+9, K-M = UTC+10..+12 (J is not in the sequence), N-Y =
+  // UTC-1..-12, Z = UTC, and J is the LOCAL zone.
+  //
+  // J was added upstream in gnulib commit 9cde39f8 (2022-05-17, "parse-datetime:
+  // support 'J' military time zone", released in coreutils 9.2), which added
+  // `{ "J", 'J', 0 }` to military_table and a matching `item: 'J'` grammar rule.
+  // Coreutils 8.32 predates it and rejects J outright, so J is the one military
+  // letter whose expected result depends on the oracle version: the differential
+  // cases carry an `oracle_version:` precondition for exactly that reason.
   {
     static const std::regex military_re(R"(^([0-9]{1,4})([A-Za-z])$)");
     std::smatch mil;
@@ -1182,12 +1189,12 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
         minute = std::stoi(digits.substr(digits.size() - 2));
       }
       bool ok = hour <= 23 && minute <= 59;
+      bool local_zone = false;
       int zone_offset_minutes = 0;
       if (letter == 'j') {
-        // [GNU] J is deliberately absent from the military zone table
-        // (uutils#12895 / WinuxCmd#354): both "1024j" and "1024J" must be
-        // rejected as invalid dates.
-        ok = false;
+        // J is the local military zone: the wall time is local time, so no
+        // shift is applied below.
+        local_zone = true;
       } else if (letter >= 'a' && letter <= 'i') {
         zone_offset_minutes = (letter - 'a' + 1) * 60;
       } else if (letter >= 'k' && letter <= 'm') {
@@ -1217,6 +1224,7 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
 
       auto as_local = local_system_time_to_filetime(target);
       if (!as_local) return std::nullopt;
+      if (local_zone) return as_local;
       // Shift from "wall time as local" to "wall time in the target zone"
       const int local_offset = timezone_offset_minutes(now_ft, false);
       return add_seconds(*as_local, static_cast<long long>(

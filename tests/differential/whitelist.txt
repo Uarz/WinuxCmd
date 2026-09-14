@@ -1,5 +1,7 @@
 # case path<TAB>reason
-# Verified against GNU coreutils 9.4 (WSL) on the current build. Runner pins WINUX_LANG=en.
+# Verified against GNU coreutils 9.4 (WSL) on the current build. The runner pins
+# WINUX_LANG=en and runs *both* sides under ORACLE_LOCALE (C by default), so a
+# verdict never depends on the locale of the shell that started the runner.
 regressions/21-id-group.case	platform: Windows has no POSIX gid; id -g prints the primary-group RID (197121) instead of /etc/group gid
 regressions/23-cp-link-option.case	environment: CreateHardLinkW cannot hardlink across \\wsl.localhost 9p shares in the WSL-side runner; verified working (hardlink count 2) on native NTFS
 corpus/ln/35-hard.case	environment: same 9p hardlink limitation as cp -l; hard links created on NTFS match GNU
@@ -15,17 +17,19 @@ regressions/12-seq-limit.case	platform: winux seq is slower for 1M-line output; 
 corpus/namei/01-basic.case	platform: output format differs between GNU namei (util-linux) and WinuxCmd (Windows path resolution steps)
 corpus/namei/02-no-exist.case	platform: GNU namei exits 1 for non-existent paths; WinuxCmd exits 0
 corpus/which/01-basic.case	environment: PATH differs between WSL (/usr/bin/sh) and Windows (C:\Windows\System32\sh.exe)
-# Byte-verified 2026-09-11: these four differ ONLY in message quoting style.
+# Byte-verified 2026-09-11: these differ ONLY in message quoting style.
 # GNU quote() emits Unicode curly quotes U+2018/U+2019 under a UTF-8 locale
 # (C.UTF-8/en_US.UTF-8); WinuxCmd emits ASCII consistently. Text, stdout and
 # exit codes are identical (verified with od -c on both sides). Under an
 # LC_ALL=C oracle they match byte-for-byte, which proves it is a quoting-style
-# difference, not a semantic gap. Kept whitelisted because the documented
-# oracle (WSL GNU 9.4 / Git Bash 8.32) runs in a UTF-8 locale.
-corpus/date/03-12hour-invalid.case	format: GNU Unicode curly quotes vs WinuxCmd ASCII quotes in invalid-date stderr; byte-identical under LC_ALL=C oracle (M3 wording batch)
-corpus/date/11-military-j.case	format: same quoting-style-only difference as date/03 (invalid military timezone). M3 wording batch
-corpus/date/12-military-J.case	format: same quoting-style-only difference as date/03 (invalid military timezone). M3 wording batch
-corpus/seq/01-invalid-float.case	format: same quoting-style-only difference as date/03 (invalid float arg). M3 wording batch
+# difference, not a semantic gap.
+#
+# runner.sh now pins the oracle to LC_ALL=C by default, so these entries are
+# unreachable under the default configuration and the cases PASS; they remain
+# listed for runs that deliberately set ORACLE_LOCALE to a UTF-8 locale, which
+# is the only configuration in which the quoting style can differ.
+corpus/date/03-12hour-invalid.case	format: GNU Unicode curly quotes vs WinuxCmd ASCII quotes in invalid-date stderr; byte-identical under the default LC_ALL=C oracle
+corpus/seq/01-invalid-float.case	format: same quoting-style-only difference as date/03 (invalid float arg)
 corpus/od/01-invalid-utf8-operand.case	format: WinuxCmd renders the invalid-UTF-8 operand as '?' (replacement char); GNU 8.32 (newlib, C locale) renders it as ''$'\377''. rc/text identical (M3 wording batch)
 
 # Round-5 verified known differences (oracle-side or platform, not product defects)
@@ -38,8 +42,7 @@ regressions/41-stdbuf-line-mode.case	platform: Git Bash oracle stdbuf itself fai
 
 # PR #996 review follow-up. date/23 pins "invalid relative amount must be
 # invalid date, not a crash"; its stderr differs only in quoting style (same
-# cause as date/03). It does execute under an MSYS2 oracle, so it is whitelisted
-# as a genuine output difference.
+# cause as date/03), so it PASSes under the default LC_ALL=C oracle too.
 #
 # cat/03 and tee/02 are deliberately NOT whitelisted. Their expected GNU text
 # ("cat: -: Bad file descriptor" / "tee: read error: Bad file descriptor") comes
@@ -51,4 +54,12 @@ regressions/41-stdbuf-line-mode.case	platform: Git Bash oracle stdbuf itself fai
 # byte-identical on this path). Recording it here would have disguised an
 # unrunnable case as a known product difference. They now carry
 # `oracle: linux` and are SKIPped under a non-Linux oracle instead.
+#
+# date/11-military-j and date/12-military-J are likewise NOT whitelisted any
+# more. Their old "quoting-style-only" reason was wrong for any oracle from
+# coreutils 9.2 on: gnulib commit 9cde39f8 (2022-05-17) made 'J' a *valid*
+# military zone meaning local time, so a modern GNU accepts 1024j while an 8.32
+# GNU rejects it - a semantic difference (exit 0 vs 1), not a formatting one.
+# The cases now carry `oracle_version: >= 9.2` and are SKIPped below that, which
+# keeps KNOWN_DIFF meaning "executed, results differ".
 corpus/date/23-rel-overflow.case	format: same quoting-style-only difference as date/03 (invalid date); rc=1 and "invalid date" text identical

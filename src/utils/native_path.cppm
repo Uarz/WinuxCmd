@@ -180,6 +180,62 @@ export auto resolve_pseudo_device_w(std::wstring_view path)
   return std::nullopt;
 }
 
+// Which inherited standard stream an operand names, if any.
+//
+// POSIX /dev/stdin, /dev/stdout and /dev/stderr are symlinks to /proc/self/fd/N:
+// they resolve to *this process's own descriptors*, so `cat /dev/stdin < file`
+// reads the file and `tee /dev/stdout > file` writes the file. Mapping them onto
+// the DOS console devices loses that redirection, and for stdin it is worse than
+// a wrong result - opening CONIN$ when descriptor 0 is a pipe makes the command
+// wait on the console forever instead of reading its input (#276 follow-up).
+//
+// Open sites must therefore consume the inherited handle instead of a path.
+// resolve_pseudo_device_w still answers with the console device name so that
+// attribute probes (ls, stat, test) continue to see a valid character device.
+export enum class StandardStream : unsigned char {
+  none = 0,
+  in,
+  out,
+  err,
+};
+
+export auto standard_stream_w(std::wstring_view path) -> StandardStream {
+  if (path == L"/dev/stdin" || path == L"/dev/fd/0") return StandardStream::in;
+  if (path == L"/dev/stdout" || path == L"/dev/fd/1") return StandardStream::out;
+  if (path == L"/dev/stderr" || path == L"/dev/fd/2") return StandardStream::err;
+  return StandardStream::none;
+}
+
+export auto standard_stream(std::string_view path) -> StandardStream {
+  return standard_stream_w(from_utf8(path));
+}
+
+// Duplicate the inherited standard handle so a tool reads or writes the stream
+// the shell actually handed it, redirection included. The caller owns the
+// returned handle. INVALID_HANDLE_VALUE when the descriptor is unavailable -
+// for example when the shell closed it with `<&-`, which GNU also reports as a
+// bad file descriptor rather than as an empty stream (#973).
+export auto duplicate_standard_handle(StandardStream stream) -> HANDLE {
+  DWORD id = STD_INPUT_HANDLE;
+  if (stream == StandardStream::out) {
+    id = STD_OUTPUT_HANDLE;
+  } else if (stream == StandardStream::err) {
+    id = STD_ERROR_HANDLE;
+  }
+
+  const HANDLE source = GetStdHandle(id);
+  if (source == nullptr || source == INVALID_HANDLE_VALUE) {
+    return INVALID_HANDLE_VALUE;
+  }
+
+  HANDLE copy = INVALID_HANDLE_VALUE;
+  if (!DuplicateHandle(GetCurrentProcess(), source, GetCurrentProcess(), &copy,
+                       0, FALSE, DUPLICATE_SAME_ACCESS)) {
+    return INVALID_HANDLE_VALUE;
+  }
+  return copy;
+}
+
 export auto make_api_path_operand_w(std::wstring_view path) -> ApiPathOperand {
   ApiPathOperand operand;
   operand.original = std::wstring(path);
@@ -204,13 +260,119 @@ export auto make_api_path_operand(std::string_view path) -> ApiPathOperand {
   return make_api_path_operand_w(from_utf8(path));
 }
 
+// True when the operand is a bare DOS device name.
+//
+// Device names resolve through the Win32 device namespace, which the \\?\
+// extended-length prefix bypasses: to_extended_path would run
+// GetFullPathNameW("NUL"), resolve the name against the current directory and
+// hand back "\\?\<cwd>\NUL" - an ordinary, missing file. Every Win32 call must
+// therefore receive these names verbatim, which is exactly the invariant
+// make_api_path_operand_w establishes when it resolves a pseudo-device; this
+// predicate lets the attribute probes honour it too. Verified with
+// GetFileAttributesW: "NUL" -> 0x20 (valid), "\\?\<cwd>\NUL" -> INVALID.
+// Keep the list in sync with resolve_pseudo_device_w, which is where the
+// pseudo-devices that reach this function are produced.
+export auto is_dos_device_name_w(std::wstring_view path) -> bool {
+  path = strip_trailing_separators(path);
+
+  // An already explicit device namespace ("\\.\NUL") needs no adjustment.
+  if (path.size() > 4 && path.compare(0, 4, L"\\\\.\\") == 0) return true;
+
+  // A device name only resolves when it is the whole operand: "dir\NUL" names
+  // an ordinary file, and so does "\\?\C:\dir\NUL".
+  if (path.find_first_of(L"\\/") != std::wstring_view::npos) return false;
+
+  std::wstring upper;
+  upper.reserve(path.size());
+  for (const wchar_t ch : path) {
+    upper.push_back((ch >= L'a' && ch <= L'z')
+                        ? static_cast<wchar_t>(ch - L'a' + L'A')
+                        : ch);
+  }
+
+  if (upper == L"NUL" || upper == L"CON" || upper == L"PRN" || upper == L"AUX" ||
+      upper == L"CONIN$" || upper == L"CONOUT$") {
+    return true;
+  }
+  return upper.size() == 4 &&
+         (upper.starts_with(L"COM") || upper.starts_with(L"LPT")) &&
+         upper[3] >= L'1' && upper[3] <= L'9';
+}
+
+// True when the operand denotes a Windows character device, either directly as
+// a DOS device name or as a POSIX pseudo-device that resolves onto one. GNU
+// reports /dev/null as a character special file, so `test -c /dev/null` is true
+// and `test -b /dev/null` is false there; both predicates need this answer.
+export auto is_character_device_w(std::wstring_view path) -> bool {
+  if (auto pseudo = resolve_pseudo_device_w(path)) {
+    return is_dos_device_name_w(*pseudo);
+  }
+  return is_dos_device_name_w(path);
+}
+
+export auto is_character_device(std::string_view path) -> bool {
+  return is_character_device_w(from_utf8(path));
+}
+
 export auto attributes_w(std::wstring_view path) -> DWORD {
+  // A DOS device name must reach the API verbatim; see is_dos_device_name_w.
+  if (is_dos_device_name_w(path)) {
+    const std::wstring verbatim(strip_trailing_separators(path));
+    return GetFileAttributesW(verbatim.c_str());
+  }
+
   // Keep all attribute probes on the same extended-path API boundary as
   // file_io. This avoids MAX_PATH failures for otherwise valid paths.
   const std::wstring native = path.starts_with(L"\\\\?\\")
                                   ? std::wstring(path)
                                   : to_extended_path(path);
   return GetFileAttributesW(native.c_str());
+}
+
+// Full attribute record for an operand that may name a character device.
+//
+// GetFileAttributesExW is the one attribute API that rejects DOS device names
+// outright. Probed against kernel32 on Windows 11:
+//
+//   GetFileAttributesW("NUL")      -> 0x20   (FILE_ATTRIBUTE_ARCHIVE)
+//   GetFileAttributesExW("NUL")    -> FALSE, ERROR_INVALID_PARAMETER (87)
+//   GetFileAttributesExW("CONIN$") -> FALSE, ERROR_INVALID_FUNCTION (1)
+//
+// So a tool that renders a full stat record cannot use the Ex variant for
+// /dev/* operands: the device resolves correctly and then the query fails. This
+// helper keeps both APIs behind one device-aware call - device names are
+// answered from GetFileAttributesW with a zeroed size/time record, which is
+// exactly what a character device reports anyway (GNU prints a size of 0 for
+// /dev/null). Ordinary paths keep the Ex variant so long paths and reparse
+// points behave as before.
+export auto file_attribute_data_w(std::wstring_view path,
+                                  WIN32_FILE_ATTRIBUTE_DATA& out) -> bool {
+  out = WIN32_FILE_ATTRIBUTE_DATA{};
+
+  std::wstring probe;
+  if (auto pseudo = resolve_pseudo_device_w(path)) {
+    probe = *pseudo;
+  } else {
+    probe.assign(path);
+  }
+
+  if (is_dos_device_name_w(probe)) {
+    const std::wstring verbatim(strip_trailing_separators(probe));
+    const DWORD attrs = GetFileAttributesW(verbatim.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) return false;
+    out.dwFileAttributes = attrs;
+    return true;
+  }
+
+  const std::wstring native =
+      probe.starts_with(L"\\\\?\\") ? probe : to_extended_path(probe);
+  return GetFileAttributesExW(native.c_str(), GetFileExInfoStandard, &out) !=
+         0;
+}
+
+export auto file_attribute_data(std::string_view path,
+                                WIN32_FILE_ATTRIBUTE_DATA& out) -> bool {
+  return file_attribute_data_w(from_utf8(path), out);
 }
 
 export auto valid_attributes(DWORD attrs) -> bool {

@@ -106,6 +106,22 @@ auto read_all_stdin() -> std::expected<std::string, std::string> {
 
 auto read_all_file(std::string_view filename)
     -> std::expected<std::string, std::string> {
+  // /dev/stdin names this process's own descriptor 0, not the console: read the
+  // inherited handle so redirection is honoured and a piped stdin can never be
+  // mistaken for a console and block forever (#276 follow-up).
+  if (native_path::standard_stream(filename) ==
+      native_path::StandardStream::in) {
+    const HANDLE stream = native_path::duplicate_standard_handle(
+        native_path::StandardStream::in);
+    if (stream == INVALID_HANDLE_VALUE) {
+      return std::unexpected(winux::i18n::format(
+          "utils.file.error.open", "cannot open '{}' for reading: {}",
+          filename, "Bad file descriptor"));
+    }
+    UniqueHandle close_stream(stream);
+    return read_handle_to_string(close_stream.get(), filename);
+  }
+
   auto operand = native_path::make_api_path_operand(filename);
   if (operand.had_trailing_separator) {
     const DWORD attrs = native_path::attributes_w(operand.extended);

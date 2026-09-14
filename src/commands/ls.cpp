@@ -453,6 +453,15 @@ auto probe_path(const std::wstring &path) -> PathProbe {
 }
 
 auto normalize_metadata_probe_path(const std::wstring &path) -> std::wstring {
+  // [GNU] POSIX pseudo-devices have no directory entry, so
+  // std::filesystem::absolute() rewrites "/dev/null" into "<cwd>\dev\null" - an
+  // ordinary missing file - and the operand is then reported as inaccessible
+  // even though the shared operand boundary resolves it correctly. Keep the
+  // spelling verbatim so make_api_path_operand_w can map it onto the Windows
+  // device (#276 follow-up).
+  if (native_path::resolve_pseudo_device_w(path)) {
+    return path;
+  }
   try {
     return std::filesystem::absolute(std::filesystem::path(path))
         .lexically_normal()
@@ -3004,17 +3013,32 @@ auto list_file(const std::string &path,
       native_path::make_api_path_operand_w(metadata_probe_wpath);
   const std::wstring operand_display_name = wpath;
 
-  // Extract just the filename for display
-  WIN32_FIND_DATAW find_data;
+  // Extract just the filename for display.
+  //
+  // [GNU] A character device is not a directory entry, so FindFirstFileW can
+  // fail on the resolved device name (NUL, CONIN$, CONOUT$) even though
+  // GetFileAttributesW reports it. Attributes are therefore the authoritative
+  // existence test and the find record is only a metadata refinement; without
+  // this, `ls /dev/null` degrades into "cannot access" (#276 follow-up).
+  WIN32_FIND_DATAW find_data{};
   HANDLE hFind = FindFirstFileW(metadata_operand.extended.c_str(), &find_data);
 
   if (hFind == INVALID_HANDLE_VALUE) {
-    return std::unexpected("cannot access '" + path +
-                           "': No such file or directory");
+    const DWORD device_attributes =
+        native_path::attributes_w(metadata_operand.extended);
+    if (!native_path::valid_attributes(device_attributes)) {
+      return std::unexpected("cannot access '" + path +
+                             "': No such file or directory");
+    }
+    find_data.dwFileAttributes = device_attributes;
+    const std::wstring leaf =
+        std::filesystem::path(metadata_probe_wpath).filename().native();
+    wcsncpy_s(find_data.cFileName, leaf.c_str(), _TRUNCATE);
+  } else {
+    FindClose(hFind);
   }
 
   std::wstring filename = find_data.cFileName;
-  FindClose(hFind);
 
   WIN32_FIND_DATAW display_find_data = find_data;
   std::wstring metadata_name = filename;

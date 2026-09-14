@@ -209,52 +209,50 @@ auto parse_signal(const std::string& signal) -> cp::Result<int> {
 }
 
 auto parse_duration(const std::string& duration) -> cp::Result<int64_t> {
-  // Support: N, Ns, Nm, Nh, Nd
-  std::string s = duration;
-  if (auto first = s.find_first_not_of(" \t\r\n");
-      first != std::string::npos && first > 0) {
-    s.erase(0, first);
-  }
-
-  if (s.empty()) {
-    return std::unexpected("invalid time interval '" + duration + "'");
-  }
+  // [GNU] DURATION is parsed like strtod in the C locale (hexadecimal floats
+  // such as "0x1d" = 29, "inf", a leading '+', and leading whitespace are all
+  // valid), followed by at most one lower-case suffix: 's' (default), 'm',
+  // 'h', or 'd' (uutils #7671, #7678). NaN and negative values are rejected.
+  const char* text = duration.c_str();
+  char* end = nullptr;
+  double value = std::strtod(text, &end);
 
   int64_t multiplier = 1;
-  if (s.size() > 1) {
-    char suffix = s.back();
-
-    switch (suffix) {
-      case 's':
-      case 'S':
-        multiplier = 1;
-        s = s.substr(0, s.size() - 1);
-        break;
-      case 'm':
-      case 'M':
-        multiplier = 60;
-        s = s.substr(0, s.size() - 1);
-        break;
-      case 'h':
-      case 'H':
-        multiplier = 3600;
-        s = s.substr(0, s.size() - 1);
-        break;
-      case 'd':
-      case 'D':
-        multiplier = 86400;
-        s = s.substr(0, s.size() - 1);
-        break;
+  bool valid = end != text && !(value < 0) && !std::isnan(value);
+  if (valid && *end != '\0') {
+    if (*(end + 1) != '\0') {
+      valid = false;
+    } else {
+      switch (*end) {
+        case 's':
+          break;
+        case 'm':
+          multiplier = 60;
+          break;
+        case 'h':
+          multiplier = 3600;
+          break;
+        case 'd':
+          multiplier = 86400;
+          break;
+        default:
+          valid = false;
+          break;
+      }
     }
   }
-
-  double parsed_value = 0.0;
-  auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), parsed_value);
-  if (ec != std::errc() || ptr != s.data() + s.size() || parsed_value < 0) {
+  if (!valid) {
     return std::unexpected("invalid time interval '" + duration + "'");
   }
-  return static_cast<int64_t>(parsed_value * static_cast<double>(multiplier) *
-                              1000.0);  // Convert to milliseconds
+
+  double ms = value * static_cast<double>(multiplier) * 1000.0;
+  // A non-finite or huge interval never fires, like GNU's unbound timeout.
+  if (!std::isfinite(ms) ||
+      ms >= static_cast<double>(std::numeric_limits<int64_t>::max()) ||
+      ms >= 4294967294.0) {  // one less than the INFINITE marker
+    return int64_t{0};
+  }
+  return static_cast<int64_t>(std::ceil(ms));  // Convert to milliseconds
 }
 
 auto build_config(const CommandContext<TIMEOUT_OPTIONS.size()>& ctx)

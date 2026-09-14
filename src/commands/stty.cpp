@@ -54,7 +54,12 @@ auto constexpr STTY_OPTIONS = std::array{
            "print all current settings in a stty-readable form"),
     // [DIFFERS] -F, --file
     OPTION("-F", "--file", "open and use the specified device instead of stdin",
-           STRING_TYPE)};
+           STRING_TYPE),
+    // [GNU] hidden developer option, spelled "---debug" on the command
+    // line (stty.c {"-debug"}). Accepted and ignored: its only effect in
+    // GNU is dumping termios bytes when tcsetattr cannot apply a mode,
+    // which has no Windows console equivalent.
+    OPTION("", "---debug", "", BOOL_TYPE)};
 
 namespace stty_pipeline {
 namespace cp = core::pipeline;

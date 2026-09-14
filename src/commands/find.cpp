@@ -39,6 +39,7 @@ import std;
 import core;
 import utils;
 import container;
+import version;
 
 using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
@@ -392,7 +393,16 @@ auto constexpr FIND_OPTIONS = std::array{
     // [GNU]
     OPTION("-o", "", "or expression"),
     // [GNU]
-    OPTION("-or", "", "or expression")};
+    OPTION("-or", "", "or expression"),
+    // [GNU] findutils accepts -help/-version (single dash) like every
+    // other predicate-style option.
+    OPTION("-help", "", "display this help and exit"),
+    // [GNU]
+    OPTION("-version", "", "output version information and exit"),
+    // [GNU] SELinux context predicate: on a system without SELinux GNU
+    // find reports "invalid predicate -context: SELinux is not enabled."
+    OPTION("-context", "", "file matches SELinux security context CTX",
+           STRING_TYPE)};
 
 namespace find_pipeline {
 namespace cp = core::pipeline;
@@ -3899,6 +3909,27 @@ REGISTER_COMMAND(find, "find", "find [path...] [expression]",
                  "grep(1), ls(1)", "WinuxCmd", "Copyright © 2026 WinuxCmd",
                  FIND_OPTIONS) {
   using namespace find_pipeline;
+
+  // [GNU] -help/-version/-context act where they appear on the command
+  // line, so honor whichever comes first (a "--" ends option processing).
+  for (const auto& arg : ctx.raw_args) {
+    if (arg == "--") break;
+    if (arg == "-help") {
+      cmd::meta::Registry::print_help("find");
+      return 0;
+    }
+    if (arg == "-version") {
+      safePrintLn("find (WinuxCmd) " + std::string(WinuxCmd::VERSION_STRING));
+      return 0;
+    }
+    if (arg == "-context") {
+      // findutils parser.c: with SELinux support compiled out the
+      // predicate is rejected outright.
+      safeErrorPrintLn(
+          "find: invalid predicate -context: SELinux is not enabled.");
+      return 1;
+    }
+  }
 
   auto cfg = build_config(ctx);
   if (!cfg) {

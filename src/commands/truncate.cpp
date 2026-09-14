@@ -74,6 +74,7 @@ struct SizeSpec {
 struct Config {
   bool no_create = false;
   bool io_blocks = false;
+  bool got_size = false;
   SizeSpec size;
   std::string reference_file;
   SmallVector<std::string, 64> files;
@@ -257,7 +258,8 @@ auto build_config(const CommandContext<TRUNCATE_OPTIONS.size()>& ctx)
     size_opt = ctx.get<std::string>("-s", "");
   }
 
-  if (ctx.has("--size") || ctx.has("-s")) {
+  cfg.got_size = ctx.has("--size") || ctx.has("-s");
+  if (cfg.got_size) {
     // [GNU] an explicitly empty -s value is a parse error, not a missing
     // operand (uutils #13576)
     auto size_result = parse_size(size_opt);
@@ -265,18 +267,24 @@ auto build_config(const CommandContext<TRUNCATE_OPTIONS.size()>& ctx)
       return std::unexpected(size_result.error());
     }
     cfg.size = *size_result;
-  } else {
-    auto ref_opt = ctx.get<std::string>("--reference", "");
-    if (ref_opt.empty()) {
-      ref_opt = ctx.get<std::string>("-r", "");
-    }
+  }
 
-    if (!ref_opt.empty()) {
-      cfg.reference_file = ref_opt;
-    } else {
-      return std::unexpected(
-          "you must specify either '--size' or '--reference'");
-    }
+  auto ref_opt = ctx.get<std::string>("--reference", "");
+  if (ref_opt.empty()) {
+    ref_opt = ctx.get<std::string>("-r", "");
+  }
+  cfg.reference_file = ref_opt;
+
+  // [GNU] option validation order (truncate.c:291-302): a reference may be
+  // combined with a *relative* --size, never an absolute one
+  // (uutils #12963).
+  if (!cfg.got_size && cfg.reference_file.empty()) {
+    return std::unexpected("you must specify either '--size' or '--reference'");
+  }
+  if (!cfg.reference_file.empty() && cfg.got_size &&
+      cfg.size.mode == SizeMode::Absolute) {
+    return std::unexpected(
+        "you must specify a relative '--size' with '--reference'");
   }
 
   for (auto arg : ctx.positionals) {
@@ -429,10 +437,20 @@ auto run(const Config& cfg) -> int {
   std::optional<int64_t> reference_size;
 
   if (!cfg.reference_file.empty()) {
+    // [GNU] the reference is statted before any file is touched:
+    // "cannot stat 'R': ..." for a missing one, then "cannot get the size
+    // of 'R': ..." when its size cannot be determined (uutils #12963).
+    auto ref_operand = native_path::make_api_path_operand(cfg.reference_file);
+    DWORD ref_attrs = native_path::operand_target_attributes_w(ref_operand);
+    if (!native_path::valid_attributes(ref_attrs)) {
+      safeErrorPrintLn("truncate: cannot stat '" + cfg.reference_file +
+                       "': No such file or directory");
+      return 1;
+    }
     auto ref_size = get_file_size(cfg.reference_file);
     if (!ref_size) {
-      safeErrorPrintLn("truncate: cannot stat reference file '" +
-                       cfg.reference_file + "'");
+      safeErrorPrintLn("truncate: cannot get the size of '" +
+                       cfg.reference_file + "': No such device or address");
       return 1;
     }
     reference_size = *ref_size;
@@ -466,10 +484,15 @@ auto run(const Config& cfg) -> int {
       current_size = *current;
     }
 
-    int64_t target_size = reference_size.value_or(0);
-    if (!reference_size) {
+    // [GNU] with --reference, a relative SIZE applies to the reference
+    // file's size rather than the target file's own size (uutils #12963).
+    int64_t target_size;
+    if (reference_size && !cfg.got_size) {
+      target_size = *reference_size;
+    } else {
+      const int64_t base_size = reference_size.value_or(current_size);
       auto applied = apply_size_mode(
-          current_size, cfg.size,
+          base_size, cfg.size,
           cfg.io_blocks ? io_block_size_for(file) : static_cast<uint64_t>(1));
       if (!applied) {
         safeErrorPrintLn("truncate: " + std::string(applied.error()));
@@ -517,6 +540,10 @@ REGISTER_COMMAND(
   auto cfg_result = build_config(ctx);
   if (!cfg_result) {
     cp::report_error(cfg_result, L"truncate");
+    const std::string err(cfg_result.error());
+    if (err.contains("you must specify") || err == "missing file operand") {
+      safeErrorPrintLn("Try 'truncate --help' for more information.");
+    }
     return 1;
   }
 

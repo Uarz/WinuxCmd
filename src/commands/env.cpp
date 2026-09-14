@@ -181,6 +181,7 @@ enum class ExecutableLookupStatus {
   Found,
   NotFound,
   NotExecutable,
+  NotADirectory,
 };
 
 struct ExecutableLookupResult {
@@ -208,6 +209,21 @@ auto resolve_executable(std::string_view program,
     std::filesystem::path base{std::string(program)};
     if (auto match = scan_candidates(base)) {
       return {ExecutableLookupStatus::Found, std::move(match)};
+    }
+    // [GNU] a trailing separator after a regular file is ENOTDIR
+    // ("Not a directory", exit 126), not ENOENT (uutils #12778).
+    if (program.ends_with('/') || program.ends_with('\\')) {
+      std::string stripped(program);
+      while (!stripped.empty() &&
+             (stripped.back() == '/' || stripped.back() == '\\')) {
+        stripped.pop_back();
+      }
+      std::error_code ec;
+      std::filesystem::path stripped_path{stripped};
+      if (std::filesystem::exists(stripped_path, ec) &&
+          !std::filesystem::is_directory(stripped_path, ec)) {
+        return {ExecutableLookupStatus::NotADirectory, std::nullopt};
+      }
     }
     return {found_non_executable ? ExecutableLookupStatus::NotExecutable
                                  : ExecutableLookupStatus::NotFound,
@@ -640,10 +656,9 @@ auto build_config(const CommandContext<ENV_OPTIONS.size()>& ctx)
                            ctx.get<bool>("-i", false);
   cfg.null_terminated =
       ctx.get<bool>("--null", false) || ctx.get<bool>("-0", false);
+  // [GNU] -u/--unset share one option meta: a single get_all by either
+  // spelling already returns every occurrence in argv order.
   cfg.unset_names = ctx.get_all<std::string>("--unset");
-  auto short_unsets = ctx.get_all<std::string>("-u");
-  cfg.unset_names.insert(cfg.unset_names.end(), short_unsets.begin(),
-                         short_unsets.end());
 
   for (const auto& occurrence : ctx.options.occurrences()) {
     if (!ctx.metas || occurrence.index >= ENV_OPTIONS.size()) {
@@ -678,9 +693,6 @@ auto build_config(const CommandContext<ENV_OPTIONS.size()>& ctx)
 
   cfg.debug_level = ctx.count({"--debug", "-v"});
   cfg.debug = cfg.debug_level > 0;
-  if (cfg.debug_level >= 2) {
-    for (auto arg : ctx.raw_args) cfg.raw_args.emplace_back(arg);
-  }
 
   if (!cfg.split_string.empty()) {
     auto split_args = split_string_args(cfg.split_string);
@@ -772,39 +784,38 @@ auto make_working_directory_arg(const std::string& chdir, std::wstring& storage)
   return storage.c_str();
 }
 
+// [GNU] -v/--debug traces each processing step on stderr in GNU's format:
+// "cleaning environ", "unset:    NAME" (for every -u operand), then
+// "setenv:   NAME=VALUE" for each assignment (env.c devmsg, uutils #14171).
 auto materialize_environment(const Config& cfg)
     -> std::map<std::string, std::string> {
   std::map<std::string, std::string> vars;
   if (!cfg.ignore_environment) {
     vars = parse_env_block();
-    if (cfg.debug) {
-      safeErrorPrint("env: loaded " + std::to_string(vars.size()) +
-                     " variables from environment\n");
-    }
   } else if (cfg.debug) {
-    safeErrorPrint("env: starting with empty environment (-i)\n");
+    safeErrorPrint("cleaning environ\n");
   }
 
   for (const auto& [k, v] : cfg.file_assignments) {
     if (cfg.debug) {
-      safeErrorPrint("env: file set '" + k + "'='" + v + "'\n");
+      safeErrorPrint("setenv:   " + k + "=" + v + "\n");
     }
     vars[k] = v;
   }
 
   for (const auto& unset_name : cfg.unset_names) {
+    if (cfg.debug) {
+      safeErrorPrint("unset:    " + unset_name + "\n");
+    }
     auto it = vars.find(unset_name);
     if (it != vars.end()) {
-      if (cfg.debug) {
-        safeErrorPrint("env: unset '" + unset_name + "'\n");
-      }
       vars.erase(it);
     }
   }
 
   for (const auto& [k, v] : cfg.assignments) {
     if (cfg.debug) {
-      safeErrorPrint("env: set '" + k + "'='" + v + "'\n");
+      safeErrorPrint("setenv:   " + k + "=" + v + "\n");
     }
     vars[k] = v;
   }
@@ -831,15 +842,20 @@ auto env_windows_error_text(DWORD error) -> std::string {
 auto run_command(const Config& cfg,
                  const std::map<std::string, std::string>& vars) -> int {
   if (cfg.debug) {
-    auto arg0 = cfg.argv0.empty() ? cfg.command.front() : cfg.argv0;
-    safeErrorPrint("executing: " + cfg.command.front() + "\n");
-    if (!cfg.argv0.empty()) {
-      safeErrorPrint("argv0:     " + cfg.argv0 + "\n");
+    // [GNU] trace order: chdir, argv0, then executing + quoted args
+    // (env.c:902-923, uutils #14171).
+    if (!cfg.chdir.empty()) {
+      safeErrorPrint("chdir:    '" + cfg.chdir + "'\n");
     }
-    safeErrorPrint("   arg[0]= " + arg0 + "\n");
+    if (!cfg.argv0.empty()) {
+      safeErrorPrint("argv0:     '" + cfg.argv0 + "'\n");
+    }
+    safeErrorPrint("executing: " + cfg.command.front() + "\n");
+    auto arg0 = cfg.argv0.empty() ? cfg.command.front() : cfg.argv0;
+    safeErrorPrint("   arg[0]= '" + arg0 + "'\n");
     for (size_t i = 1; i < cfg.command.size(); ++i) {
-      safeErrorPrint("   arg[" + std::to_string(i) + "]= " + cfg.command[i] +
-                     "\n");
+      safeErrorPrint("   arg[" + std::to_string(i) + "]= '" + cfg.command[i] +
+                     "'\n");
     }
   }
 
@@ -847,6 +863,8 @@ auto run_command(const Config& cfg,
   if (lookup.status != ExecutableLookupStatus::Found) {
     const DWORD error = lookup.status == ExecutableLookupStatus::NotExecutable
                             ? ERROR_ACCESS_DENIED
+                        : lookup.status == ExecutableLookupStatus::NotADirectory
+                            ? ERROR_DIRECTORY
                             : ERROR_FILE_NOT_FOUND;
     safeErrorPrint("env: failed to run command '" + cfg.command.front() +
                    "': " + env_windows_error_text(error) + "\n");
@@ -864,10 +882,6 @@ auto run_command(const Config& cfg,
   if (!cfg.chdir.empty() && working_directory_arg == nullptr) {
     cp::report_custom_error(L"env", L"cannot change directory");
     return 125;
-  }
-
-  if (cfg.debug && !cfg.chdir.empty()) {
-    safeErrorPrint("env: working directory: " + cfg.chdir + "\n");
   }
 
   STARTUPINFOW si{sizeof(si)};
@@ -894,11 +908,6 @@ auto run_command(const Config& cfg,
   CloseHandle(pi.hProcess);
   CloseHandle(pi.hThread);
 
-  if (cfg.debug) {
-    safeErrorPrint("env: command exited with code " +
-                   std::to_string(exit_code) + "\n");
-  }
-
   return static_cast<int>(exit_code);
 }
 
@@ -916,14 +925,6 @@ auto run(const Config& cfg) -> int {
   if (cfg.null_terminated && !cfg.command.empty()) {
     cp::report_custom_error(L"env", L"cannot specify --null (-0) with command");
     return 125;
-  }
-
-  if (cfg.debug_level >= 2) {
-    safeErrorPrint("input args:\n");
-    for (size_t i = 0; i < cfg.raw_args.size(); ++i) {
-      safeErrorPrint("arg[" + std::to_string(i) + "]: " + cfg.raw_args[i] +
-                     "\n");
-    }
   }
 
   auto vars = materialize_environment(cfg);

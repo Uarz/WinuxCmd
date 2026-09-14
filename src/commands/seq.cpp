@@ -554,8 +554,7 @@ auto run(const Config& cfg) -> int {
       const double next = cfg.first + i * cfg.increment;
       if (!std::isfinite(next) || !in_range(next)) {
         if (std::isfinite(next) && print_extra_number(next, prev)) {
-          max_width =
-              std::max(max_width, format_number(next, cfg).size());
+          max_width = std::max(max_width, format_number(next, cfg).size());
         }
         break;
       }

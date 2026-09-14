@@ -345,6 +345,52 @@ auto zone_time_to_filetime(const SYSTEMTIME& st,
   return local_system_time_to_filetime(st);
 }
 
+// Inverse of zone_time_to_filetime: break a FILETIME down into wall-clock
+// fields in the effective zone (TZ env fixed offset, else system local).
+auto filetime_to_zone_system_time(const FILETIME& ft)
+    -> std::optional<SYSTEMTIME> {
+  if (auto east = env_tz_offset_east()) {
+    FILETIME shifted = add_seconds(ft, static_cast<long long>(*east) * 60);
+    SYSTEMTIME st{};
+    if (!FileTimeToSystemTime(&shifted, &st)) return std::nullopt;
+    return st;
+  }
+  return filetime_to_local_system_time(ft);
+}
+
+// [GNU] Calendar month arithmetic like parse-datetime.y's rel.month:
+// shifting Mar 31 back one month yields Mar 3 (mktime day overflow rolls
+// forward), not Feb 28. Verified: touch -d '2026-03-31 1 month ago' ->
+// 2026-03-03 (uutils#10185 / WinuxCmd#281).
+auto shift_months(const FILETIME& base, long long months)
+    -> std::optional<FILETIME> {
+  auto st = filetime_to_zone_system_time(base);
+  if (!st) return std::nullopt;
+  long long total =
+      static_cast<long long>(st->wYear) * 12 + (st->wMonth - 1) + months;
+  long long year = total / 12;
+  long long month = total % 12;
+  if (month < 0) {
+    month += 12;
+    --year;
+  }
+  ++month;
+  if (year < 1601 || year > 9999) return std::nullopt;
+  long long day = st->wDay;
+  while (day > days_in_month(static_cast<int>(year), static_cast<int>(month))) {
+    day -= days_in_month(static_cast<int>(year), static_cast<int>(month));
+    if (++month > 12) {
+      month = 1;
+      ++year;
+      if (year > 9999) return std::nullopt;
+    }
+  }
+  st->wYear = static_cast<WORD>(year);
+  st->wMonth = static_cast<WORD>(month);
+  st->wDay = static_cast<WORD>(day);
+  return zone_time_to_filetime(*st, std::nullopt);
+}
+
 auto parse_fixed_date_time(std::string input) -> std::optional<FILETIME> {
   input = trim_copy(input);
   if (auto epoch = parse_epoch_time(input)) return epoch;
@@ -426,6 +472,22 @@ auto parse_fixed_date_time(std::string input) -> std::optional<FILETIME> {
       tv.remove_prefix(colon + 1);
     }
     if (pieces.size() < 2 || pieces.size() > 3) return std::nullopt;
+    // [GNU] the seconds field may carry a fractional part
+    // ("03:04:05.123456789", stat-style timestamps; WinuxCmd#976).
+    // FILETIME holds 100ns ticks, so extra digits are truncated.
+    long long frac_ticks = 0;
+    if (pieces.size() == 3) {
+      if (auto dot = pieces[2].find('.'); dot != std::string_view::npos) {
+        auto frac = pieces[2].substr(dot + 1);
+        if (frac.empty() || !is_digits(frac)) return std::nullopt;
+        long long nsec = 0;
+        for (size_t i = 0; i < 9; ++i) {
+          nsec = nsec * 10 + (i < frac.size() ? frac[i] - '0' : 0);
+        }
+        frac_ticks = nsec / 100;
+        pieces[2] = pieces[2].substr(0, dot);
+      }
+    }
     auto h = parse_int(pieces[0]);
     auto m = parse_int(pieces[1]);
     auto sec =
@@ -434,6 +496,29 @@ auto parse_fixed_date_time(std::string input) -> std::optional<FILETIME> {
     hour = *h;
     minute = *m;
     second = *sec;
+
+    SYSTEMTIME st{};
+    st.wYear = static_cast<WORD>(year);
+    st.wMonth = static_cast<WORD>(month);
+    st.wDay = static_cast<WORD>(day);
+    st.wHour = static_cast<WORD>(hour);
+    st.wMinute = static_cast<WORD>(minute);
+    st.wSecond = static_cast<WORD>(second);
+
+    std::optional<FILETIME> ft;
+    if (tz_offset) {
+      auto utc_ft = utc_system_time_to_filetime(st);
+      if (!utc_ft) return std::nullopt;
+      ft = add_seconds(*utc_ft, -static_cast<long long>(*tz_offset) * 60);
+    } else {
+      ft = zone_time_to_filetime(st, std::nullopt);
+    }
+    if (!ft) return std::nullopt;
+    if (frac_ticks != 0) {
+      ft = ticks_to_filetime(filetime_to_ticks(*ft) +
+                             static_cast<unsigned long long>(frac_ticks));
+    }
+    return ft;
   }
 
   SYSTEMTIME st{};
@@ -493,6 +578,15 @@ auto parse_relative_date(std::string input, const FILETIME& base)
   }
   if (ago) amount = -amount;
 
+  // [GNU] month/year are calendar units, not fixed second counts:
+  // "3 months ago" rolls the wall-clock month back three positions.
+  if (unit == "month" || unit == "months") {
+    return shift_months(base, amount);
+  }
+  if (unit == "year" || unit == "years") {
+    return shift_months(base, static_cast<long long>(amount) * 12);
+  }
+
   long long scale = 0;
   if (unit == "second" || unit == "seconds" || unit == "sec" ||
       unit == "secs") {
@@ -513,10 +607,107 @@ auto parse_relative_date(std::string input, const FILETIME& base)
   return add_seconds(base, static_cast<long long>(amount) * scale);
 }
 
+// [GNU] A date string may end with one relative item applied to a base
+// timestamp ("2026-03-31 1 month ago" -> 2026-03-03). Split off a trailing
+// "<amount> <unit>[ ago|hence]" and parse the remainder as the base.
+auto parse_combined_date(std::string input, const FILETIME& base, int depth)
+    -> std::optional<FILETIME> {
+  if (depth > 4) return std::nullopt;  // bound the recursion
+  static const std::regex tail_re(
+      R"(^(.*?)\s+([+-]?[0-9]+|next|last)\s+(fortnights?|seconds?|secs?|minutes?|mins?|hours?|days?|weeks?|months?|years?)\s*(ago|hence)?\s*$)",
+      std::regex::icase);
+  std::smatch m;
+  if (!std::regex_match(input, m, tail_re)) return std::nullopt;
+  std::string base_str = trim_copy(m[1].str());
+  if (base_str.empty()) return std::nullopt;
+
+  std::optional<FILETIME> base_ft = parse_fixed_date_time(base_str);
+  if (!base_ft) {
+    base_ft = parse_combined_date(base_str, base, depth + 1);
+    if (!base_ft) base_ft = parse_relative_date(base_str, base);
+    if (!base_ft) return std::nullopt;
+  }
+
+  std::string rel_spec = trim_copy(m[2].str() + " " + m[3].str() + " " +
+                                   (m[4].matched ? m[4].str() : ""));
+  return parse_relative_date(rel_spec, *base_ft);
+}
+
+// [GNU] military timezone specs (parse-datetime.y military_table):
+// "<HH|HHMM><L>" or a lone "<L>" meaning today 00:00 in that zone.
+// A-I = UTC+1..+9, K-M = UTC+10..+12 (J is skipped in the alphabet),
+// N-Y = UTC-1..-12, Z = UTC, and J = the local zone. 'T' is not a zone.
+auto parse_military_time(const std::string& input) -> std::optional<FILETIME> {
+  // [GNU] also accepts "<HH>:<MM>[:<SS>]<L>" (e.g. "9:30j").
+  static const std::regex military_hms_re(
+      R"(^([0-9]{1,2}):([0-9]{2})(?::([0-9]{2}))?\s*([A-Za-z])$)");
+  static const std::regex military_re(R"(^([0-9]{1,4})\s*([A-Za-z])$)");
+  static const std::regex zone_re(R"(^([A-Za-z])$)");
+  std::smatch m;
+  int hour = 0;
+  int minute = 0;
+  int second = 0;
+  char letter = '\0';
+  if (std::regex_match(input, m, military_hms_re)) {
+    hour = std::stoi(m[1].str());
+    minute = std::stoi(m[2].str());
+    if (m[3].matched) second = std::stoi(m[3].str());
+    letter = static_cast<char>(
+        std::tolower(static_cast<unsigned char>(m[4].str()[0])));
+  } else if (std::regex_match(input, m, military_re)) {
+    const std::string digits = m[1].str();
+    if (digits.size() <= 2) {
+      hour = std::stoi(digits);
+    } else {
+      hour = std::stoi(digits.substr(0, digits.size() - 2));
+      minute = std::stoi(digits.substr(digits.size() - 2));
+    }
+    letter = static_cast<char>(
+        std::tolower(static_cast<unsigned char>(m[2].str()[0])));
+  } else if (std::regex_match(input, m, zone_re)) {
+    letter = static_cast<char>(
+        std::tolower(static_cast<unsigned char>(m[1].str()[0])));
+  } else {
+    return std::nullopt;
+  }
+  if (letter == 't' || hour > 23 || minute > 59 || second > 59) {
+    return std::nullopt;
+  }
+
+  std::optional<int> east;
+  if (letter == 'j') {
+    east = std::nullopt;  // 'J' = the local zone
+  } else if (letter >= 'a' && letter <= 'i') {
+    east = (letter - 'a' + 1) * 60;
+  } else if (letter >= 'k' && letter <= 'm') {
+    east = (letter - 'a') * 60;
+  } else if (letter == 'z') {
+    east = 0;
+  } else if (letter >= 'n' && letter <= 'y') {
+    east = -(letter - 'n' + 1) * 60;
+  } else {
+    return std::nullopt;
+  }
+
+  SYSTEMTIME now{};
+  GetLocalTime(&now);
+  SYSTEMTIME st{};
+  st.wYear = now.wYear;
+  st.wMonth = now.wMonth;
+  st.wDay = now.wDay;
+  st.wHour = static_cast<WORD>(hour);
+  st.wMinute = static_cast<WORD>(minute);
+  st.wSecond = static_cast<WORD>(second);
+  st.wMilliseconds = 0;
+  return zone_time_to_filetime(st, east);
+}
+
 auto parse_gnu_date_string(const std::string& input, const FILETIME& base)
     -> std::optional<FILETIME> {
   if (auto fixed = parse_fixed_date_time(input)) return fixed;
-  return parse_relative_date(input, base);
+  if (auto mil = parse_military_time(input)) return mil;
+  if (auto rel = parse_relative_date(input, base)) return rel;
+  return parse_combined_date(input, base, 0);
 }
 
 auto parse_touch_timestamp(const std::string& input)
@@ -571,24 +762,28 @@ auto file_open_flags(bool no_dereference) -> DWORD {
   return flags;
 }
 
-auto read_times_from_file(const std::wstring& wpath, bool no_dereference)
-    -> std::optional<TimePair> {
+auto read_times_from_file(const std::wstring& wpath, bool no_dereference,
+                          DWORD* error = nullptr) -> std::optional<TimePair> {
+  auto fail = [&](DWORD e) -> std::optional<TimePair> {
+    if (error != nullptr) *error = e;
+    return std::nullopt;
+  };
   auto operand = native_path::make_api_path_operand_w(wpath);
   if (operand.had_trailing_separator &&
       native_path::attributes_are_regular_file(
           native_path::operand_target_attributes_w(operand))) {
-    return std::nullopt;
+    return fail(ERROR_DIRECTORY);
   }
 
   UniqueHandle h(CreateFileW(
       operand.extended.c_str(), FILE_READ_ATTRIBUTES,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
       OPEN_EXISTING, file_open_flags(no_dereference), nullptr));
-  if (!h) return std::nullopt;
+  if (!h) return fail(GetLastError());
 
   FILETIME c{}, a{}, m{};
   bool ok = GetFileTime(h.get(), &c, &a, &m) != 0;
-  if (!ok) return std::nullopt;
+  if (!ok) return fail(GetLastError());
 
   return TimePair{a, m};
 }
@@ -703,10 +898,8 @@ auto process_command(const CommandContext<TOUCH_OPTIONS.size()>& ctx)
       flag_a = false;
       flag_m = true;
     } else {
-      safeErrorPrint("touch: invalid argument '");
-      safeErrorPrint(time_word);
-      safeErrorPrint("' for '--time'\n");
-      return std::unexpected("invalid time argument");
+      return std::unexpected("invalid argument '" + time_word +
+                             "' for '--time'");
     }
   }
 
@@ -727,12 +920,15 @@ auto process_command(const CommandContext<TOUCH_OPTIONS.size()>& ctx)
   std::string ref_path = ctx.get<std::string>("--reference", "");
   if (ref_path.empty()) ref_path = ctx.get<std::string>("-r", "");
   if (!ref_path.empty()) {
-    ref_times = read_times_from_file(utf8_to_wstring(ref_path), no_dereference);
+    // [GNU] single-line diagnostic with the errno text:
+    // "touch: failed to get attributes of 'dang': No such file or directory"
+    DWORD ref_error = 0;
+    ref_times = read_times_from_file(utf8_to_wstring(ref_path), no_dereference,
+                                     &ref_error);
     if (!ref_times.has_value()) {
-      safeErrorPrint("touch: failed to get attributes of '");
-      safeErrorPrint(ref_path);
-      safeErrorPrint("'\n");
-      return std::unexpected("reference file error");
+      return std::unexpected(
+          "failed to get attributes of '" + ref_path + "': " +
+          win32_posix_error_text(ref_error, {.invalid_name_as_missing = true}));
     }
   }
 
@@ -753,10 +949,9 @@ auto process_command(const CommandContext<TOUCH_OPTIONS.size()>& ctx)
       ft = parse_gnu_date_string(occurrence.value, base_time);
     }
     if (!ft.has_value()) {
-      safeErrorPrint("touch: invalid date format '");
-      safeErrorPrint(occurrence.value);
-      safeErrorPrint("'\n");
-      return std::unexpected("invalid date format");
+      // [GNU] one diagnostic line carries the offending string:
+      // "touch: invalid date format 'xyz'"
+      return std::unexpected("invalid date format '" + occurrence.value + "'");
     }
     date_times = TimePair{*ft, *ft};
     base_time = *ft;

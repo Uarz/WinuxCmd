@@ -391,19 +391,22 @@ TEST(env, env_debug_shows_overridden_argv0) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_TRUE(r.stderr_text.find("argv0:     debug-name") != std::string::npos);
-  EXPECT_TRUE(r.stderr_text.find("arg[0]= debug-name") != std::string::npos);
+  // [GNU] env.c uses quoteaf/quote: both lines are single-quoted.
+  EXPECT_TRUE(r.stderr_text.find("argv0:     'debug-name'") !=
+              std::string::npos);
+  EXPECT_TRUE(r.stderr_text.find("arg[0]= 'debug-name'") != std::string::npos);
 }
 
-TEST(env, env_double_debug_prints_input_args) {
+// [GNU] -vv is identical to -v: there is no extra verbosity level
+// (env.c 'v' just sets dev_debug).
+TEST(env, env_double_debug_traces_like_single_debug) {
   Pipeline p;
   p.add(L"env.exe", {L"-vv", system_cmd(), L"/C", L"echo", L"ok"});
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_TRUE(r.stderr_text.find("input args:") != std::string::npos);
-  EXPECT_TRUE(r.stderr_text.find("arg[0]: -vv") != std::string::npos);
   EXPECT_TRUE(r.stderr_text.find("executing: ") != std::string::npos);
+  EXPECT_TRUE(r.stderr_text.find("arg[0]= ") != std::string::npos);
 }
 
 TEST(env, env_mixed_debug_flags_accumulate_level) {
@@ -412,8 +415,8 @@ TEST(env, env_mixed_debug_flags_accumulate_level) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_TRUE(r.stderr_text.find("input args:") != std::string::npos);
-  EXPECT_TRUE(r.stderr_text.find("arg[1]: --debug") != std::string::npos);
+  EXPECT_TRUE(r.stderr_text.find("executing: ") != std::string::npos);
+  EXPECT_TRUE(r.stderr_text.find("arg[0]= ") != std::string::npos);
 }
 
 TEST(env, env_argv0_overrides_child_command_line_argv0) {

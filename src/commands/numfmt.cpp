@@ -80,6 +80,10 @@ auto constexpr NUMFMT_OPTIONS = std::array{
            STRING_TYPE),
     // [GNU]
     OPTION("", "--debug", "print conversion diagnostics", BOOL_TYPE),
+    // [GNU] hidden developer option, spelled "---debug" on the command
+    // line (numfmt.c {"-debug"}); aliases --debug. Empty description keeps
+    // it out of --help like GNU.
+    OPTION("", "---debug", "", BOOL_TYPE),
     // [GNU] --from-unit: multiply input numbers by UNIT
     OPTION("", "--from-unit", "multiply input numbers by UNIT", STRING_TYPE),
     // [GNU] --to-unit: divide numbers by UNIT before formatting
@@ -159,12 +163,12 @@ const char* suffix_power_char(int power) {
 
 enum class NumParseStatus {
   Ok,
-  InvalidNumber,     // "invalid number: 'X'"
-  ForbiddenSuffix,   // "rejecting suffix in input: 'X' (consider using --from)"
-  InvalidSuffix,     // "invalid suffix in input: 'X'"
-  InvalidSuffixTail, // "invalid suffix in input 'X': 'tail'"
-  MissingI,          // "missing 'i' suffix in input: 'X' (e.g Ki/Mi/Gi)"
-  Overflow           // "value too large to be converted: 'X'"
+  InvalidNumber,    // "invalid number: 'X'"
+  ForbiddenSuffix,  // "rejecting suffix in input: 'X' (consider using --from)"
+  InvalidSuffix,    // "invalid suffix in input: 'X'"
+  InvalidSuffixTail,  // "invalid suffix in input 'X': 'tail'"
+  MissingI,           // "missing 'i' suffix in input: 'X' (e.g Ki/Mi/Gi)"
+  Overflow            // "value too large to be converted: 'X'"
 };
 
 struct ParsedInput {
@@ -238,8 +242,7 @@ ParsedInput parse_human(std::string_view input, const std::string& scale_from,
   // precede the suffix.
   size_t j = i;
   bool matched_sep = false;
-  if (!unit_sep.empty() &&
-      s.compare(j, unit_sep.size(), unit_sep) == 0) {
+  if (!unit_sep.empty() && s.compare(j, unit_sep.size(), unit_sep) == 0) {
     j += unit_sep.size();
     matched_sep = true;
   }
@@ -300,8 +303,7 @@ std::optional<double> unit_size(const std::string& text) {
   const char last = text.back();
   if (std::isdigit(static_cast<unsigned char>(last)) == 0) {
     if (last == 'i' && text.size() >= 2 &&
-        std::isdigit(static_cast<unsigned char>(text[text.size() - 2])) ==
-            0) {
+        std::isdigit(static_cast<unsigned char>(text[text.size() - 2])) == 0) {
       digits.pop_back();
       base = 1024.0;
     } else {
@@ -343,8 +345,7 @@ struct FmtSpec {
   int user_precision = -1;
 };
 
-std::optional<std::string> parse_format(const std::string& fmt,
-                                        FmtSpec& out) {
+std::optional<std::string> parse_format(const std::string& fmt, FmtSpec& out) {
   size_t i = 0;
   size_t prefix_len = 0;
   for (;; i += (fmt[i] == '%') + 1) {
@@ -394,16 +395,14 @@ std::optional<std::string> parse_format(const std::string& fmt,
   if (fmt[i] == '.') {
     ++i;
     if (i < fmt.size() && (fmt[i] == '+' || fmt[i] == ' ' || fmt[i] == '\t')) {
-      return ::winux::i18n::format(
-          "command.numfmt.error.format_bad_precision",
-          "invalid precision in format '{}'", fmt);
+      return ::winux::i18n::format("command.numfmt.error.format_bad_precision",
+                                   "invalid precision in format '{}'", fmt);
     }
     errno = 0;
     const long prec = std::strtol(fmt.c_str() + i, &endptr, 10);
     if (errno == ERANGE || prec < 0) {
-      return ::winux::i18n::format(
-          "command.numfmt.error.format_bad_precision",
-          "invalid precision in format '{}'", fmt);
+      return ::winux::i18n::format("command.numfmt.error.format_bad_precision",
+                                   "invalid precision in format '{}'", fmt);
     }
     out.user_precision = static_cast<int>(prec);
     i = static_cast<size_t>(endptr - fmt.c_str());
@@ -419,9 +418,9 @@ std::optional<std::string> parse_format(const std::string& fmt,
 
   for (; i < fmt.size(); i += (fmt[i] == '%') + 1) {
     if (fmt[i] == '%' && i + 1 < fmt.size() && fmt[i + 1] != '%') {
-      return ::winux::i18n::format(
-          "command.numfmt.error.format_too_many",
-          "format '{}' has too many % directives", fmt);
+      return ::winux::i18n::format("command.numfmt.error.format_too_many",
+                                   "format '{}' has too many % directives",
+                                   fmt);
     }
   }
 
@@ -433,8 +432,7 @@ std::optional<std::string> parse_format(const std::string& fmt,
 // Insert ',' every three digits in the integer part of S (before any '.');
 // the sign and the fractional part are untouched ([GNU] %'f semantics).
 std::string group_integer_part(const std::string& s) {
-  const size_t beg =
-      (!s.empty() && (s[0] == '-' || s[0] == '+')) ? 1 : 0;
+  const size_t beg = (!s.empty() && (s[0] == '-' || s[0] == '+')) ? 1 : 0;
   const size_t dot = s.find('.');
   const size_t end = dot == std::string::npos ? s.size() : dot;
   const size_t n = end - beg;
@@ -482,17 +480,16 @@ int decimal_exponent(double val) {
 }
 
 // cut(1)-style --field spec: N, N-, N-M, -M, - and comma separated lists.
-bool parse_field_spec(const std::string& spec,
-                      std::vector<std::pair<unsigned long, unsigned long>>&
-                          ranges,
-                      std::string& err) {
+bool parse_field_spec(
+    const std::string& spec,
+    std::vector<std::pair<unsigned long, unsigned long>>& ranges,
+    std::string& err) {
   static constexpr unsigned long kMax = ~0UL;
   size_t pos = 0;
   while (pos <= spec.size()) {
     const size_t comma = spec.find(',', pos);
-    const std::string item =
-        spec.substr(pos, comma == std::string::npos ? std::string::npos
-                                                    : comma - pos);
+    const std::string item = spec.substr(
+        pos, comma == std::string::npos ? std::string::npos : comma - pos);
     if (item == "-") {
       ranges.emplace_back(1UL, kMax);
     } else {
@@ -504,8 +501,7 @@ bool parse_field_spec(const std::string& spec,
       const auto to_ul = [](const std::string& t, unsigned long& v) {
         if (t.empty()) return false;
         unsigned long long parsed = 0;
-        auto res =
-            std::from_chars(t.data(), t.data() + t.size(), parsed);
+        auto res = std::from_chars(t.data(), t.data() + t.size(), parsed);
         if (res.ec != std::errc() || res.ptr != t.data() + t.size() ||
             parsed > kMax) {
           return false;
@@ -535,9 +531,8 @@ bool parse_field_spec(const std::string& spec,
         return false;
       }
       if (hi < lo) {
-        err = ::winux::i18n::translate(
-            "command.numfmt.error.field_decreasing",
-            "invalid decreasing range");
+        err = ::winux::i18n::translate("command.numfmt.error.field_decreasing",
+                                       "invalid decreasing range");
         return false;
       }
       ranges.emplace_back(lo, hi);
@@ -620,7 +615,8 @@ REGISTER_COMMAND(
   bool grouping = ctx.get<bool>("--grouping", false);
   const bool locale_grouping = grouping || ctx.get<bool>("-l", false);
   std::string invalid_policy = ctx.get<std::string>("--invalid", "abort");
-  bool debug = ctx.get<bool>("--debug", false);
+  bool debug =
+      ctx.get<bool>("--debug", false) || ctx.get<bool>("---debug", false);
   std::string round_mode = ctx.get<std::string>("--round", "");
   int padding = ctx.get<int>("--padding", ctx.get<int>("--pad", 0));
   std::string suffix = ctx.get<std::string>("--suffix", "");
@@ -662,10 +658,9 @@ REGISTER_COMMAND(
     return 1;
   }
   if (locale_grouping && (to_si || to_iec || to_iec_i)) {
-    safeErrorPrintLn("numfmt: " +
-                     ::winux::i18n::translate(
-                         "command.numfmt.error.grouping_vs_to",
-                         "grouping cannot be combined with --to"));
+    safeErrorPrintLn("numfmt: " + ::winux::i18n::translate(
+                                      "command.numfmt.error.grouping_vs_to",
+                                      "grouping cannot be combined with --to"));
     return 1;
   }
 
@@ -698,10 +693,10 @@ REGISTER_COMMAND(
     }
     // [GNU] the %'f flag selects grouping and conflicts with --to.
     if (fmt_spec.grouping && (to_si || to_iec || to_iec_i)) {
-      safeErrorPrintLn("numfmt: " +
-                       ::winux::i18n::translate(
-                           "command.numfmt.error.grouping_vs_to",
-                           "grouping cannot be combined with --to"));
+      safeErrorPrintLn(
+          "numfmt: " +
+          ::winux::i18n::translate("command.numfmt.error.grouping_vs_to",
+                                   "grouping cannot be combined with --to"));
       return 1;
     }
   }
@@ -771,13 +766,11 @@ REGISTER_COMMAND(
       val /= base;
       ++power;
     }
-    const int show_decimal =
-        (val != 0) && (std::abs(val) < 10) && (power > 0);
+    const int show_decimal = (val != 0) && (std::abs(val) < 10) && (power > 0);
     const int prec =
         fmt_spec.user_precision == -1 ? show_decimal : fmt_spec.user_precision;
-    std::string out = numeric_text(val, prec,
-                                   fmt_spec.grouping || locale_grouping,
-                                   fmt_spec.zero_pad);
+    std::string out = numeric_text(
+        val, prec, fmt_spec.grouping || locale_grouping, fmt_spec.zero_pad);
     if (power > 0) {
       out += unit_separator;
       out += suffix_power_char(power);
@@ -804,17 +797,16 @@ REGISTER_COMMAND(
             "command.numfmt.error.rejecting_suffix",
             "rejecting suffix in input: '{}' (consider using --from)", text);
       case NumParseStatus::InvalidSuffixTail:
-        return ::winux::i18n::format(
-            "command.numfmt.error.invalid_suffix_tail",
-            "invalid suffix in input '{}': '{}'", text, tail);
+        return ::winux::i18n::format("command.numfmt.error.invalid_suffix_tail",
+                                     "invalid suffix in input '{}': '{}'", text,
+                                     tail);
       case NumParseStatus::MissingI:
         return ::winux::i18n::format(
             "command.numfmt.error.missing_i",
             "missing 'i' suffix in input: '{}' (e.g Ki/Mi/Gi)", text);
       case NumParseStatus::InvalidSuffix:
-        return ::winux::i18n::format(
-            "command.numfmt.error.invalid_suffix", "invalid suffix in input: '{}'",
-            text);
+        return ::winux::i18n::format("command.numfmt.error.invalid_suffix",
+                                     "invalid suffix in input: '{}'", text);
       case NumParseStatus::Overflow:
         return ::winux::i18n::format(
             "command.numfmt.error.value_too_large_convert",
@@ -852,8 +844,7 @@ REGISTER_COMMAND(
       had_invalid = true;
       if (invalid_policy != "ignore") {
         safeErrorPrint("numfmt: " +
-                       invalid_message(pi.status, number_text, pi.tail) +
-                       "\n");
+                       invalid_message(pi.status, number_text, pi.tail) + "\n");
       }
       if (invalid_policy == "abort") {
         return false;
@@ -868,8 +859,7 @@ REGISTER_COMMAND(
       val = val * from_scale / to_scale;
     }
     const int precision_used =
-        fmt_spec.user_precision == -1 ? pi.precision
-                                      : fmt_spec.user_precision;
+        fmt_spec.user_precision == -1 ? pi.precision : fmt_spec.user_precision;
 
     // [GNU] prepare_padded_number: without scaling, values needing more
     // than 18 digits cannot be printed; scaling tops out at 999Q.
@@ -880,14 +870,13 @@ REGISTER_COMMAND(
         char value_text[64];
         std::snprintf(value_text, sizeof(value_text), "%g", val);
         if (precision_used > 0) {
-          safeErrorPrint(
-              "numfmt: " +
-              ::winux::i18n::format(
-                  "command.numfmt.error.value_precision_too_large",
-                  "value/precision too large to be printed: '{}/{}' "
-                  "(consider using --to)",
-                  value_text, precision_used) +
-              "\n");
+          safeErrorPrint("numfmt: " +
+                         ::winux::i18n::format(
+                             "command.numfmt.error.value_precision_too_large",
+                             "value/precision too large to be printed: '{}/{}' "
+                             "(consider using --to)",
+                             value_text, precision_used) +
+                         "\n");
         } else {
           safeErrorPrint(
               "numfmt: " +
@@ -926,8 +915,7 @@ REGISTER_COMMAND(
     // appends the spaces instead.
     if (pad_w > 0 && static_cast<long long>(out.size()) < pad_w) {
       out.insert(0, static_cast<size_t>(pad_w - out.size()), ' ');
-    } else if (pad_w < 0 &&
-               static_cast<long long>(out.size()) < -pad_w) {
+    } else if (pad_w < 0 && static_cast<long long>(out.size()) < -pad_w) {
       out.append(static_cast<size_t>(-pad_w - out.size()), ' ');
     }
     if (debug) {

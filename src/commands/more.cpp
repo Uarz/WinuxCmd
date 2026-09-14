@@ -341,16 +341,56 @@ auto copy_stream_to_stdout(std::istream& input) -> int {
   return input.bad() ? 1 : 0;
 }
 
+// [util-linux more] classify a file operand before opening: directories are
+// announced with a "*** name: directory ***" banner and skipped, a trailing
+// separator on a regular file is ENOTDIR, and other unreadable operands
+// report "cannot open <name>: <err>" (uutils #12786).
+struct MoreFileProbe {
+  enum class Kind { Openable, Directory, OpenError } kind;
+  std::string error;
+};
+
+auto probe_file_operand(const std::string& filename) -> MoreFileProbe {
+  auto operand = native_path::make_api_path_operand(filename);
+  const DWORD attrs = native_path::operand_target_attributes_w(operand);
+  if (native_path::attributes_are_directory(attrs)) {
+    return {MoreFileProbe::Kind::Directory, {}};
+  }
+  if (const int err = native_path::operand_file_open_error(operand); err != 0) {
+    return {MoreFileProbe::Kind::OpenError,
+            err == ENOTDIR ? "Not a directory" : "No such file or directory"};
+  }
+  if (!native_path::valid_attributes(attrs)) {
+    return {MoreFileProbe::Kind::OpenError, "No such file or directory"};
+  }
+  return {MoreFileProbe::Kind::Openable, {}};
+}
+
+auto report_cannot_open(const std::string& filename, std::string_view error)
+    -> int {
+  safeErrorPrintLn("more: cannot open " + filename + ": " + std::string(error));
+  return 1;
+}
+
+void print_directory_banner(const std::string& filename) {
+  safePrint("\n*** " + filename + ": directory ***\n\n");
+}
+
 auto copy_file_to_stdout(const std::string& filename) -> int {
   if (filename.empty() || filename == "-") {
     return copy_stream_to_stdout(std::cin);
   }
+  const auto probe = probe_file_operand(filename);
+  if (probe.kind == MoreFileProbe::Kind::Directory) {
+    print_directory_banner(filename);
+    return 0;
+  }
+  if (probe.kind == MoreFileProbe::Kind::OpenError) {
+    return report_cannot_open(filename, probe.error);
+  }
   std::ifstream file(filename, std::ios::binary);
   if (!file) {
-    safeErrorPrint("more: ");
-    safeErrorPrint(filename);
-    safeErrorPrintLn(": No such file or directory");
-    return 1;
+    return report_cannot_open(filename, "Permission denied");
   }
   return copy_stream_to_stdout(file);
 }
@@ -401,6 +441,16 @@ auto prepare_start_line(std::vector<std::string>& lines, const Config& cfg)
 }
 auto display_file_noninteractive(const std::string& filename, const Config& cfg)
     -> int {
+  if (!filename.empty() && filename != "-") {
+    const auto probe = probe_file_operand(filename);
+    if (probe.kind == MoreFileProbe::Kind::Directory) {
+      print_directory_banner(filename);
+      return 0;
+    }
+    if (probe.kind == MoreFileProbe::Kind::OpenError) {
+      return report_cannot_open(filename, probe.error);
+    }
+  }
   auto lines_result = read_display_lines(filename);
   if (!lines_result) {
     safeErrorPrint("more: ");
@@ -416,6 +466,17 @@ auto display_file_noninteractive(const std::string& filename, const Config& cfg)
 }
 auto display_file(const std::string& filename, const Config& cfg,
                   size_t file_index, size_t file_count) -> MoreResult {
+  if (!filename.empty() && filename != "-") {
+    const auto probe = probe_file_operand(filename);
+    if (probe.kind == MoreFileProbe::Kind::Directory) {
+      print_directory_banner(filename);
+      return {0, MoreAction::NextFile, 1};
+    }
+    if (probe.kind == MoreFileProbe::Kind::OpenError) {
+      report_cannot_open(filename, probe.error);
+      return {1, MoreAction::NextFile, 1};
+    }
+  }
   auto lines_result = read_display_lines(filename);
   if (!lines_result) {
     safeErrorPrint("more: ");

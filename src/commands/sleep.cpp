@@ -53,8 +53,18 @@ struct Config {
   SmallVector<std::string, 64> durations;
 };
 
-auto parse_duration(const std::string& duration) -> cp::Result<int64_t> {
-  // Support: N, Ns, Nm, Nh, Nd
+auto invalid_interval(const std::string& duration)
+    -> std::unexpected<std::string> {
+  return std::unexpected(
+      winux::i18n::format("command.sleep.error.invalid_interval",
+                          "invalid time interval '{}'", duration));
+}
+
+// [GNU] sleep.c: intervals are parsed with strtod, so hexadecimal floats,
+// leading '+', scientific notation, "inf"/"infinity" are accepted; NaN and
+// negative values are rejected.  Only a trailing [smhd] acts as a suffix.
+// Returns milliseconds (may be +inf).
+auto parse_duration(const std::string& duration) -> cp::Result<double> {
   std::string s = duration;
   if (auto first = s.find_first_not_of(" \t\r\n");
       first != std::string::npos && first > 0) {
@@ -62,44 +72,39 @@ auto parse_duration(const std::string& duration) -> cp::Result<int64_t> {
   }
 
   if (s.empty()) {
-    return std::unexpected("invalid time interval '" + duration + "'");
+    return invalid_interval(duration);
   }
 
-  int64_t multiplier = 1;
+  double multiplier = 1.0;
   if (s.size() > 1) {
-    char suffix = s.back();
-
-    switch (suffix) {
+    switch (s.back()) {
       case 's':
-      case 'S':
-        multiplier = 1;
-        s = s.substr(0, s.size() - 1);
+        multiplier = 1.0;
+        s.pop_back();
         break;
       case 'm':
-      case 'M':
-        multiplier = 60;
-        s = s.substr(0, s.size() - 1);
+        multiplier = 60.0;
+        s.pop_back();
         break;
       case 'h':
-      case 'H':
-        multiplier = 3600;
-        s = s.substr(0, s.size() - 1);
+        multiplier = 3600.0;
+        s.pop_back();
         break;
       case 'd':
-      case 'D':
-        multiplier = 86400;
-        s = s.substr(0, s.size() - 1);
+        multiplier = 86400.0;
+        s.pop_back();
         break;
     }
   }
 
-  double value = 0.0;
-  auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), value);
-  if (ec != std::errc() || ptr != s.data() + s.size() || value < 0) {
-    return std::unexpected("invalid time interval '" + duration + "'");
+  errno = 0;
+  char* end = nullptr;
+  const double value = std::strtod(s.c_str(), &end);
+  if (end != s.c_str() + s.size() || std::isnan(value) || value < 0 ||
+      (end == s.c_str())) {
+    return invalid_interval(duration);
   }
-  return static_cast<int64_t>(value * static_cast<double>(multiplier) *
-                              1000.0);  // Convert to milliseconds
+  return value * multiplier * 1000.0;  // Convert to milliseconds
 }
 
 auto build_config(const CommandContext<SLEEP_OPTIONS.size()>& ctx)
@@ -118,7 +123,8 @@ auto build_config(const CommandContext<SLEEP_OPTIONS.size()>& ctx)
 }
 
 auto run(const Config& cfg) -> int {
-  int64_t total_ms = 0;
+  double total_ms = 0.0;
+  bool infinite = false;
   SmallVector<std::string, 8> invalid_durations;
 
   for (const auto& duration_str : cfg.durations) {
@@ -127,7 +133,11 @@ auto run(const Config& cfg) -> int {
       invalid_durations.push_back(std::string(duration_result.error()));
       continue;
     }
-    total_ms += *duration_result;
+    if (std::isinf(*duration_result)) {
+      infinite = true;
+    } else {
+      total_ms += *duration_result;
+    }
   }
 
   if (!invalid_durations.empty()) {
@@ -138,11 +148,21 @@ auto run(const Config& cfg) -> int {
     return 1;
   }
 
-  while (total_ms > 0) {
+  // [GNU] "sleep inf" / "sleep infinity" pauses forever; so does any
+  // interval that overflows a machine duration (e.g. "sleep 1e300").
+  if (infinite || std::isinf(total_ms) ||
+      total_ms >= static_cast<double>(std::numeric_limits<int64_t>::max())) {
+    while (true) {
+      Sleep(INFINITE);
+    }
+  }
+
+  int64_t remaining_ms = static_cast<int64_t>(total_ms);
+  while (remaining_ms > 0) {
     const auto chunk =
-        std::min<int64_t>(total_ms, std::numeric_limits<DWORD>::max());
+        std::min<int64_t>(remaining_ms, std::numeric_limits<DWORD>::max());
     Sleep(static_cast<DWORD>(chunk));
-    total_ms -= chunk;
+    remaining_ms -= chunk;
   }
 
   return 0;

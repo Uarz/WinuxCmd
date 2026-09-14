@@ -126,6 +126,52 @@ TEST(expr, expr_plus_quotes_keyword_or_operator_tokens) {
   EXPECT_EQ_TEXT(r.stdout_text, "length\n");
 }
 
+// [#1005] GNU expr uses arbitrary-precision integers (GMP); results beyond
+// int64 must be exact rather than overflowing or erroring.
+TEST(expr, expr_arbitrary_precision_arithmetic) {
+  Pipeline add;
+  add.add(L"expr.exe", {L"9223372036854775807", L"+", L"1"});
+  auto add_result = add.run();
+  EXPECT_EXIT_CODE(add_result, 0);
+  EXPECT_EQ_TEXT(add_result.stdout_text, "9223372036854775808\n");
+
+  Pipeline mul;
+  mul.add(L"expr.exe",
+          {L"99999999999999999999", L"*", L"99999999999999999999"});
+  auto mul_result = mul.run();
+  EXPECT_EXIT_CODE(mul_result, 0);
+  EXPECT_EQ_TEXT(mul_result.stdout_text,
+                 "9999999999999999999800000000000000000001\n");
+
+  Pipeline sub;
+  sub.add(L"expr.exe", {L"-9223372036854775808", L"-", L"1"});
+  auto sub_result = sub.run();
+  EXPECT_EXIT_CODE(sub_result, 0);
+  EXPECT_EQ_TEXT(sub_result.stdout_text, "-9223372036854775809\n");
+}
+
+// [GNU] / and % truncate toward zero; the remainder takes the sign of the
+// dividend.
+TEST(expr, expr_division_and_remainder_truncate_toward_zero) {
+  Pipeline div;
+  div.add(L"expr.exe", {L"-7", L"/", L"2"});
+  auto div_result = div.run();
+  EXPECT_EXIT_CODE(div_result, 0);
+  EXPECT_EQ_TEXT(div_result.stdout_text, "-3\n");
+
+  Pipeline mod_neg;
+  mod_neg.add(L"expr.exe", {L"-7", L"%", L"3"});
+  auto mod_neg_result = mod_neg.run();
+  EXPECT_EXIT_CODE(mod_neg_result, 0);
+  EXPECT_EQ_TEXT(mod_neg_result.stdout_text, "-1\n");
+
+  Pipeline mod_pos;
+  mod_pos.add(L"expr.exe", {L"7", L"%", L"-3"});
+  auto mod_pos_result = mod_pos.run();
+  EXPECT_EXIT_CODE(mod_pos_result, 0);
+  EXPECT_EQ_TEXT(mod_pos_result.stdout_text, "1\n");
+}
+
 TEST(expr, expr_invalid_expression_exits_two) {
   Pipeline division;
   division.add(L"expr.exe", {L"1", L"/", L"0"});

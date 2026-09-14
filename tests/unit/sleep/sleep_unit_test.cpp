@@ -116,6 +116,46 @@ TEST(sleep, sleep_trailing_whitespace_is_rejected) {
                  "Try 'sleep --help' for more information.\n");
 }
 
+// [#1015] strtod accepts "nan" but GNU rejects it as a time interval.
+TEST(sleep, sleep_nan_interval_is_rejected) {
+  Pipeline p;
+  p.add(L"sleep.exe", {L"nan"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stdout_text.empty());
+  EXPECT_EQ_TEXT(r.stderr_text,
+                 "sleep: invalid time interval 'nan'\n"
+                 "Try 'sleep --help' for more information.\n");
+}
+
+// [#1015] GNU 9.x accepts C99 hexadecimal floats: "0x10" is 16 seconds.
+// "0x0" verifies acceptance without actually sleeping.
+TEST(sleep, sleep_hex_interval_is_accepted) {
+  Pipeline p;
+  p.add(L"sleep.exe", {L"0x0"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stdout_text.empty());
+  EXPECT_TRUE(r.stderr_text.empty());
+}
+
+// [#1015] GNU only accepts lowercase s/m/h/d suffixes.
+TEST(sleep, sleep_uppercase_suffix_is_rejected) {
+  Pipeline p;
+  p.add(L"sleep.exe", {L"0M"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_EQ_TEXT(r.stderr_text,
+                 "sleep: invalid time interval '0M'\n"
+                 "Try 'sleep --help' for more information.\n");
+}
+
 TEST(sleep, sleep_reports_all_invalid_intervals_before_help_hint) {
   Pipeline p;
   p.add(L"sleep.exe", {L"abc", L"100000.0", L"1years", L" "});

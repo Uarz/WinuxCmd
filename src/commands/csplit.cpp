@@ -327,9 +327,9 @@ struct PatternApplication {
 };
 
 auto apply_pattern(const std::vector<std::string>& lines,
-                   const ParsedPattern& pattern, const std::string& pattern_text,
-                   size_t current, bool repeated)
-    -> cp::Result<PatternApplication> {
+                   const ParsedPattern& pattern,
+                   const std::string& pattern_text, size_t current,
+                   bool repeated) -> cp::Result<PatternApplication> {
   PatternApplication result;
   result.skip = pattern.skip;
   result.output.begin = current;
@@ -573,9 +573,8 @@ auto run(const Config& cfg) -> int {
         // GNU streams everything scanned so far into the in-progress file
         // before reporting that the pattern never matched.
         if (!pattern.skip) {
-          auto in_progress =
-              writer.materialize_in_progress(Segment{current, lines.size()},
-                                             true);
+          auto in_progress = writer.materialize_in_progress(
+              Segment{current, lines.size()}, true);
           if (!in_progress) {
             return finish_with_error(in_progress.error());
           }

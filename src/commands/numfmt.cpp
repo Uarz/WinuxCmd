@@ -143,8 +143,8 @@ NumParseStatus parse_number_ex(const std::string& s, long long& result,
   double multiplier = 1.0;
   if (!suffix_text.empty()) {
     if (suffix_text.size() != 1) return NumParseStatus::InvalidSuffix;
-    const char suffix = static_cast<char>(std::toupper(
-        static_cast<unsigned char>(suffix_text[0])));
+    const char suffix = static_cast<char>(
+        std::toupper(static_cast<unsigned char>(suffix_text[0])));
     const bool si = from == "si" || from == "auto";
     const double base = si ? 1000.0 : 1024.0;
     switch (suffix) {
@@ -257,7 +257,8 @@ std::pair<std::string, std::string> scale_to(double value, double base,
   } else {
     snprintf(buffer, sizeof(buffer), "%.1f", value);
   }
-  return {buffer, index == 0 ? std::string() : std::string(1, suffixes[index - 1])};
+  return {buffer,
+          index == 0 ? std::string() : std::string(1, suffixes[index - 1])};
 }
 }  // namespace
 
@@ -294,9 +295,9 @@ REGISTER_COMMAND(
   if (!to_unit.empty() && to_unit != "none" && to_unit != "si" &&
       to_unit != "iec" && to_unit != "iec-i") {
     safeErrorPrint("numfmt: invalid argument '" + to_unit + "' for '--to'\n");
-    safeErrorPrint(::winux::i18n::format(
-        "command.numfmt.error.valid_to_args",
-        "Valid arguments are:\n  - 'none'\n  - 'si'\n  - 'iec'\n  - 'iec-i'\n"));
+    safeErrorPrint(::winux::i18n::format("command.numfmt.error.valid_to_args",
+                                         "Valid arguments are:\n  - 'none'\n  "
+                                         "- 'si'\n  - 'iec'\n  - 'iec-i'\n"));
     return 1;
   }
   bool to_si = to_unit == "si";
@@ -410,8 +411,9 @@ REGISTER_COMMAND(
   // (uutils #12596).
   constexpr size_t kMaxNumericLength = 126;
   bool had_prepare_error = false;
-  auto prepare_padded = [&](double value, const std::string& formatted)
-      -> std::optional<std::string> {
+  auto prepare_padded =
+      [&](double value,
+          const std::string& formatted) -> std::optional<std::string> {
     if (formatted.size() > kMaxNumericLength) {
       char value_text[64];
       snprintf(value_text, sizeof(value_text), "%f", value);
@@ -423,7 +425,8 @@ REGISTER_COMMAND(
     return formatted;
   };
 
-  auto process_number = [&](const std::string& s) -> std::optional<std::string> {
+  auto process_number =
+      [&](const std::string& s) -> std::optional<std::string> {
     long long num = 0;
     double raw_value = 0.0;
     const auto status =
@@ -433,8 +436,8 @@ REGISTER_COMMAND(
         debug_log("failed to parse input '" + s + "'");
       }
       const bool suffix_issue = status == NumParseStatus::InvalidSuffix;
-      const char* problem = suffix_issue ? "invalid suffix in input"
-                                         : "invalid number";
+      const char* problem =
+          suffix_issue ? "invalid suffix in input" : "invalid number";
       if (invalid_policy == "warn") {
         safeErrorPrint(std::string("numfmt: ") + problem + ": '" + s + "'\n");
         had_invalid = true;
@@ -452,9 +455,8 @@ REGISTER_COMMAND(
     // [GNU] Raw (no --to, no --format) printing requires the value to fit
     // in intmax_t; larger values error out (uutils #11654).
     const bool raw_print = !to_si && !to_iec && !to_iec_i && format_str.empty();
-    if (raw_print &&
-        (raw_value > 9223372036854775807.0 ||
-         raw_value < -9223372036854775808.0)) {
+    if (raw_print && (raw_value > 9223372036854775807.0 ||
+                      raw_value < -9223372036854775808.0)) {
       char printed[64];
       snprintf(printed, sizeof(printed), "%g", raw_value);
       safeErrorPrint(std::string("numfmt: value too large to be printed: '") +
@@ -480,14 +482,14 @@ REGISTER_COMMAND(
     if (to_si || to_iec || to_iec_i) {
       // With --to, GNU computes in floating point even for values that do
       // not fit intmax_t ("12345678901234567890 --to=si" -> "12.3E").
-      const bool out_of_intmax =
-          raw_value > 9223372036854775807.0 ||
-          raw_value < -9223372036854775808.0;
+      const bool out_of_intmax = raw_value > 9223372036854775807.0 ||
+                                 raw_value < -9223372036854775808.0;
       double scaled = out_of_intmax ? raw_value : static_cast<double>(num);
       std::string formatted;
       std::string unit_suffix;
       if (to_iec_i) {
-        std::tie(formatted, unit_suffix) = scale_to(scaled, 1024.0, "KiMiGiTiPi");
+        std::tie(formatted, unit_suffix) =
+            scale_to(scaled, 1024.0, "KiMiGiTiPi");
       } else if (to_si) {
         // [GNU] SI suffixes are upper case (5.0K, 123.5M); uutils #7221.
         std::tie(formatted, unit_suffix) = scale_to(scaled, 1000.0, "KMGTPE");

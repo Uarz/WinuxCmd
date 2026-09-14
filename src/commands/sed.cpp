@@ -2200,8 +2200,8 @@ auto preserve_in_place_backup(const std::filesystem::path& original,
                               const std::string& suffix) -> bool {
   if (suffix.empty()) return true;
 
-  auto backup = make_in_place_backup_path(
-      wstring_to_utf8(original.wstring()), suffix);
+  auto backup =
+      make_in_place_backup_path(wstring_to_utf8(original.wstring()), suffix);
   std::error_code ec;
   std::filesystem::copy_file(
       original, backup, std::filesystem::copy_options::overwrite_existing, ec);

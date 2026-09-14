@@ -100,22 +100,27 @@ auto build_config(const CommandContext<HOSTNAME_OPTIONS.size()>& ctx)
     std::string_view long_name;
   };
   static constexpr UnsupportedOption unsupported[] = {
-      {"-b", "--boot"},         {"-i", "--ip-address"},
-      {"-I", "--all-ip-addresses"}, {"-s", "--short"},
-      {"-f", "--fqdn"},         {"-a", "--alias"},
-      {"-A", "--all-fqdns"},    {"-d", "--domain"},
-      {"-F", "--file"},         {"-y", "--yp"},
+      {"-b", "--boot"},
+      {"-i", "--ip-address"},
+      {"-I", "--all-ip-addresses"},
+      {"-s", "--short"},
+      {"-f", "--fqdn"},
+      {"-a", "--alias"},
+      {"-A", "--all-fqdns"},
+      {"-d", "--domain"},
+      {"-F", "--file"},
+      {"-y", "--yp"},
       {"-n", "--node"}};
   for (const auto& opt : unsupported) {
     if (!opt.short_name.empty() && ctx.has(std::string(opt.short_name))) {
-      return std::unexpected(
-          "unknown option -- " + std::string(opt.short_name.substr(1)) +
-          "\nTry 'hostname --help' for more information.");
+      return std::unexpected("unknown option -- " +
+                             std::string(opt.short_name.substr(1)) +
+                             "\nTry 'hostname --help' for more information.");
     }
     if (ctx.has(std::string(opt.long_name))) {
-      return std::unexpected(
-          "unrecognized option '" + std::string(opt.long_name) +
-          "'\nTry 'hostname --help' for more information.");
+      return std::unexpected("unrecognized option '" +
+                             std::string(opt.long_name) +
+                             "'\nTry 'hostname --help' for more information.");
     }
   }
   (void)cfg.show_ip;

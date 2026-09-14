@@ -32,11 +32,11 @@
 /// @License: MIT
 /// @Copyright: Copyright © 2026 WinuxCmd
 
+#include <cstdlib>  // std::getenv
+#include <ctime>    // _tzset, localtime_s, mktime (TZ env support)
+
 #include "core/command_macros.h"
 #include "pch/pch.h"
-
-#include <ctime>   // _tzset, localtime_s, mktime (TZ env support)
-#include <cstdlib> // std::getenv
 
 // Standard library symbols (std::regex, std::istringstream, ...) come from the
 // `import std;` below. Do NOT also #include standard C++ headers in a
@@ -243,7 +243,7 @@ auto filetime_to_local_st(const FILETIME &ft) -> std::optional<SYSTEMTIME> {
   const long long secs =
       static_cast<long long>(ticks / 10000000ULL) - 11644473600LL;
   const time_t t = static_cast<time_t>(secs);
-  struct tm tmv {};
+  struct tm tmv{};
   if (localtime_s(&tmv, &t) != 0) return std::nullopt;
   SYSTEMTIME st{};
   st.wYear = static_cast<WORD>(tmv.tm_year + 1900);
@@ -269,7 +269,7 @@ auto local_st_to_filetime(const SYSTEMTIME &local) -> std::optional<FILETIME> {
     return ft;
   }
   if (!valid_system_time(local)) return std::nullopt;
-  struct tm tmv {};
+  struct tm tmv{};
   tmv.tm_year = static_cast<int>(local.wYear) - 1900;
   tmv.tm_mon = static_cast<int>(local.wMonth) - 1;
   tmv.tm_mday = static_cast<int>(local.wDay);
@@ -483,8 +483,10 @@ auto parse_fixed_date_time(std::string input, bool use_utc)
     second = *sec;
     if (has_am || has_pm) {
       if (hour < 1 || hour > 12) return std::nullopt;
-      if (has_pm && hour < 12) hour += 12;
-      else if (has_am && hour == 12) hour = 0;
+      if (has_pm && hour < 12)
+        hour += 12;
+      else if (has_am && hour == 12)
+        hour = 0;
     }
   }
 
@@ -700,11 +702,10 @@ auto format_time(const TimeValue &tv, const std::string &format)
           // [GNU] %N prints 9-digit nanoseconds. An explicit width smaller
           // than 9 truncates (%3N -> "123"), a larger width left-pads
           // (%12N), '-' keeps the first digit only.
-          std::string nanos = pad_left(std::to_string(
-                                           static_cast<long long>(
-                                               st.wMilliseconds) *
-                                           1000000),
-                                       9, '0');
+          std::string nanos =
+              pad_left(std::to_string(static_cast<long long>(st.wMilliseconds) *
+                                      1000000),
+                       9, '0');
           if (no_pad) {
             result += nanos.substr(0, 1);
           } else if (has_width) {
@@ -786,7 +787,8 @@ auto format_time(const TimeValue &tv, const std::string &format)
               apply_case(format_time(tv, "%H:%M:%S"), to_uppcase, to_lowcase);
           break;
         case 'R':
-          result += apply_case(format_time(tv, "%H:%M"), to_uppcase, to_lowcase);
+          result +=
+              apply_case(format_time(tv, "%H:%M"), to_uppcase, to_lowcase);
           break;
         case 'r':
           result += apply_case(format_time(tv, "%I:%M:%S %p"), to_uppcase,
@@ -922,8 +924,8 @@ auto strip_relative_items(std::string &s)
       unit_seconds = 3600;
     else if (unit.starts_with("min"))
       unit_seconds = 60;
-    items.push_back({*amount, is_month || is_year, is_year ? 12 : 1,
-                     unit_seconds});
+    items.push_back(
+        {*amount, is_month || is_year, is_year ? 12 : 1, unit_seconds});
     work = trim_copy(work.substr(0, m.position(0)));
   }
   s = work;
@@ -931,8 +933,8 @@ auto strip_relative_items(std::string &s)
 }
 
 auto apply_relative_items(const FILETIME &base,
-                          const std::vector<RelativeItem> &items,
-                          bool use_utc) -> std::optional<FILETIME> {
+                          const std::vector<RelativeItem> &items, bool use_utc)
+    -> std::optional<FILETIME> {
   long long delta_seconds = 0;
   long long delta_months = 0;
   for (const auto &item : items) {
@@ -956,8 +958,8 @@ auto apply_relative_items(const FILETIME &base,
       if (!local) return std::nullopt;
       st = *local;
     }
-    long long total = static_cast<long long>(st.wYear) * 12 +
-                      (st.wMonth - 1) + delta_months;
+    long long total =
+        static_cast<long long>(st.wYear) * 12 + (st.wMonth - 1) + delta_months;
     int year = static_cast<int>(total / 12);
     int month = static_cast<int>(total % 12) + 1;
     if (year < 1 || year > 9999) return std::nullopt;
@@ -1027,7 +1029,7 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
   // hot path free of regex machinery.
   {
     const std::string_view day_words[] = {"yesterday", "today", "tomorrow"};
-    for (const auto& word : day_words) {
+    for (const auto &word : day_words) {
       if (!lower.starts_with(word)) continue;
       std::string rest = trim_copy(lower.substr(word.size()));
       if (rest.empty()) continue;  // bare day word handled above
@@ -1038,8 +1040,8 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
       if (auto space = rest.find(' '); space != std::string::npos) {
         time_part = trim_copy(rest.substr(0, space));
         std::string zone = trim_copy(rest.substr(space + 1));
-        utc_zone = zone == "gmt" || zone == "utc" || zone == "ut" ||
-                   zone == "z";
+        utc_zone =
+            zone == "gmt" || zone == "utc" || zone == "ut" || zone == "z";
         if (!utc_zone) return std::nullopt;
       }
       int hour = -1;
@@ -1049,19 +1051,19 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
         const auto colon1 = time_part.find(':');
         if (colon1 == std::string::npos) return std::nullopt;
         const auto colon2 = time_part.find(':', colon1 + 1);
-        auto parse_field = [](const std::string& text) -> int {
+        auto parse_field = [](const std::string &text) -> int {
           if (text.empty() || text.size() > 2) return -1;
           for (const char ch : text) {
             if (!std::isdigit(static_cast<unsigned char>(ch))) return -1;
           }
-          return (text[0] - '0') * 10 +
-                 (text.size() > 1 ? text[1] - '0' : 0);
+          return (text[0] - '0') * 10 + (text.size() > 1 ? text[1] - '0' : 0);
         };
         hour = parse_field(time_part.substr(0, colon1));
         if (colon2 == std::string::npos) {
           minute = parse_field(time_part.substr(colon1 + 1));
         } else {
-          minute = parse_field(time_part.substr(colon1 + 1, colon2 - colon1 - 1));
+          minute =
+              parse_field(time_part.substr(colon1 + 1, colon2 - colon1 - 1));
           second = parse_field(time_part.substr(colon2 + 1));
         }
       }
@@ -1070,8 +1072,10 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
         return std::nullopt;
       }
       long long day_shift = 0;
-      if (word == "yesterday") day_shift = -86400;
-      else if (word == "tomorrow") day_shift = 86400;
+      if (word == "yesterday")
+        day_shift = -86400;
+      else if (word == "tomorrow")
+        day_shift = 86400;
       const FILETIME shifted = add_seconds(now, day_shift);
       SYSTEMTIME base{};
       if (utc_zone) {
@@ -1171,8 +1175,8 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
     std::smatch mil;
     if (std::regex_match(value, mil, military_re)) {
       const std::string digits = mil[1].str();
-      const char letter = static_cast<char>(std::tolower(
-          static_cast<unsigned char>(mil[2].str()[0])));
+      const char letter = static_cast<char>(
+          std::tolower(static_cast<unsigned char>(mil[2].str()[0])));
       int hour = 0;
       int minute = 0;
       if (digits.size() <= 2) {
@@ -1219,9 +1223,9 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
       if (!as_local) return std::nullopt;
       // Shift from "wall time as local" to "wall time in the target zone"
       const int local_offset = timezone_offset_minutes(now_ft, false);
-      return add_seconds(*as_local, static_cast<long long>(
-                                        local_offset - zone_offset_minutes) *
-                                        60);
+      return add_seconds(
+          *as_local,
+          static_cast<long long>(local_offset - zone_offset_minutes) * 60);
     }
   }
 
@@ -1574,9 +1578,8 @@ REGISTER_COMMAND(
               "date: {}: read error: Is a directory", date_file));
         } else {
           const int open_errno = errno;
-          const char* reason =
-              open_errno != 0 ? std::strerror(open_errno)
-                              : "No such file or directory";
+          const char *reason = open_errno != 0 ? std::strerror(open_errno)
+                                               : "No such file or directory";
           // The common ENOENT case gets a dedicated key so translators can
           // render the whole message; anything else keeps the raw strerror.
           if (std::strcmp(reason, "No such file or directory") == 0) {
@@ -1584,16 +1587,16 @@ REGISTER_COMMAND(
                 "command.date.error.cannot_open",
                 "date: {}: No such file or directory", date_file));
           } else {
-            safeErrorPrintLn(winux::i18n::format(
-                "command.date.error.cannot_open_generic", "date: {}: {}",
-                date_file, reason));
+            safeErrorPrintLn(
+                winux::i18n::format("command.date.error.cannot_open_generic",
+                                    "date: {}: {}", date_file, reason));
           }
         }
         return 1;
       }
     }
-    std::istream& in = from_stdin ? static_cast<std::istream&>(std::cin)
-                                  : static_cast<std::istream&>(file_stream);
+    std::istream &in = from_stdin ? static_cast<std::istream &>(std::cin)
+                                  : static_cast<std::istream &>(file_stream);
     std::string line;
     bool ok = true;
     while (std::getline(in, line)) {

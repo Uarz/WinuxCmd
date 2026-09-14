@@ -554,11 +554,11 @@ auto parse_wrap_size(const std::string& raw)
     -> std::expected<int, std::string> {
   size_t digit_start = 0;
   if (!raw.empty() && (raw[0] == '+' || raw[0] == '-')) digit_start = 1;
-  const bool numeric = digit_start < raw.size() &&
-                       std::ranges::all_of(raw.substr(digit_start),
-                                           [](unsigned char ch) {
-                                             return std::isdigit(ch) != 0;
-                                           });
+  const bool numeric =
+      digit_start < raw.size() &&
+      std::ranges::all_of(
+          raw.substr(digit_start),
+          [](unsigned char ch) { return std::isdigit(ch) != 0; });
   if (numeric) {
     errno = 0;
     const long long value = std::strtoll(raw.c_str(), nullptr, 10);

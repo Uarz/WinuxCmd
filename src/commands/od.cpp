@@ -554,8 +554,7 @@ auto read_file_bytes(const std::string& filename,
     // [GNU] od reports "<name>: <reason>"; a directory operand reads as
     // "Is a directory" on GNU (uutils #12993)
     std::error_code ec;
-    const std::filesystem::path p(
-        native_path::normalize_api_operand(filename));
+    const std::filesystem::path p(native_path::normalize_api_operand(filename));
     if (std::filesystem::is_directory(p, ec)) {
       safeErrorPrintLn("od: " + filename + ": Is a directory");
     } else if (std::filesystem::exists(p, ec)) {
@@ -841,9 +840,9 @@ REGISTER_COMMAND(
         // three separate safeErrorPrint calls made each fragment its own
         // catalog entry — producing a stray "od: " key and leaving the
         // operand and the reason untranslatable.
-        safeErrorPrintLn(winux::i18n::format(
-            "command.od.error.cannot_open",
-            "od: {}: No such file or directory", file_arg));
+        safeErrorPrintLn(
+            winux::i18n::format("command.od.error.cannot_open",
+                                "od: {}: No such file or directory", file_arg));
         ok = false;
         continue;
       }

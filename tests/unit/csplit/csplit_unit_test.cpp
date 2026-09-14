@@ -276,8 +276,7 @@ TEST(csplit, csplit_keep_files_retains_created_files_on_error) {
   // GNU -k keeps the files created before the failure, including the empty
   // in-progress file of the failing pattern.
   EXPECT_EQ(r.exit_code, 1);
-  EXPECT_EQ_TEXT(tmp.read("xx00"),
-                 "1\n2\n3\n4\n5\n6\n7\n8\n9\n");
+  EXPECT_EQ_TEXT(tmp.read("xx00"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n");
   EXPECT_EQ_TEXT(tmp.read("xx01"), "");
 }
 

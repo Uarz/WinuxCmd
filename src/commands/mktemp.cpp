@@ -331,8 +331,7 @@ auto build_config(const CommandContext<MKTEMP_OPTIONS.size()>& ctx)
   // -t flag: interpret template as single file name component, relative
   // to $TMPDIR (or default temp dir). Strip any directory from template.
   if (cfg.use_tmpdir_flag) {
-    cfg.template_str =
-        path_utf8(utf8_path(cfg.template_str).filename());
+    cfg.template_str = path_utf8(utf8_path(cfg.template_str).filename());
     if (cfg.template_str.empty()) {
       cfg.template_str = "tmp.XXXXXXXXXX";
     }
@@ -399,9 +398,8 @@ auto run(const Config& cfg) -> int {
 
   if (!cfg.tmpdir.empty()) {
     base_dir = utf8_path(normalize_win_shell_path(cfg.tmpdir));
-    template_component =
-        path_utf8(utf8_path(normalize_win_shell_path(cfg.template_str))
-                      .filename());
+    template_component = path_utf8(
+        utf8_path(normalize_win_shell_path(cfg.template_str)).filename());
   } else {
     std::filesystem::path template_path =
         utf8_path(normalize_win_shell_path(cfg.template_str));
@@ -447,8 +445,7 @@ auto run(const Config& cfg) -> int {
                     : path_utf8(candidate_path);
 
     // Check if file/directory already exists
-    DWORD attrs =
-        GetFileAttributesW(utf8_to_wstring(temp_file).c_str());
+    DWORD attrs = GetFileAttributesW(utf8_to_wstring(temp_file).c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES) {
       // File doesn't exist, we can use this name
       break;

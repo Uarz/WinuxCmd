@@ -150,8 +150,7 @@ auto decimal_precision(std::string_view text) -> std::optional<int> {
   // [GNU] scientific-notation operands still yield a fixed-point default
   // format: precision is the mantissa's fractional digit count adjusted by
   // the exponent (8.0e-1 -> 2, 8e-1 -> 1, 1.0e5 -> 0).
-  if (auto e_pos = text.find_first_of("eE");
-      e_pos != std::string_view::npos) {
+  if (auto e_pos = text.find_first_of("eE"); e_pos != std::string_view::npos) {
     std::string_view mantissa = text.substr(0, e_pos);
     std::string_view exp_part = text.substr(e_pos + 1);
     long exponent = 0;

@@ -370,8 +370,7 @@ TEST(date, date_file_missing_reports_open_error) {
   TEST_LOG_EXIT_CODE(r);
   TEST_LOG("date -f missing stderr", r.stderr_text);
   EXPECT_EQ(r.exit_code, 1);
-  EXPECT_NE(r.stderr_text.find("No such file or directory"),
-            std::string::npos);
+  EXPECT_NE(r.stderr_text.find("No such file or directory"), std::string::npos);
   EXPECT_NE(r.stderr_text.find("no-such-file.txt"), std::string::npos);
 }
 
@@ -391,8 +390,7 @@ TEST(date, date_file_formats_each_line_and_continues_after_invalid) {
   // [GNU] batch mode reports the invalid line, keeps processing, and exits 1.
   EXPECT_EQ(r.exit_code, 1);
   EXPECT_EQ(r.stdout_text, "2024-01-02\n2025-06-07\n");
-  EXPECT_NE(r.stderr_text.find("invalid date 'not a date'"),
-            std::string::npos);
+  EXPECT_NE(r.stderr_text.find("invalid date 'not a date'"), std::string::npos);
 }
 
 TEST(date, date_file_valid_file_prints_every_line) {
@@ -438,8 +436,8 @@ TEST(date, date_case_flags_composites) {
 
   Pipeline p;
   p.set_cwd(tmp.wpath());
-  p.add(L"date.exe", {L"-u", L"--date", L"@0",
-                      L"+%c|%#c|%^c|%r|%#r|%^r|%x|%#x|%^x"});
+  p.add(L"date.exe",
+        {L"-u", L"--date", L"@0", L"+%c|%#c|%^c|%r|%#r|%^r|%x|%#x|%^x"});
 
   auto r = p.run();
   TEST_LOG_EXIT_CODE(r);

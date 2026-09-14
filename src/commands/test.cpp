@@ -222,8 +222,8 @@ bool parse_decimal_bignum(const std::string& s, bool& negative,
   return true;
 }
 
-int compare_bignum(bool negative_a, const std::string& mag_a,
-                   bool negative_b, const std::string& mag_b) {
+int compare_bignum(bool negative_a, const std::string& mag_a, bool negative_b,
+                   const std::string& mag_b) {
   const bool zero_a = mag_a == "0";
   const bool zero_b = mag_b == "0";
   const bool neg_a = negative_a && !zero_a;
@@ -488,8 +488,8 @@ class TestExpressionParser {
       ++pos_;
       int result = parse_or();
       if (!peek(")")) {
-        syntax_error("missing argument after '" +
-                     std::string(args_[pos_ - 1]) + "'");
+        syntax_error("missing argument after '" + std::string(args_[pos_ - 1]) +
+                     "'");
         return 2;
       }
       ++pos_;

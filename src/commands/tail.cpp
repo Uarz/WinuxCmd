@@ -230,8 +230,7 @@ struct NumericParse {
   bool overflow = false;
 };
 
-auto parse_numeric_with_suffix_status(std::string_view text)
-    -> NumericParse {
+auto parse_numeric_with_suffix_status(std::string_view text) -> NumericParse {
   if (text.empty()) return {};
 
   size_t i = 0;

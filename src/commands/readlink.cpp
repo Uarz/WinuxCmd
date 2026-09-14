@@ -258,15 +258,15 @@ auto check_suffix_resolvable(const std::filesystem::path& prefix,
         (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
       auto handle = open_path_handle(current.wstring(), true);
       if (!handle) {
-        return std::unexpected(winux::i18n::format(
-            "command.readlink.error.too_many_symlinks",
-            "Too many levels of symbolic links"));
+        return std::unexpected(
+            winux::i18n::format("command.readlink.error.too_many_symlinks",
+                                "Too many levels of symbolic links"));
       }
       auto final_path = path_from_handle(handle.get());
       if (!final_path) {
-        return std::unexpected(winux::i18n::format(
-            "command.readlink.error.too_many_symlinks",
-            "Too many levels of symbolic links"));
+        return std::unexpected(
+            winux::i18n::format("command.readlink.error.too_many_symlinks",
+                                "Too many levels of symbolic links"));
       }
     }
   }

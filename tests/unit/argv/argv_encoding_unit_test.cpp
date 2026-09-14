@@ -32,10 +32,10 @@
  * the test does not depend on the compiler's source-charset interpretation
  * (CI runners compile under ACP 1252, not UTF-8).
  */
-#include "framework/winuxtest.h"
-
 #include <filesystem>
 #include <string>
+
+#include "framework/winuxtest.h"
 
 namespace {
 
@@ -95,8 +95,7 @@ TEST(argv, non_ascii_find_root_prints_utf8_paths) {
   TEST_LOG("find utf8 stderr", r.stderr_text);
 
   EXPECT_EQ(r.exit_code, 0);
-  const std::string expected =
-      std::string(kChineseDirUtf8) + "/a.txt";
+  const std::string expected = std::string(kChineseDirUtf8) + "/a.txt";
   EXPECT_TRUE(r.stdout_text.find(expected) != std::string::npos);
 }
 

@@ -83,8 +83,8 @@ auto parse_width(std::string_view value) -> cp::Result<int> {
     return std::unexpected("Numerical result out of range");
   }
   if (ec != std::errc() || ptr != value.data() + value.size() || parsed < 0) {
-    return std::unexpected("invalid number of columns: '" +
-                           std::string(value) + "'");
+    return std::unexpected("invalid number of columns: '" + std::string(value) +
+                           "'");
   }
   return static_cast<int>(parsed);
 }

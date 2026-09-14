@@ -32,10 +32,10 @@
 
 #include "pch/pch.h"
 // include other header after pch.h
-#include "core/command_macros.h"
+#include <cstdlib>  // std::getenv
+#include <ctime>    // localtime_s (TZ env support)
 
-#include <ctime>   // localtime_s (TZ env support)
-#include <cstdlib> // std::getenv
+#include "core/command_macros.h"
 
 import std;
 import core;
@@ -163,14 +163,15 @@ struct Config {
 
 // [GNU] pr.c validates numeric option values via xstrtoui and reports:
 //   pr: '-l PAGE_LENGTH' invalid number of lines: 'abc'
-//   pr: '-l PAGE_LENGTH' invalid number of lines: '0': Numerical result out of range
-//   pr: '-w PAGE_WIDTH' invalid number of characters: '0': Numerical result out of range
+//   pr: '-l PAGE_LENGTH' invalid number of lines: '0': Numerical result out of
+//   range pr: '-w PAGE_WIDTH' invalid number of characters: '0': Numerical
+//   result out of range
 auto parse_positive_number(const std::string& label, const std::string& what,
                            const std::string& value)
     -> std::expected<int, std::string> {
   auto fail = [&](bool out_of_range) {
-    std::string msg = "'" + label + "' invalid number of " + what + ": '" +
-                      value + "'";
+    std::string msg =
+        "'" + label + "' invalid number of " + what + ": '" + value + "'";
     if (out_of_range) msg += ": Numerical result out of range";
     return std::unexpected(msg);
   };
@@ -267,8 +268,10 @@ auto build_config(const CommandContext<PR_OPTIONS.size()>& ctx)
   std::string expand_raw;
   const char* expand_label = "-e";
   for (auto [name, label] :
-       {std::pair{std::string_view("--expand"), std::string_view("--expand-tabs")},
-        std::pair{std::string_view("--expand-tabs"), std::string_view("--expand-tabs")},
+       {std::pair{std::string_view("--expand"),
+                  std::string_view("--expand-tabs")},
+        std::pair{std::string_view("--expand-tabs"),
+                  std::string_view("--expand-tabs")},
         std::pair{std::string_view("-e"), std::string_view("-e")}}) {
     auto v = ctx.get<std::string>(name, "");
     if (!v.empty()) {
@@ -575,9 +578,9 @@ auto now_local_st() -> SYSTEMTIME {
     ULARGE_INTEGER uli{};
     uli.LowPart = now_ft.dwLowDateTime;
     uli.HighPart = now_ft.dwHighDateTime;
-    const time_t t = static_cast<time_t>(uli.QuadPart / 10000000ULL) -
-                     11644473600LL;
-    struct tm tmv {};
+    const time_t t =
+        static_cast<time_t>(uli.QuadPart / 10000000ULL) - 11644473600LL;
+    struct tm tmv{};
     if (localtime_s(&tmv, &t) == 0) {
       SYSTEMTIME st{};
       st.wYear = static_cast<WORD>(tmv.tm_year + 1900);
@@ -748,9 +751,7 @@ auto run(const Config& cfg) -> int {
   // page length. (Savannah #1728)
   const int lines_per_page = body_capacity(cfg);
   const int page_lines_total =
-      cfg.omit_header || cfg.omit_pagination
-          ? lines_per_page
-          : cfg.page_length;
+      cfg.omit_header || cfg.omit_pagination ? lines_per_page : cfg.page_length;
 
   // [GNU] a start page beyond the total page count is reported and nothing
   // is printed (uutils #13557)
@@ -843,8 +844,8 @@ auto run(const Config& cfg) -> int {
       ++lines_on_page;
       if (lines_on_page >= lines_per_page && !cfg.omit_pagination) {
         // [GNU] Every page is filled to the page length before the break.
-        for (int pad = page_lines_total - header_block_lines(cfg) -
-                       lines_on_page;
+        for (int pad =
+                 page_lines_total - header_block_lines(cfg) - lines_on_page;
              pad > 0; --pad) {
           safePrintLn("");
         }
@@ -917,8 +918,8 @@ auto run(const Config& cfg) -> int {
       ++lines_on_page;
       if (lines_on_page >= lines_per_page) {
         // [GNU] Every page is filled to the page length before the break.
-        for (int pad = page_lines_total - header_block_lines(cfg) -
-                       lines_on_page;
+        for (int pad =
+                 page_lines_total - header_block_lines(cfg) - lines_on_page;
              pad > 0; --pad) {
           safePrintLn("");
         }

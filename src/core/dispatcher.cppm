@@ -948,17 +948,14 @@ class RegistryImpl {
     {
       static constexpr std::string_view kLiteralArgCommands[] = {
           "echo", "yes", "test", "[", "true", "false"};
-      const bool literal_args =
-          std::ranges::any_of(kLiteralArgCommands, [cmdName](auto n) {
-            return n == cmdName;
-          });
+      const bool literal_args = std::ranges::any_of(
+          kLiteralArgCommands, [cmdName](auto n) { return n == cmdName; });
       if (!literal_args) {
         std::vector<std::string> abbrev_storage;
         bool end_of_options = false;
         std::optional<std::string> ambiguous;
         for (std::string_view arg : effective_args) {
-          if (end_of_options || arg.size() <= 2 ||
-              !arg.starts_with("--")) {
+          if (end_of_options || arg.size() <= 2 || !arg.starts_with("--")) {
             if (arg == "--") end_of_options = true;
             abbrev_storage.emplace_back(arg);
             continue;

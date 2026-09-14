@@ -2448,9 +2448,9 @@ auto install_package(const Options& opts, std::string_view package_name)
       opts.force);
   if (preflight) return *preflight;
 
-  auto downloaded = download_artifact(opts.root, pkg->value("name", ""),
-                                      *artifact, opts.verbose,
-                                      user_forced_proxy(opts));
+  auto downloaded =
+      download_artifact(opts.root, pkg->value("name", ""), *artifact,
+                        opts.verbose, user_forced_proxy(opts));
   if (!downloaded) return 1;
 
   fs::path extracted = staging_dir(opts.root) / pkg->value("name", "package");
@@ -3797,7 +3797,8 @@ auto print_usage() -> int {
       "downloads (env: HTTP_PROXY,\n"
       "                                        HTTPS_PROXY, WPM_HTTP_PROXY, "
       "WPM_HTTPS_PROXY, NO_PROXY)\n"
-      "      --from <manifest>                 install packages from a manifest "
+      "      --from <manifest>                 install packages from a "
+      "manifest "
       "file or URL\n"
       "                                        (TOML, JSON, or plain list)\n"
       "      --help                            display this help and exit\n"

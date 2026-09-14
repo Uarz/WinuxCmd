@@ -98,14 +98,13 @@ auto format_uptime_clock(std::chrono::seconds uptime) -> std::string {
 
   char buf[64];
   if (days.count() > 0) {
-    std::string day_part = std::to_string(days.count()) +
-                           (days.count() == 1 ? " day" : " days");
+    std::string day_part =
+        std::to_string(days.count()) + (days.count() == 1 ? " day" : " days");
     snprintf(buf, sizeof(buf), "%s, %2d:%02d", day_part.c_str(),
              static_cast<int>(hours.count()),
              static_cast<int>(minutes.count()));
   } else {
-    snprintf(buf, sizeof(buf), "%2d:%02d",
-             static_cast<int>(hours.count()),
+    snprintf(buf, sizeof(buf), "%2d:%02d", static_cast<int>(hours.count()),
              static_cast<int>(minutes.count()));
   }
   return std::string(buf);

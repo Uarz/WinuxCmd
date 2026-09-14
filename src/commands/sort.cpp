@@ -466,9 +466,8 @@ auto parse_key_position(std::string_view text)
   // [GNU] overflowing field/char numbers are accepted and clamp (the field is
   // beyond every line, so the key is empty; uutils #7185).
   unsigned long long field_big = 0;
-  auto [ptr, ec] = std::from_chars(field_text.data(),
-                                   field_text.data() + field_text.size(),
-                                   field_big);
+  auto [ptr, ec] = std::from_chars(
+      field_text.data(), field_text.data() + field_text.size(), field_big);
   if ((ec != std::errc() && ec != std::errc::result_out_of_range) ||
       ptr != field_text.data() + field_text.size()) {
     return std::unexpected("invalid key spec");
@@ -1709,7 +1708,8 @@ auto external_sort(const Config& cfg) -> cp::Result<int> {
       cfg.temporary_directory_hint.empty()
           ? std::filesystem::temp_directory_path()
           // Wide form: the narrow path ctor decodes via the system ACP (#88).
-          : std::filesystem::path(utf8_to_wstring(cfg.temporary_directory_hint));
+          : std::filesystem::path(
+                utf8_to_wstring(cfg.temporary_directory_hint));
   auto make_run = [&](std::vector<std::string>& records) -> cp::Result<bool> {
     if (records.empty()) return true;
     auto before = [&](const std::string& a, const std::string& b) {
@@ -1788,7 +1788,8 @@ auto external_sort(const Config& cfg) -> cp::Result<int> {
   }
 
   for (auto& path : temporary_paths) {
-    ExternalRun run{path, file_io::open_binary_file(wstring_to_utf8(path.wstring()))};
+    ExternalRun run{path,
+                    file_io::open_binary_file(wstring_to_utf8(path.wstring()))};
     if (!run.input.is_open())
       return std::unexpected("cannot open temporary file");
     run.has_current =

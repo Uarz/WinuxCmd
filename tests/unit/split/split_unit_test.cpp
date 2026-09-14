@@ -135,7 +135,7 @@ TEST(split, split_number_mode_reassembles_without_overlap) {
 
   EXPECT_EQ(r.exit_code, 0);
   std::string rebuilt;
-  for (const char *suffix : {"aa", "ab", "ac", "ad"}) {
+  for (const char* suffix : {"aa", "ab", "ac", "ad"}) {
     rebuilt += tmp.read(std::string("part") + suffix);
   }
   EXPECT_EQ(rebuilt, input);
@@ -312,10 +312,9 @@ TEST(split, split_invalid_size_messages_quote_argument) {
 
   // GNU strtoint_die quotes the rejected argument for every size option.
   const wchar_t* flag_sets[][2] = {
-      {L"-l", L"0"},        {L"-l", L"x"},        {L"-l", L"2fb"},
-      {L"-b", L"0"},        {L"-b", L"abc"},      {L"-C", L"0"},
-      {L"-n", L"0"},        {L"-n", L"x"},        {L"-n", L"1/0"},
-      {L"-n", L"0/3"},      {L"-n", L"a/3"},      {L"-n", L"1/2/3"},
+      {L"-l", L"0"},   {L"-l", L"x"},   {L"-l", L"2fb"}, {L"-b", L"0"},
+      {L"-b", L"abc"}, {L"-C", L"0"},   {L"-n", L"0"},   {L"-n", L"x"},
+      {L"-n", L"1/0"}, {L"-n", L"0/3"}, {L"-n", L"a/3"}, {L"-n", L"1/2/3"},
   };
   const char* expected[] = {
       "split: invalid number of lines: '0'\n",

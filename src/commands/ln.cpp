@@ -123,14 +123,12 @@ auto relative_symlink_target(const std::string &source,
   std::error_code ec;
   // Build paths from the wide form: the narrow path ctor decodes via the
   // system ACP, which mangles non-ASCII UTF-8 sources/targets (#88).
-  auto source_path =
-      std::filesystem::absolute(utf8_to_wstring(source), ec);
+  auto source_path = std::filesystem::absolute(utf8_to_wstring(source), ec);
   if (ec) return source;
-  auto target_path =
-      std::filesystem::absolute(utf8_to_wstring(target), ec);
+  auto target_path = std::filesystem::absolute(utf8_to_wstring(target), ec);
   if (ec) return source;
-  auto relative = std::filesystem::relative(source_path,
-                                            target_path.parent_path(), ec);
+  auto relative =
+      std::filesystem::relative(source_path, target_path.parent_path(), ec);
   return ec ? source : wstring_to_utf8(relative.wstring());
 }
 

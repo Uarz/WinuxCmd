@@ -484,9 +484,9 @@ auto render_format(std::string_view format, const std::string& filename,
                                 reparse_buffer.data(),
                                 static_cast<DWORD>(reparse_buffer.size()),
                                 &returned, nullptr)) {
-              auto* reparse = reinterpret_cast<
-                  stat_win32_compat::ReparseDataBuffer*>(
-                  reparse_buffer.data());
+              auto* reparse =
+                  reinterpret_cast<stat_win32_compat::ReparseDataBuffer*>(
+                      reparse_buffer.data());
               std::wstring target;
               if (reparse->ReparseTag == IO_REPARSE_TAG_SYMLINK) {
                 const auto& sl = reparse->SymbolicLinkReparseBuffer;

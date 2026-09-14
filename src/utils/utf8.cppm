@@ -89,9 +89,9 @@ export auto is_valid_utf8(const std::string_view& text) -> bool {
       if (!continuation(cont)) return false;
       codepoint = (codepoint << 6) | (cont & 0x3F);
     }
-    if (length == 2 && codepoint < 0x80) return false;      // overlong
-    if (length == 3 && codepoint < 0x800) return false;     // overlong
-    if (length == 4 && codepoint < 0x10000) return false;   // overlong
+    if (length == 2 && codepoint < 0x80) return false;     // overlong
+    if (length == 3 && codepoint < 0x800) return false;    // overlong
+    if (length == 4 && codepoint < 0x10000) return false;  // overlong
     if (codepoint > 0x10FFFF) return false;
     if (codepoint >= 0xD800 && codepoint <= 0xDFFF) return false;  // surrogate
     p += length;

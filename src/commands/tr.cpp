@@ -210,8 +210,9 @@ auto parse_repeat_spec(std::string_view digits) -> cp::Result<RepeatSpec> {
     return spec;
   }
   if (digits[0] < '0' || digits[0] > '9') {
-    return std::unexpected(make_dynamic_error(
-        "invalid repeat count '" + std::string(digits) + "' in [c*n] construct"));
+    return std::unexpected(make_dynamic_error("invalid repeat count '" +
+                                              std::string(digits) +
+                                              "' in [c*n] construct"));
   }
 
   // GNU parses the count in octal when the first digit is '0' (xstrtoumax).
@@ -220,9 +221,9 @@ auto parse_repeat_spec(std::string_view digits) -> cp::Result<RepeatSpec> {
   bool overflow = false;
   for (char ch : digits) {
     if (ch < '0' || ch >= static_cast<char>('0' + base)) {
-      return std::unexpected(make_dynamic_error(
-          "invalid repeat count '" + std::string(digits) +
-          "' in [c*n] construct"));
+      return std::unexpected(make_dynamic_error("invalid repeat count '" +
+                                                std::string(digits) +
+                                                "' in [c*n] construct"));
     }
     size_t digit = static_cast<size_t>(ch - '0');
     if (count > (std::numeric_limits<size_t>::max() - digit) / base) {
@@ -232,8 +233,9 @@ auto parse_repeat_spec(std::string_view digits) -> cp::Result<RepeatSpec> {
     count = count * base + digit;
   }
   if (overflow) {
-    return std::unexpected(make_dynamic_error(
-        "invalid repeat count '" + std::string(digits) + "' in [c*n] construct"));
+    return std::unexpected(make_dynamic_error("invalid repeat count '" +
+                                              std::string(digits) +
+                                              "' in [c*n] construct"));
   }
   if (count == 0) {
     spec.indefinite = true;  // [c*0] behaves like [c*]
@@ -277,9 +279,9 @@ auto parse_set_atom(std::string_view& str, RepeatSpec* repeat_out)
             return *atom;
           }
           // No repeat context (e.g. a range endpoint): expand here.
-          size_t n = spec->indefinite ? 0
-                                      : std::min(spec->count,
-                                                 kMaxMaterializedRepeat);
+          size_t n = spec->indefinite
+                         ? 0
+                         : std::min(spec->count, kMaxMaterializedRepeat);
           return std::string(n, (*atom)[0]);
         }
       }
@@ -316,8 +318,8 @@ auto parse_set(std::string_view str) -> cp::Result<SetParseResult> {
       continue;  // contributes nothing until the fill phase
     }
     if (spec.count > 0) {
-      result += std::string(std::min(spec.count, kMaxMaterializedRepeat),
-                            (*atom)[0]);
+      result +=
+          std::string(std::min(spec.count, kMaxMaterializedRepeat), (*atom)[0]);
       continue;
     }
 

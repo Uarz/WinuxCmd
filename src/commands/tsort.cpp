@@ -62,18 +62,17 @@ REGISTER_COMMAND(tsort,
   std::string tok;
   while (tok_ss >> tok) tokens.push_back(tok);
   if (tokens.size() % 2 != 0) {
-    safeErrorPrintLn(::winux::i18n::format(
-        "command.tsort.error.odd_tokens",
-        "tsort: input contains an odd number of tokens"));
+    safeErrorPrintLn(
+        ::winux::i18n::format("command.tsort.error.odd_tokens",
+                              "tsort: input contains an odd number of tokens"));
     return 1;
   }
 
   std::set<std::string> nodes;
   std::map<std::string, std::vector<std::string>> graph;
   std::set<std::pair<std::string, std::string>> seen_pairs;
-  const std::string input_name = ctx.positionals.empty()
-                                     ? "-"
-                                     : std::string(ctx.positionals[0]);
+  const std::string input_name =
+      ctx.positionals.empty() ? "-" : std::string(ctx.positionals[0]);
 
   for (size_t i = 0; i + 1 < tokens.size(); i += 2) {
     const std::string& node = tokens[i];

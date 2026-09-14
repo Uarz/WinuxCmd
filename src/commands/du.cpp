@@ -858,8 +858,7 @@ auto get_inode_key(const std::wstring& path) -> std::wstring {
   std::wstring key;
   if (GetFileInformationByHandle(hFile, &info)) {
     const uint64_t index =
-        (static_cast<uint64_t>(info.nFileIndexHigh) << 32) |
-        info.nFileIndexLow;
+        (static_cast<uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
     key = std::to_wstring(info.dwVolumeSerialNumber) + L":" +
           std::to_wstring(index);
   }
@@ -891,13 +890,13 @@ auto get_file_size(const std::wstring& path) -> uint64_t {
  * @param summarize Only show totals for arguments
  * @return Total size
  */
-auto calculate_dir_size(
-    const std::wstring& path,
-    std::unordered_map<std::wstring, uint64_t>& sizes,
-    std::unordered_map<std::wstring, FILETIME>& times, int current_depth,
-    const DuConfig& cfg, std::unordered_set<std::wstring>& seen_inodes,
-    std::unordered_set<std::wstring>& visited_dirs,
-    const std::wstring& root_drive = L"") -> UsageSummary {
+auto calculate_dir_size(const std::wstring& path,
+                        std::unordered_map<std::wstring, uint64_t>& sizes,
+                        std::unordered_map<std::wstring, FILETIME>& times,
+                        int current_depth, const DuConfig& cfg,
+                        std::unordered_set<std::wstring>& seen_inodes,
+                        std::unordered_set<std::wstring>& visited_dirs,
+                        const std::wstring& root_drive = L"") -> UsageSummary {
   WIN32_FIND_DATAW find_data;
   std::wstring search_path = path + L"\\*";
   HANDLE hFind = FindFirstFileW(search_path.c_str(), &find_data);
@@ -955,9 +954,9 @@ auto calculate_dir_size(
       // (FindFirstFile already handles this for most cases)
 
       // Recursively calculate subdirectory size
-      UsageSummary child_summary = calculate_dir_size(
-          full_path, sizes, times, child_depth, cfg, seen_inodes, visited_dirs,
-          drive);
+      UsageSummary child_summary =
+          calculate_dir_size(full_path, sizes, times, child_depth, cfg,
+                             seen_inodes, visited_dirs, drive);
       if (!cfg.separate_dirs) {
         summary.size += child_summary.size;
       }
@@ -1114,8 +1113,8 @@ auto print_disk_usage(const CommandContext<DU_OPTIONS.size()>& ctx)
         continue;
       }
       // Calculate directory size
-      UsageSummary dir_summary = calculate_dir_size(
-          wpath, sizes, times, 0, cfg, seen_inodes, visited_dirs);
+      UsageSummary dir_summary = calculate_dir_size(wpath, sizes, times, 0, cfg,
+                                                    seen_inodes, visited_dirs);
 
       // Print directory size
       uint64_t dir_size = sizes[wpath];

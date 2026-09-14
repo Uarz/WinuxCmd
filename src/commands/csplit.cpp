@@ -324,27 +324,53 @@ struct PatternApplication {
   Segment output;
   size_t next_start = 0;
   size_t matched_line = 0;
+  // Next index a regexp scan examines. GNU tracks the scan position
+  // independently of the output position: a matched line is consumed even
+  // when it becomes the first line of the next output file, and with a
+  // positive offset the lines up to the boundary are consumed as well.
+  size_t scan_next = 0;
 };
 
 auto apply_pattern(const std::vector<std::string>& lines,
                    const ParsedPattern& pattern,
-                   const std::string& pattern_text, size_t current,
-                   bool repeated) -> cp::Result<PatternApplication> {
+                   const std::string& pattern_text, size_t current, size_t scan,
+                   bool repeated, bool suppress_matched, size_t repetition)
+    -> cp::Result<PatternApplication> {
+  auto out_of_range = [&]() -> cp::Result<PatternApplication> {
+    std::string message = "'" + pattern_text + "': line number out of range";
+    // GNU appends the repetition number when the failure happens during a
+    // {N}/{*} repeat: "csplit: '3': line number out of range on repetition 3".
+    if (repetition > 0) {
+      message += " on repetition " + std::to_string(repetition);
+    }
+    return std::unexpected(message);
+  };
+
   PatternApplication result;
   result.skip = pattern.skip;
   result.output.begin = current;
+  result.scan_next = scan;
 
   if (pattern.kind == ParsedPattern::Kind::LineNumber) {
     size_t boundary =
         repeated ? current + pattern.line_number : pattern.line_number - 1;
-    if (boundary > lines.size() || boundary < current) {
-      return std::unexpected("'" + pattern_text +
-                             "': line number out of range");
+    // Without --suppress-matched GNU requires the boundary line itself to
+    // exist: after writing the segment it checks that more input remains.
+    // With --suppress-matched a boundary at EOF is allowed because the
+    // suppressed-line removal simply finds nothing left to drop.
+    if (boundary < current || boundary > lines.size() ||
+        (!suppress_matched && boundary == lines.size())) {
+      return out_of_range();
     }
     result.found = true;
     result.matched_line = boundary;
     result.output.end = boundary;
     result.next_start = boundary;
+    // After a line-count pattern GNU leaves the boundary line available to
+    // the next regexp scan; --suppress-matched removes it, so the scan then
+    // resumes after the dropped line.
+    result.scan_next =
+        suppress_matched && boundary < lines.size() ? boundary + 1 : boundary;
     return result;
   }
 
@@ -353,15 +379,14 @@ auto apply_pattern(const std::vector<std::string>& lines,
   if (!re) {
     return std::unexpected("invalid regular expression");
   }
-  for (size_t i = current; i < lines.size(); ++i) {
+  for (size_t i = scan; i < lines.size(); ++i) {
     if (re.pattern.find_all(line_for_regex(lines[i])).empty()) continue;
 
     int64_t boundary_signed =
         static_cast<int64_t>(i) + static_cast<int64_t>(pattern.offset);
     if (boundary_signed < static_cast<int64_t>(current) ||
         boundary_signed > static_cast<int64_t>(lines.size())) {
-      return std::unexpected("'" + pattern_text +
-                             "': line number out of range");
+      return out_of_range();
     }
 
     size_t boundary = static_cast<size_t>(boundary_signed);
@@ -369,6 +394,7 @@ auto apply_pattern(const std::vector<std::string>& lines,
     result.matched_line = i;
     result.output.end = boundary;
     result.next_start = boundary;
+    result.scan_next = std::max(i, boundary) + 1;
     return result;
   }
 
@@ -533,6 +559,9 @@ auto run(const Config& cfg) -> int {
     RepeatSpec repeat;
   };
   std::vector<BoundPattern> plan;
+  // [GNU] Line-number patterns must be non-decreasing: a smaller value is a
+  // fatal parse-time error, an equal value only warns and still runs.
+  std::optional<size_t> last_line_number;
   for (size_t i = 0; i < cfg.patterns.size(); ++i) {
     std::string pattern_text = cfg.patterns[i];
     auto pattern_result = parse_pattern(pattern_text);
@@ -544,6 +573,26 @@ auto run(const Config& cfg) -> int {
     BoundPattern bound;
     bound.text = pattern_text;
     bound.pattern = *pattern_result;
+
+    if (bound.pattern.kind == ParsedPattern::Kind::LineNumber &&
+        last_line_number.has_value()) {
+      if (bound.pattern.line_number < *last_line_number) {
+        cp::Result<int> error = std::unexpected(
+            "line number '" + std::to_string(bound.pattern.line_number) +
+            "' is smaller than preceding line number, " +
+            std::to_string(*last_line_number));
+        cp::report_error(error, L"csplit");
+        return 1;
+      }
+      if (bound.pattern.line_number == *last_line_number) {
+        safeErrorPrint("csplit: warning: line number '" +
+                       std::to_string(bound.pattern.line_number) +
+                       "' is the same as preceding line number\n");
+      }
+    }
+    if (bound.pattern.kind == ParsedPattern::Kind::LineNumber) {
+      last_line_number = bound.pattern.line_number;
+    }
 
     if (bound.pattern.kind == ParsedPattern::Kind::Regex) {
       auto re = portable_regex::compile(portable_regex::Syntax::Basic,
@@ -571,6 +620,7 @@ auto run(const Config& cfg) -> int {
     plan.push_back(std::move(bound));
   }
 
+  size_t scan = 0;  // next index examined by regexp matching
   for (const auto& bound : plan) {
     const std::string& pattern_text = bound.text;
     const ParsedPattern& pattern = bound.pattern;
@@ -580,8 +630,8 @@ auto run(const Config& cfg) -> int {
         repeat.has_repeat && !repeat.until_exhausted ? repeat.count + 1 : 1;
     bool repeated = false;
     for (size_t application = 0;; ++application) {
-      auto applied =
-          apply_pattern(lines, pattern, pattern_text, current, repeated);
+      auto applied = apply_pattern(lines, pattern, pattern_text, current, scan,
+                                   repeated, cfg.suppress_matched, application);
       if (!applied) {
         // GNU flushes its in-progress output file before dying:
         // line-number patterns and regexes with a non-negative offset
@@ -602,7 +652,21 @@ auto run(const Config& cfg) -> int {
         return finish_with_error(applied.error());
       }
       if (!applied->found) {
-        if (repeat.until_exhausted && repeated) break;
+        if (repeat.until_exhausted) {
+          // A {*}-style repeat ends the whole split at the first failed
+          // application: GNU flushes the remaining input into the
+          // in-progress file (dropping it entirely for %skip% patterns) and
+          // exits without running any further patterns or creating a final
+          // file afterwards.
+          if (!pattern.skip) {
+            auto in_progress = writer.materialize_in_progress(
+                Segment{current, lines.size()}, true);
+            if (!in_progress) {
+              return finish_with_error(in_progress.error());
+            }
+          }
+          return 0;
+        }
         // GNU streams everything scanned so far into the in-progress file
         // before reporting that the pattern never matched.
         if (!pattern.skip) {
@@ -612,14 +676,20 @@ auto run(const Config& cfg) -> int {
             return finish_with_error(in_progress.error());
           }
         }
-        return finish_with_error("'" + pattern_text + "': match not found");
+        std::string message = "'" + pattern_text + "': match not found";
+        if (application > 0) {
+          message += " on repetition " + std::to_string(application);
+        }
+        return finish_with_error(message);
       }
 
-      if (cfg.suppress_matched && applied->matched_line < suppress.size()) {
-        suppress[applied->matched_line] = true;
+      // [GNU] --suppress-matched drops the line at the split boundary (the
+      // first line of the next output file), which is not necessarily the
+      // line the regexp matched when an offset is given.
+      if (cfg.suppress_matched && applied->next_start < suppress.size()) {
+        suppress[applied->next_start] = true;
       }
 
-      size_t old_current = current;
       if (!applied->skip) {
         auto written = writer.write_segment(applied->output);
         if (!written) {
@@ -627,9 +697,13 @@ auto run(const Config& cfg) -> int {
         }
       }
       current = applied->next_start;
+      scan = applied->scan_next;
       repeated = true;
 
-      if (repeat.until_exhausted && current != old_current) continue;
+      // {*}-style repeats run until an application fails; regexp scans
+      // always make progress (scan_next strictly increases) and line
+      // numbers keep growing, so the loop cannot spin forever.
+      if (repeat.until_exhausted) continue;
       if (application + 1 >= applications) break;
     }
   }

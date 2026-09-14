@@ -506,13 +506,24 @@ auto output_tail_seekable_lines(std::ifstream& input, const TailConfig& config)
 }
 
 auto output_new_data(std::ifstream& input, std::streampos& offset,
-                     std::string_view header = {}) -> bool {
+                     std::string_view header = {},
+                     std::string_view diag_name = {}) -> bool {
   input.clear();
   input.seekg(0, std::ios::end);
   auto end = input.tellg();
   if (end == std::streampos(-1)) return !input.bad();
 
-  if (end < offset) offset = 0;
+  if (end < offset) {
+    // [GNU] A shrinking file reports "tail: NAME: file truncated" once and
+    // is then followed from the start.
+    if (!diag_name.empty()) {
+      safeErrorPrint("tail: ");
+      safeErrorPrint(winux::i18n::format("command.tail.follow.file_truncated",
+                                         "{}: file truncated", diag_name));
+      safeErrorPrint("\n");
+    }
+    offset = 0;
+  }
   if (end == offset) return true;
 
   input.clear();
@@ -672,6 +683,9 @@ auto build_config(const CommandContext<N>& ctx) -> cp::Result<TailConfig> {
 
     if (option_matches(meta, "-F", "")) {
       config.follow_by_name = true;
+      // [GNU] -F is shorthand for --follow=name --retry; --follow=name on
+      // its own does not retry.
+      config.retry = true;
       continue;
     }
 
@@ -693,7 +707,7 @@ auto build_config(const CommandContext<N>& ctx) -> cp::Result<TailConfig> {
   config.follow = ctx.get<bool>("-f", false) || ctx.has("--follow") ||
                   config.follow_by_name;
   config.explicit_retry = ctx.get<bool>("--retry", false);
-  config.retry = config.explicit_retry || config.follow_by_name;
+  config.retry = config.retry || config.explicit_retry;
   for (int pid : ctx.template get_all<int>("--pid")) {
     if (pid < 0) return std::unexpected("invalid process ID");
     config.follow_pids.push_back(static_cast<DWORD>(pid));
@@ -758,112 +772,20 @@ auto build_config(const CommandContext<N>& ctx) -> cp::Result<TailConfig> {
 
   return config;
 }
-auto open_file_with_retry(const std::string& file, const TailConfig& config)
-    -> std::optional<std::ifstream> {
-  while (true) {
-    std::ifstream input = open_input_file(file);
-    if (input.is_open()) return input;
-    if (!config.retry || should_stop_follow(config)) return std::nullopt;
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  }
-}
-
-auto follow_descriptor(const std::string& file, const TailConfig& config)
-    -> bool {
-  std::ifstream monitor_file = open_input_file(file);
-  if (!monitor_file.is_open()) {
-    safeErrorPrint("tail: cannot open '");
-    safeErrorPrint(file);
-    safeErrorPrint("' for following\n");
-    return false;
-  }
-
-  monitor_file.seekg(0, std::ios::end);
-  auto offset = monitor_file.tellg();
-  if (offset == std::streampos(-1)) offset = 0;
-
-  while (true) {
-    if (should_stop_follow(config)) break;
-    std::this_thread::sleep_for(config.sleep_interval);
-    if (!output_new_data(monitor_file, offset)) {
-      safeErrorPrint("tail: error reading '");
-      safeErrorPrint(file);
-      safeErrorPrint("' while following\n");
-      return false;
-    }
-  }
-
-  return true;
-}
-
-auto follow_name(const std::string& file, const TailConfig& config,
-                 std::optional<FileIdentity> identity, std::streampos offset)
-    -> bool {
-  std::uintmax_t unchanged_stats = 0;
-
-  while (true) {
-    if (should_stop_follow(config)) break;
-    std::this_thread::sleep_for(config.sleep_interval);
-
-    auto current_status = read_file_status(file);
-    if (!current_status) {
-      if (config.retry) continue;
-      safeErrorPrint("tail: cannot open '");
-      safeErrorPrint(file);
-      safeErrorPrint("' for following\n");
-      return false;
-    }
-
-    bool identity_changed =
-        !identity || !same_identity(*identity, current_status->identity);
-    bool unchanged = current_status->size == streampos_to_size(offset);
-
-    if (identity_changed) {
-      if (unchanged_stats < config.max_unchanged_stats) {
-        ++unchanged_stats;
-        continue;
-      }
-      identity = current_status->identity;
-      offset = 0;
-      unchanged_stats = 0;
-    } else if (unchanged) {
-      if (unchanged_stats < config.max_unchanged_stats) {
-        ++unchanged_stats;
-      } else {
-        unchanged_stats = 0;
-      }
-      continue;
-    } else {
-      unchanged_stats = 0;
-    }
-
-    std::ifstream current = open_input_file(file);
-    if (!current.is_open()) {
-      if (config.retry) continue;
-      safeErrorPrint("tail: cannot open '");
-      safeErrorPrint(file);
-      safeErrorPrint("' for following\n");
-      return false;
-    }
-
-    if (!output_new_data(current, offset)) {
-      safeErrorPrint("tail: error reading '");
-      safeErrorPrint(file);
-      safeErrorPrint("' while following\n");
-      return false;
-    }
-  }
-
-  return true;
-}
-
 struct FollowTarget {
   std::string file;
   std::optional<FileIdentity> identity;
   std::streampos offset = 0;
-  std::uintmax_t unchanged_stats = 0;
   std::ifstream descriptor;
+  // [GNU] Count of consecutive polls that saw no size change; when it
+  // reaches --max-unchanged-stats the file is reopened by name even though
+  // the size still matches, mirroring GNU's periodic fstat refresh.
+  std::uintmax_t unchanged_stats = 0;
   bool active = true;
+  // [GNU] Whether the name last resolved to a readable file; drives the
+  // once-per-transition "has become inaccessible" / "has appeared"
+  // diagnostics while --retry keeps polling an absent file.
+  bool accessible = true;
 };
 
 auto follow_header(const FollowTarget& target, const TailConfig& config)
@@ -912,24 +834,59 @@ auto emit_retry_warning(const TailConfig& config) -> void {
   }
 }
 
+// [GNU] Shared "name disappeared" diagnostic used while following: with
+// --retry the name stays in the follow set and the transition is reported
+// once, otherwise the target is dropped like GNU's recheck() does.
+auto report_follow_inaccessible(FollowTarget& target, const TailConfig& config)
+    -> bool {
+  if (config.retry) {
+    if (target.accessible) {
+      target.accessible = false;
+      safeErrorPrint(
+          winux::i18n::format("command.tail.follow.inaccessible",
+                              "tail: '{}' has become inaccessible: {}\n",
+                              target.file, describe_open_failure(target.file)));
+    }
+    return true;
+  }
+  safeErrorPrint("tail: ");
+  safeErrorPrint(target.file);
+  safeErrorPrint(": ");
+  safeErrorPrint(describe_open_failure(target.file));
+  safeErrorPrint("\n");
+  target.active = false;
+  return false;
+}
+
+auto report_follow_reappeared(FollowTarget& target) -> void {
+  target.accessible = true;
+  safeErrorPrint(winux::i18n::format(
+      "command.tail.follow.appeared",
+      "tail: '{}' has appeared;  following new file\n", target.file));
+}
+
 auto follow_descriptor_target(FollowTarget& target, const TailConfig& config,
                               bool multi) -> bool {
   if (!target.descriptor.is_open()) {
     target.descriptor = open_input_file(target.file);
     if (!target.descriptor.is_open()) {
-      safeErrorPrint("tail: cannot open '");
-      safeErrorPrint(target.file);
-      safeErrorPrint("' for following\n");
-      target.active = false;
-      return false;
+      return report_follow_inaccessible(target, config);
     }
-    target.descriptor.seekg(0, std::ios::end);
-    target.offset = target.descriptor.tellg();
-    if (target.offset == std::streampos(-1)) target.offset = 0;
+    if (!target.accessible) {
+      // [GNU] A file that (re)appears while --retry polls is followed from
+      // its beginning, not just from its end.
+      report_follow_reappeared(target);
+      target.offset = 0;
+    } else {
+      target.descriptor.seekg(0, std::ios::end);
+      target.offset = target.descriptor.tellg();
+      if (target.offset == std::streampos(-1)) target.offset = 0;
+    }
   }
 
   if (!output_new_data(target.descriptor, target.offset,
-                       multi ? follow_header(target, config) : "")) {
+                       multi ? follow_header(target, config) : "",
+                       target.file)) {
     safeErrorPrint("tail: error reading '");
     safeErrorPrint(target.file);
     safeErrorPrint("' while following\n");
@@ -939,54 +896,62 @@ auto follow_descriptor_target(FollowTarget& target, const TailConfig& config,
   return true;
 }
 
+// [GNU] --follow=name recheck(): the path is statted by name every poll, so
+// replacement (rename+recreate, symlink repoint) is detected as soon as the
+// volume/index pair changes rather than only after --max-unchanged-stats
+// quiet iterations.
 auto follow_name_target(FollowTarget& target, const TailConfig& config,
                         bool multi) -> bool {
   auto current_status = read_file_status(target.file);
   if (!current_status) {
-    if (config.retry) return true;
-    safeErrorPrint("tail: cannot open '");
-    safeErrorPrint(target.file);
-    safeErrorPrint("' for following\n");
-    target.active = false;
-    return false;
+    return report_follow_inaccessible(target, config);
   }
 
-  bool identity_changed =
-      !target.identity ||
-      !same_identity(*target.identity, current_status->identity);
-  bool unchanged = current_status->size == streampos_to_size(target.offset);
-
-  if (identity_changed) {
-    if (target.unchanged_stats < config.max_unchanged_stats) {
-      ++target.unchanged_stats;
-      return true;
-    }
+  bool reopen_from_start = false;
+  if (!target.accessible) {
+    report_follow_reappeared(target);
     target.identity = current_status->identity;
+    reopen_from_start = true;
+  } else if (target.identity &&
+             !same_identity(*target.identity, current_status->identity)) {
+    // [GNU] tail.c recheck: diagnose replacement of the followed file name.
+    safeErrorPrint(winux::i18n::format(
+        "command.tail.replaced",
+        "tail: '{}' has been replaced;  following new file\n", target.file));
+    target.identity = current_status->identity;
+    reopen_from_start = true;
+  } else if (!target.identity) {
+    target.identity = current_status->identity;
+  }
+
+  if (reopen_from_start) {
     target.offset = 0;
     target.unchanged_stats = 0;
-  } else if (unchanged) {
+  } else if (current_status->size == streampos_to_size(target.offset)) {
+    // [GNU] --max-unchanged-stats=N: after N unchanged polls GNU reopens
+    // the file because its followed descriptor could be stale.  This
+    // implementation stats the path by name every poll, so the identity
+    // check above already sees a replacement; the periodic reopen below is
+    // kept so a same-size rewrite still produces a fresh open like GNU.
     if (target.unchanged_stats < config.max_unchanged_stats) {
       ++target.unchanged_stats;
-    } else {
-      target.unchanged_stats = 0;
+      return true;  // Unchanged: nothing new to dump this iteration.
     }
-    return true;
+    target.unchanged_stats = 0;
   } else {
     target.unchanged_stats = 0;
   }
+  // A shrunken file is reported by output_new_data ("file truncated") and
+  // re-read from the start; a grown file dumps only the appended range.
 
   std::ifstream current = open_input_file(target.file);
   if (!current.is_open()) {
-    if (config.retry) return true;
-    safeErrorPrint("tail: cannot open '");
-    safeErrorPrint(target.file);
-    safeErrorPrint("' for following\n");
-    target.active = false;
-    return false;
+    return report_follow_inaccessible(target, config);
   }
 
   if (!output_new_data(current, target.offset,
-                       multi ? follow_header(target, config) : "")) {
+                       multi ? follow_header(target, config) : "",
+                       target.file)) {
     safeErrorPrint("tail: error reading '");
     safeErrorPrint(target.file);
     safeErrorPrint("' while following\n");
@@ -1016,6 +981,12 @@ auto follow_targets(std::vector<FollowTarget>& targets,
 
     std::erase_if(targets,
                   [](const FollowTarget& target) { return !target.active; });
+    if (targets.empty() && !ok) {
+      // [GNU] Once the last followed name is gone tail gives up with this
+      // diagnostic instead of silently exiting the follow loop.
+      safeErrorPrint(winux::i18n::format("command.tail.follow.no_files",
+                                         "tail: no files remaining\n"));
+    }
   }
 
   return ok;
@@ -1105,8 +1076,8 @@ REGISTER_COMMAND(
         any_error = true;
       }
     } else {
-      auto input = open_file_with_retry(file, config);
-      if (!input) {
+      auto input = open_input_file(file);
+      if (!input.is_open()) {
         std::string reason = describe_open_failure(file);
         if (is_directory_open_failure(reason)) {
           safeErrorPrint("tail: error reading '");
@@ -1121,6 +1092,17 @@ REGISTER_COMMAND(
           safeErrorPrint(reason);
           safeErrorPrint("\n");
         }
+        // [GNU] With --retry the failed name stays in the follow set: the
+        // initial open error is reported once and every follow iteration
+        // retries the open until the file appears.
+        if (config.retry && config.follow &&
+            !is_directory_open_failure(reason)) {
+          FollowTarget target;
+          target.file = file;
+          target.accessible = false;
+          follow_targets_to_run.push_back(std::move(target));
+          continue;
+        }
         any_error = true;
         continue;
       }
@@ -1128,20 +1110,20 @@ REGISTER_COMMAND(
       emit_header();
       bool used_fast_path = false;
       if (config.by_bytes) {
-        used_fast_path = output_tail_seekable_bytes(*input, config);
+        used_fast_path = output_tail_seekable_bytes(input, config);
       } else if (config.delimiter == '\0') {
-        used_fast_path = output_tail_seekable_lines(*input, config);
-      } else if (!stream_needs_text_decoding(*input)) {
-        used_fast_path = output_tail_seekable_lines(*input, config);
-        if (!used_fast_path) output_tail(*input, config);
+        used_fast_path = output_tail_seekable_lines(input, config);
+      } else if (!stream_needs_text_decoding(input)) {
+        used_fast_path = output_tail_seekable_lines(input, config);
+        if (!used_fast_path) output_tail(input, config);
       } else {
-        output_text_tail(*input, config);
+        output_text_tail(input, config);
         used_fast_path = true;
       }
       if (!used_fast_path) {
-        output_tail(*input, config);
+        output_tail(input, config);
       }
-      if (input->bad()) {
+      if (input.bad()) {
         safeErrorPrint("tail: error reading '");
         safeErrorPrint(file);
         safeErrorPrint("'\n");
@@ -1152,13 +1134,30 @@ REGISTER_COMMAND(
         FollowTarget target;
         target.file = file;
         target.identity = read_file_identity(file);
-        input->clear();
-        input->seekg(0, std::ios::end);
-        target.offset = input->tellg();
+        // Record the end offset before the stream is moved into the
+        // descriptor slot: tellg() on a moved-from stream returns -1 and
+        // the follow dump would restart at offset 0, re-printing the file.
+        input.clear();
+        input.seekg(0, std::ios::end);
+        target.offset = input.tellg();
         if (target.offset == std::streampos(-1)) target.offset = 0;
+        if (config.follow_by_name) {
+          // [GNU] --follow=name always re-opens the path for the first
+          // dump; the stream used for the initial output is not reused.
+          target.descriptor.close();
+        } else {
+          target.descriptor = std::move(input);
+        }
         follow_targets_to_run.push_back(std::move(target));
       }
     }
+  }
+
+  if (config.follow && follow_targets_to_run.empty() && any_error) {
+    // [GNU] tail.c: with -f/--follow and no live inputs left, tail ends
+    // with "tail: no files remaining" rather than exiting silently.
+    safeErrorPrint(winux::i18n::format("command.tail.follow.no_files",
+                                       "tail: no files remaining\n"));
   }
 
   if (!follow_targets_to_run.empty() &&

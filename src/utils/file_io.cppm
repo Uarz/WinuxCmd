@@ -255,6 +255,9 @@ auto read_all_stdin() -> std::expected<std::string, std::string> {
         "utils.file.error.read_stdin_bad_fd",
         "error reading 'standard input': Bad file descriptor"));
   }
+#ifdef _WIN32
+  _setmode(_fileno(stdin), _O_BINARY);
+#endif
   std::string content;
   std::array<char, kReadChunkSize> buffer{};
 

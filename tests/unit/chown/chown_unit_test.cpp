@@ -286,10 +286,13 @@ TEST(chown, chown_dot_separator_owner_form_warns) {
   p.add(L"chown.exe", {L"Users.", L"file.txt"});
   auto r = p.run();
 
-  EXPECT_EQ(r.exit_code, 1);
-  EXPECT_EQ_TEXT(r.stderr_text,
-                 "chown: warning: '.' should be ':'\n"
-                 "chown: changing ownership is not supported on Windows\n");
+  EXPECT_NE(r.stderr_text.find("chown: warning: '.' should be ':'\n"),
+            std::string::npos);
+  if (r.exit_code == 0) {
+    EXPECT_EQ(get_owner_name_for_path(tmp.path / "file.txt"), "Users");
+  } else {
+    EXPECT_NE(r.stderr_text.find("Operation not permitted"), std::string::npos);
+  }
 }
 
 TEST(chown, chown_dot_separator_owner_group_form_warns) {
@@ -301,10 +304,14 @@ TEST(chown, chown_dot_separator_owner_group_form_warns) {
   p.add(L"chown.exe", {L"Users.Users", L"file.txt"});
   auto r = p.run();
 
-  EXPECT_EQ(r.exit_code, 1);
-  EXPECT_EQ_TEXT(r.stderr_text,
-                 "chown: warning: '.' should be ':'\n"
-                 "chown: changing ownership is not supported on Windows\n");
+  EXPECT_NE(r.stderr_text.find("chown: warning: '.' should be ':'\n"),
+            std::string::npos);
+  if (r.exit_code == 0) {
+    EXPECT_EQ(get_owner_name_for_path(tmp.path / "file.txt"), "Users");
+    EXPECT_EQ(get_group_name_for_path(tmp.path / "file.txt"), "Users");
+  } else {
+    EXPECT_NE(r.stderr_text.find("Operation not permitted"), std::string::npos);
+  }
 }
 
 TEST(chown, chown_invalid_from_user_fails) {
@@ -444,12 +451,13 @@ TEST(chown, chown_from_matching_group_direct_avoids_placeholder_warning) {
 
   auto r = p.run();
 
-  EXPECT_EQ(r.exit_code, 1);
-  EXPECT_NE(r.stdout_text.find("changing ownership of 'target.txt'"),
-            std::string::npos);
-  EXPECT_NE(r.stderr_text.find(
-                "chown: changing ownership is not supported on Windows"),
-            std::string::npos);
+  if (r.exit_code == 0) {
+    EXPECT_NE(r.stdout_text.find("changed ownership of 'target.txt'"),
+              std::string::npos);
+    EXPECT_EQ(get_group_name_for_path(tmp.path / "target.txt"), "Users");
+  } else {
+    EXPECT_NE(r.stderr_text.find("Operation not permitted"), std::string::npos);
+  }
 }
 
 TEST(chown, chown_colon_only_verbose_reports_retained_ownership) {
@@ -542,10 +550,13 @@ TEST(chown, chown_verbose) {
   p.add(L"chown.exe", {L"-v", L"Users", L"file.txt"});
   auto r = p.run();
 
-  EXPECT_EQ(r.exit_code, 1);
-  EXPECT_NE(r.stderr_text.find(
-                "chown: changing ownership is not supported on Windows"),
-            std::string::npos);
+  if (r.exit_code == 0) {
+    EXPECT_NE(r.stdout_text.find("changed ownership of 'file.txt'"),
+              std::string::npos);
+    EXPECT_EQ(get_owner_name_for_path(tmp.path / "file.txt"), "Users");
+  } else {
+    EXPECT_NE(r.stderr_text.find("Operation not permitted"), std::string::npos);
+  }
 }
 
 TEST(chown, chown_recursive) {
@@ -559,8 +570,82 @@ TEST(chown, chown_recursive) {
   p.add(L"chown.exe", {L"-R", L"Users", L"."});
   auto r = p.run();
 
+  if (r.exit_code == 0) {
+    EXPECT_EQ(get_owner_name_for_path(tmp.path / "file.txt"), "Users");
+    EXPECT_EQ(get_owner_name_for_path(tmp.path / "subdir/nested.txt"), "Users");
+  } else {
+    EXPECT_NE(r.stderr_text.find("Operation not permitted"), std::string::npos);
+  }
+}
+
+auto get_owner_name_for_link(const std::filesystem::path& path) -> std::string {
+  std::wstring wpath = path.wstring();
+  HANDLE handle = CreateFileW(
+      wpath.c_str(), READ_CONTROL,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+      nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
+    return {};
+  }
+  PSECURITY_DESCRIPTOR security_desc = nullptr;
+  PSID owner_sid = nullptr;
+  const DWORD status =
+      GetSecurityInfo(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                      &owner_sid, nullptr, nullptr, nullptr, &security_desc);
+  std::string owner;
+  if (status == ERROR_SUCCESS) {
+    owner = lookup_owner_name_from_sid(owner_sid);
+  }
+  if (security_desc != nullptr) {
+    LocalFree(security_desc);
+  }
+  CloseHandle(handle);
+  return owner;
+}
+
+TEST(chown, chown_h_operates_on_dangling_symlink) {
+  TempDir tmp;
+
+  Pipeline ln;
+  ln.set_cwd(tmp.wpath());
+  ln.add(L"ln.exe", {L"-s", L"missing-target.txt", L"dangling.txt"});
+  auto link_result = ln.run();
+  if (link_result.exit_code != 0) {
+    std::cout << "  SKIPPED (cannot create symbolic links)\n";
+    return;
+  }
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"chown.exe", {L"-h", L"Users", L"dangling.txt"});
+  auto r = p.run();
+
+  if (r.exit_code == 0) {
+    EXPECT_EQ(get_owner_name_for_link(tmp.path / "dangling.txt"), "Users");
+  } else {
+    EXPECT_NE(r.stderr_text.find("Operation not permitted"), std::string::npos);
+  }
+}
+
+TEST(chown, chown_without_h_cannot_dereference_dangling_symlink) {
+  TempDir tmp;
+
+  Pipeline ln;
+  ln.set_cwd(tmp.wpath());
+  ln.add(L"ln.exe", {L"-s", L"missing-target.txt", L"dangling.txt"});
+  auto link_result = ln.run();
+  if (link_result.exit_code != 0) {
+    std::cout << "  SKIPPED (cannot create symbolic links)\n";
+    return;
+  }
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"chown.exe", {L"Users", L"dangling.txt"});
+  auto r = p.run();
+
   EXPECT_EQ(r.exit_code, 1);
-  EXPECT_NE(r.stderr_text.find(
-                "chown: changing ownership is not supported on Windows"),
+  EXPECT_NE(r.stderr_text.find("cannot dereference 'dangling.txt'"),
             std::string::npos);
 }

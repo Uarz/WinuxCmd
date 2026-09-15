@@ -91,16 +91,27 @@ struct Config {
   bool quiet = false;
   bool preserve_root = false;
   bool has_reference = false;
+  bool no_dereference = false;
+  bool traverse_all = false;      // -L
+  bool traverse_cmdline = false;  // -H
   std::string owner;
   std::string group;
   std::string reference_file;
   std::string reference_owner_display;
+  std::vector<std::byte> reference_owner_sid;
+  std::vector<std::byte> reference_group_sid;
   std::string from_spec;
   OwnerGroupSpec from_owner_group;
   bool has_from_spec = false;
   bool has_group = false;
   std::vector<std::string> warnings;
   std::vector<std::string> files;
+};
+
+struct PathSids {
+  std::vector<std::byte> owner;
+  std::vector<std::byte> group;
+  bool ok = false;
 };
 
 struct PreserveRootMatch {
@@ -198,6 +209,222 @@ auto format_missing_reference_error(const std::string& path, DWORD error)
     default:
       return "failed to get attributes of '" + path + "'";
   }
+}
+
+auto copy_sid_bytes(PSID sid) -> std::vector<std::byte> {
+  if (sid == nullptr || !IsValidSid(sid)) return {};
+  const DWORD len = GetLengthSid(sid);
+  std::vector<std::byte> buffer(len);
+  if (!CopySid(len, buffer.data(), sid)) {
+    return {};
+  }
+  return buffer;
+}
+
+// Fetch owner/group SIDs of the link itself via an OPEN_REPARSE_POINT
+// handle; works on dangling symlinks where the named variant follows the
+// link and fails.
+auto get_sids_for_link(const std::wstring& wpath) -> PathSids {
+  PathSids result;
+  HANDLE handle = CreateFileW(
+      wpath.c_str(), READ_CONTROL,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+      nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
+    return result;
+  }
+  PSECURITY_DESCRIPTOR security_desc = nullptr;
+  PSID owner_sid = nullptr;
+  PSID group_sid = nullptr;
+  const DWORD status =
+      GetSecurityInfo(handle, SE_FILE_OBJECT,
+                      OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION,
+                      &owner_sid, &group_sid, nullptr, nullptr, &security_desc);
+  if (status == ERROR_SUCCESS) {
+    result.owner = copy_sid_bytes(owner_sid);
+    result.group = copy_sid_bytes(group_sid);
+    result.ok = !result.owner.empty();
+  }
+  if (security_desc != nullptr) {
+    LocalFree(security_desc);
+  }
+  CloseHandle(handle);
+  return result;
+}
+
+// Fetch the file object owner/group SIDs without following the final
+// component's symbolic link.
+auto get_sids_for_path(const std::wstring& wpath) -> PathSids {
+  PathSids result;
+  PSECURITY_DESCRIPTOR security_desc = nullptr;
+  PSID owner_sid = nullptr;
+  PSID group_sid = nullptr;
+
+  const DWORD status = GetNamedSecurityInfoW(
+      const_cast<wchar_t*>(wpath.c_str()), SE_FILE_OBJECT,
+      OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION, &owner_sid,
+      &group_sid, nullptr, nullptr, &security_desc);
+  if (status == ERROR_SUCCESS) {
+    result.owner = copy_sid_bytes(owner_sid);
+    result.group = copy_sid_bytes(group_sid);
+    result.ok = !result.owner.empty();
+  }
+  if (security_desc != nullptr) {
+    LocalFree(security_desc);
+  }
+  return result;
+}
+
+auto enable_privilege(const wchar_t* name) -> bool {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(),
+                        TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+    return false;
+  }
+
+  LUID luid{};
+  bool ok = LookupPrivilegeValueW(nullptr, name, &luid) != FALSE;
+  if (ok) {
+    TOKEN_PRIVILEGES privileges{};
+    privileges.PrivilegeCount = 1;
+    privileges.Privileges[0].Luid = luid;
+    privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    ok = AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges),
+                               nullptr, nullptr) != FALSE &&
+         GetLastError() == ERROR_SUCCESS;
+  }
+  CloseHandle(token);
+  return ok;
+}
+
+auto current_token_sid(TOKEN_INFORMATION_CLASS kind) -> std::vector<std::byte> {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+    return {};
+  }
+
+  DWORD required = 0;
+  GetTokenInformation(token, kind, nullptr, 0, &required);
+  std::vector<std::byte> info(required);
+  std::vector<std::byte> sid;
+  if (required != 0 &&
+      GetTokenInformation(token, kind, info.data(), required, &required)) {
+    PSID raw = nullptr;
+    if (kind == TokenUser) {
+      raw = reinterpret_cast<TOKEN_USER*>(info.data())->User.Sid;
+    } else if (kind == TokenPrimaryGroup) {
+      raw = reinterpret_cast<TOKEN_PRIMARY_GROUP*>(info.data())->PrimaryGroup;
+    }
+    sid = copy_sid_bytes(raw);
+  }
+  CloseHandle(token);
+  return sid;
+}
+
+// Build a SID sharing every sub-authority of `base` except the final RID,
+// which is replaced.  Numeric GNU ids map onto the RID of the file's domain.
+auto sid_with_rid(PSID base, DWORD rid) -> std::vector<std::byte> {
+  if (base == nullptr || !IsValidSid(base)) return {};
+
+  PUCHAR count_ptr = GetSidSubAuthorityCount(base);
+  if (count_ptr == nullptr || *count_ptr == 0) return {};
+  const UCHAR count = *count_ptr;
+
+  SID_IDENTIFIER_AUTHORITY authority = *GetSidIdentifierAuthority(base);
+  std::vector<DWORD> sub_authorities(count);
+  for (UCHAR i = 0; i < count; ++i) {
+    DWORD* value = GetSidSubAuthority(base, i);
+    if (value == nullptr) return {};
+    sub_authorities[i] = (i == count - 1) ? rid : *value;
+  }
+
+  PSID built = nullptr;
+  if (!AllocateAndInitializeSid(&authority, count, sub_authorities[0],
+                                count > 1 ? sub_authorities[1] : 0,
+                                count > 2 ? sub_authorities[2] : 0,
+                                count > 3 ? sub_authorities[3] : 0,
+                                count > 4 ? sub_authorities[4] : 0,
+                                count > 5 ? sub_authorities[5] : 0,
+                                count > 6 ? sub_authorities[6] : 0,
+                                count > 7 ? sub_authorities[7] : 0, &built)) {
+    return {};
+  }
+  auto result = copy_sid_bytes(built);
+  FreeSid(built);
+  return result;
+}
+
+// Resolve an owner/group spec to a SID.  Accepts account names, "S-..." SID
+// strings, and bare numeric ids (interpreted as a RID relative to `base_sid`,
+// falling back to the current user's SID when the base is unavailable).
+auto resolve_account_sid(const std::string& spec, PSID base_sid)
+    -> std::vector<std::byte> {
+  if (spec.empty()) return {};
+
+  if (spec.size() > 2 && (spec[0] == 'S' || spec[0] == 's') && spec[1] == '-') {
+    PSID parsed = nullptr;
+    std::wstring wspec = utf8_to_wstring(spec);
+    if (ConvertStringSidToSidW(wspec.c_str(), &parsed) && parsed != nullptr) {
+      auto result = copy_sid_bytes(parsed);
+      LocalFree(parsed);
+      return result;
+    }
+  }
+
+  if (is_numeric_id(spec)) {
+    DWORD rid = 0;
+    try {
+      rid = static_cast<DWORD>(std::stoul(spec));
+    } catch (...) {
+      return {};
+    }
+    auto sid = sid_with_rid(base_sid, rid);
+    if (sid.empty()) {
+      auto token_sid = current_token_sid(TokenUser);
+      sid = sid_with_rid(token_sid.empty() ? nullptr : token_sid.data(), rid);
+    }
+    return sid;
+  }
+
+  std::wstring waccount = utf8_to_wstring(spec);
+  DWORD sid_size = 0;
+  DWORD domain_size = 0;
+  SID_NAME_USE use = SidTypeUnknown;
+  LookupAccountNameW(nullptr, waccount.c_str(), nullptr, &sid_size, nullptr,
+                     &domain_size, &use);
+  if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || sid_size == 0) {
+    return {};
+  }
+
+  std::vector<std::byte> sid(sid_size);
+  std::wstring domain(domain_size, L'\0');
+  if (!LookupAccountNameW(nullptr, waccount.c_str(), sid.data(), &sid_size,
+                          domain.data(), &domain_size, &use)) {
+    return {};
+  }
+  return sid;
+}
+
+auto format_chown_error(const std::string& verb, const std::string& path,
+                        DWORD error) -> std::string {
+  std::string message = "chown: " + verb + " '" + path + "': ";
+  switch (error) {
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+      message += "No such file or directory";
+      break;
+    case ERROR_ACCESS_DENIED:
+    case ERROR_PRIVILEGE_NOT_HELD:
+    case ERROR_INVALID_OWNER:
+    case ERROR_INVALID_PRIMARY_GROUP:
+      message += "Operation not permitted";
+      break;
+    default:
+      message += win32_system_error_text(error);
+      break;
+  }
+  return message;
 }
 
 auto get_owner_group_display_for_path(const std::string& path) -> std::string {
@@ -490,15 +717,16 @@ auto build_config(const CommandContext<CHOWN_OPTIONS.size()>& ctx)
   cfg.has_reference = !cfg.reference_file.empty();
   cfg.from_spec = ctx.get<std::string>("--from", "");
 
+  cfg.traverse_cmdline = ctx.get<bool>("-H", false);
+  cfg.traverse_all = ctx.get<bool>("-L", false);
+  cfg.no_dereference = (ctx.get<bool>("-h", false) ||
+                        ctx.get<bool>("--no-dereference", false)) &&
+                       !ctx.get<bool>("--dereference", false);
+
   if (cfg.recursive && ctx.get<bool>("--dereference", false) &&
-      !ctx.get<bool>("-H", false) && !ctx.get<bool>("-L", false)) {
+      !cfg.traverse_cmdline && !cfg.traverse_all) {
     return std::unexpected("-R --dereference requires either -H or -L");
   }
-  (void)ctx.get<bool>("--dereference", false);
-  (void)ctx.get<bool>("-h", false);
-  (void)ctx.get<bool>("--no-dereference", false);
-  (void)ctx.get<bool>("-H", false);
-  (void)ctx.get<bool>("-L", false);
   (void)ctx.get<bool>("-P", false);
   (void)ctx.get<bool>("--no-preserve-root", false);
 
@@ -523,6 +751,9 @@ auto build_config(const CommandContext<CHOWN_OPTIONS.size()>& ctx)
     }
     cfg.reference_owner_display =
         get_owner_group_display_for_path(cfg.reference_file);
+    const auto ref_sids = get_sids_for_path(wref);
+    cfg.reference_owner_sid = ref_sids.owner;
+    cfg.reference_group_sid = ref_sids.group;
     add_file_args(cfg, std::span<const std::string_view>(
                            ctx.positionals.data(), ctx.positionals.size()));
   } else {
@@ -560,24 +791,60 @@ auto build_config(const CommandContext<CHOWN_OPTIONS.size()>& ctx)
   return cfg;
 }
 
-auto process_file(const std::string& path, const Config& cfg) -> int {
+auto process_file(const std::string& path, const Config& cfg, bool no_deref)
+    -> int {
   std::wstring wpath = utf8_to_wstring(path);
 
   DWORD attr = GetFileAttributesW(wpath.c_str());
   if (attr == INVALID_FILE_ATTRIBUTES) {
     if (!cfg.quiet) {
-      safeErrorPrint("chown: cannot access '" + path +
-                     "': No such file or directory\n");
+      safeErrorPrintLn(
+          format_chown_error("cannot access", path, GetLastError()));
     }
     return 1;
   }
 
+  const bool is_link = (attr & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+
+  if (is_link && !no_deref) {
+    // Following the link: GNU reports "cannot dereference" when the
+    // referent does not exist.
+    HANDLE probe = CreateFileW(
+        wpath.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (probe == INVALID_HANDLE_VALUE) {
+      DWORD error = GetLastError();
+      if (!cfg.quiet) {
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+          safeErrorPrintLn(
+              format_chown_error("cannot dereference", path, error));
+        } else {
+          safeErrorPrintLn(format_chown_error("cannot access", path, error));
+        }
+      }
+      return 1;
+    }
+    CloseHandle(probe);
+  }
+
+  const auto path_sids =
+      no_deref ? get_sids_for_link(wpath) : get_sids_for_path(wpath);
+
   const bool needs_current_ownership =
-      cfg.has_from_spec ||
-      ((cfg.verbose || cfg.changes) && cfg.has_reference) ||
-      ((cfg.verbose || cfg.changes) && !cfg.has_reference);
+      cfg.has_from_spec || cfg.verbose || cfg.changes;
   OwnershipInfo current_ownership;
-  if (needs_current_ownership) {
+  if (needs_current_ownership && path_sids.ok) {
+    const PSID owner_psid =
+        reinterpret_cast<PSID>(const_cast<std::byte*>(path_sids.owner.data()));
+    const PSID group_psid =
+        reinterpret_cast<PSID>(const_cast<std::byte*>(path_sids.group.data()));
+    current_ownership =
+        OwnershipInfo{.owner_name = lookup_account_name_from_sid(owner_psid),
+                      .owner_id = lookup_account_id_from_sid(owner_psid),
+                      .group_name = lookup_account_name_from_sid(group_psid),
+                      .group_id = lookup_account_id_from_sid(group_psid)};
+  } else if (needs_current_ownership) {
     current_ownership = get_ownership_info_for_path(path);
   }
 
@@ -595,19 +862,20 @@ auto process_file(const std::string& path, const Config& cfg) -> int {
   }
 
   if (cfg.has_reference) {
-    if (cfg.verbose || cfg.changes) {
-      safeErrorPrint("chown: ownership of '");
-      safeErrorPrint(path);
-      safeErrorPrint("' retained as ");
-      safeErrorPrintLn(cfg.reference_owner_display.empty()
-                           ? std::string("unknown")
-                           : cfg.reference_owner_display);
+    const std::string current_display =
+        format_ownership_display(current_ownership);
+    if (!cfg.reference_owner_display.empty() &&
+        current_display == cfg.reference_owner_display) {
+      if (cfg.verbose || cfg.changes) {
+        safeErrorPrint("chown: ownership of '");
+        safeErrorPrint(path);
+        safeErrorPrint("' retained as ");
+        safeErrorPrintLn(cfg.reference_owner_display);
+      }
+      return 0;
     }
-    return 0;
-  }
-
-  if ((cfg.verbose || cfg.changes) &&
-      matches_requested_ownership(cfg, current_ownership)) {
+  } else if ((cfg.verbose || cfg.changes) &&
+             matches_requested_ownership(cfg, current_ownership)) {
     safeErrorPrint("chown: ownership of '");
     safeErrorPrint(path);
     safeErrorPrint("' retained as ");
@@ -617,42 +885,133 @@ auto process_file(const std::string& path, const Config& cfg) -> int {
     return 0;
   }
 
-  // On Windows, chown requires administrator privileges
-  // Report the current state and note that actual ownership change is not
-  // supported
-  if (cfg.verbose) {
-    if (cfg.has_group && !cfg.group.empty()) {
-      safePrint("changing ownership of '" + path + "'");
-      safePrint(" to " + cfg.owner + ":" + cfg.group);
-      safePrint("\n");
-    } else {
-      safePrint("changing ownership of '" + path + "'");
-      safePrint(" to " + cfg.owner);
-      safePrint("\n");
+  // Resolve the desired owner/group SIDs.
+  std::vector<std::byte> owner_sid;
+  std::vector<std::byte> group_sid;
+  if (cfg.has_reference) {
+    owner_sid = cfg.reference_owner_sid;
+    group_sid = cfg.reference_group_sid;
+  } else {
+    if (!cfg.owner.empty()) {
+      owner_sid = resolve_account_sid(
+          cfg.owner, path_sids.owner.empty()
+                         ? nullptr
+                         : reinterpret_cast<PSID>(
+                               const_cast<std::byte*>(path_sids.owner.data())));
+      if (owner_sid.empty()) {
+        if (!cfg.quiet) {
+          safeErrorPrintLn("chown: invalid user: '" + cfg.owner + "'");
+        }
+        return 1;
+      }
+    }
+    if (cfg.has_group) {
+      if (cfg.group.empty()) {
+        // "chown owner:" assigns the owner's login group; the closest
+        // Windows equivalent is the caller's primary group.
+        group_sid = current_token_sid(TokenPrimaryGroup);
+      } else {
+        group_sid = resolve_account_sid(
+            cfg.group, path_sids.group.empty()
+                           ? nullptr
+                           : reinterpret_cast<PSID>(const_cast<std::byte*>(
+                                 path_sids.group.data())));
+      }
+      if (group_sid.empty()) {
+        if (!cfg.quiet) {
+          safeErrorPrintLn("chown: invalid group: '" + cfg.group + "'");
+        }
+        return 1;
+      }
     }
   }
 
-  safeErrorPrintLn(winux::i18n::translate(
-      "command.chown.error.unsupported_ownership",
-      "chown: changing ownership is not supported on Windows"));
-  return 1;
+  if (owner_sid.empty() && group_sid.empty()) {
+    if (!cfg.quiet) {
+      safeErrorPrintLn("chown: invalid spec for '" + path + "'");
+    }
+    return 1;
+  }
+
+  // Elevated privileges let administrators reassign ownership to arbitrary
+  // accounts (SeRestorePrivilege) or take ownership (SeTakeOwnership).
+  enable_privilege(SE_TAKE_OWNERSHIP_NAME);
+  enable_privilege(SE_RESTORE_NAME);
+
+  DWORD open_flags = FILE_FLAG_BACKUP_SEMANTICS;
+  if (no_deref) {
+    // Open the reparse point itself so -h works on dangling symlinks.
+    open_flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+  }
+  HANDLE object =
+      CreateFileW(wpath.c_str(), WRITE_OWNER | READ_CONTROL,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING, open_flags, nullptr);
+  if (object == INVALID_HANDLE_VALUE) {
+    if (!cfg.quiet) {
+      safeErrorPrintLn(
+          format_chown_error("cannot access", path, GetLastError()));
+    }
+    return 1;
+  }
+
+  SECURITY_INFORMATION security_info = 0;
+  if (!owner_sid.empty()) security_info |= OWNER_SECURITY_INFORMATION;
+  if (!group_sid.empty()) security_info |= GROUP_SECURITY_INFORMATION;
+  const DWORD status = SetSecurityInfo(
+      object, SE_FILE_OBJECT, security_info,
+      owner_sid.empty() ? nullptr : owner_sid.data(),
+      group_sid.empty() ? nullptr : group_sid.data(), nullptr, nullptr);
+  CloseHandle(object);
+
+  if (status != ERROR_SUCCESS) {
+    if (!cfg.quiet) {
+      safeErrorPrintLn(
+          format_chown_error("changing ownership of", path, status));
+    }
+    return 1;
+  }
+
+  if (cfg.verbose || cfg.changes) {
+    const std::string from = format_ownership_display(current_ownership);
+    std::string to;
+    if (cfg.has_reference) {
+      to = cfg.reference_owner_display;
+    } else if (cfg.has_group) {
+      to = cfg.owner + ":" + cfg.group;
+    } else {
+      to = cfg.owner;
+    }
+    safePrint("changed ownership of '" + path + "' from " +
+              (from.empty() ? std::string("unknown") : from) + " to " +
+              (to.empty() ? std::string("unknown") : to) + "\n");
+  }
+  return 0;
 }
 
-auto process_recursive(const std::string& path, const Config& cfg) -> int {
+auto process_recursive(const std::string& path, const Config& cfg,
+                       bool command_line_arg) -> int {
   std::wstring wpath = utf8_to_wstring(path);
 
   DWORD attr = GetFileAttributesW(wpath.c_str());
   if (attr == INVALID_FILE_ATTRIBUTES) {
     if (!cfg.quiet) {
-      safeErrorPrint("chown: cannot access '" + path +
-                     "': No such file or directory\n");
+      safeErrorPrintLn(
+          format_chown_error("cannot access", path, GetLastError()));
     }
     return 1;
   }
 
-  int exit_code = process_file(path, cfg);
+  const bool link_self =
+      cfg.no_dereference ||
+      !(cfg.traverse_all || (cfg.traverse_cmdline && command_line_arg));
+  int exit_code = process_file(path, cfg, link_self);
 
-  if (attr & FILE_ATTRIBUTE_DIRECTORY) {
+  const bool descend =
+      (attr & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+      ((attr & FILE_ATTRIBUTE_REPARSE_POINT) == 0 || cfg.traverse_all ||
+       (cfg.traverse_cmdline && command_line_arg));
+  if (descend) {
     std::wstring search_path = wpath + L"\\*";
     WIN32_FIND_DATAW find_data;
     HANDLE hFind = FindFirstFileW(search_path.c_str(), &find_data);
@@ -665,7 +1024,7 @@ auto process_recursive(const std::string& path, const Config& cfg) -> int {
         }
 
         std::string subpath = path + "\\" + wstring_to_utf8(filename);
-        int sub_result = process_recursive(subpath, cfg);
+        int sub_result = process_recursive(subpath, cfg, false);
         if (sub_result != 0) {
           exit_code = sub_result;
         }
@@ -684,9 +1043,9 @@ REGISTER_COMMAND(
     chown, "chown", "change file owner and group",
     "Change the owner and/or group of each FILE.\n"
     "\n"
-    "Note: On Windows, chown is limited. Without administrator privileges,\n"
-    "the command can only report the current state. Changing ownership\n"
-    "requires elevated permissions.",
+    "Note: On Windows, changing ownership requires the\n"
+    "SeTakeOwnership/SeRestore privileges, usually an elevated shell.\n"
+    "Use -h to modify a symbolic link itself, including dangling links.",
     "  chown user file.txt            Change owner of file.txt\n"
     "  chown user:group file.txt     Change owner and group\n"
     "  chown -R user dir/            Recursively change owner\n"
@@ -730,9 +1089,9 @@ REGISTER_COMMAND(
 
     int result;
     if (cfg.recursive) {
-      result = process_recursive(file, cfg);
+      result = process_recursive(file, cfg, true);
     } else {
-      result = process_file(file, cfg);
+      result = process_file(file, cfg, cfg.no_dereference);
     }
     if (result != 0) {
       exit_code = result;

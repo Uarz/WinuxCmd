@@ -40,6 +40,20 @@ export auto option_policy_for_command(std::string_view command)
     // (the optstring); everything after it is data to normalize.
     policy.stop_options_after_positionals = 1;
   }
+  // [GNU] printf.c and test.c never call getopt: "--help"/"--version" are
+  // honored only as the sole argument (handled by the dispatcher), and
+  // every other token is an operand.  Long-option tokens therefore stay
+  // literal operands instead of producing "unrecognized option" errors,
+  // and for printf everything after the format operand is data — a
+  // trailing "-v", "-5" or "--help" is an argument, not an option.  The
+  // WinuxCmd "-v" extension still parses ahead of the format.
+  if (command == "printf") {
+    policy.allow_long_options = false;
+    policy.stop_options_after_positionals = 1;
+  }
+  if (command == "test" || command == "[") {
+    policy.allow_long_options = false;
+  }
   // [GNU] fmt's obsolete "-WIDTH" width is argv[1]-only; digit options in
   // other positions get fmt.c's own diagnostic.
   policy.obsolete_numeric_width_hint = command == "fmt";

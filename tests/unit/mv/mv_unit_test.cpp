@@ -381,3 +381,52 @@ TEST(mv, mv_readonly_destination_no_prompt_on_non_tty) {
   EXPECT_EQ(tmp.read("dest.txt"), "new");
   EXPECT_FALSE(std::filesystem::exists(tmp.path / "src.txt"));
 }
+
+TEST(mv, mv_exchange_swaps_two_files) {
+  TempDir tmp;
+  tmp.write("a.txt", "AAA");
+  tmp.write("b.txt", "BBB");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"mv.exe", {L"--exchange", L"a.txt", L"b.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ(tmp.read("a.txt"), "BBB");
+  EXPECT_EQ(tmp.read("b.txt"), "AAA");
+}
+
+TEST(mv, mv_exchange_swaps_directories) {
+  TempDir tmp;
+  std::filesystem::create_directory(tmp.path / "d1");
+  std::filesystem::create_directory(tmp.path / "d2");
+  tmp.write("d1/f.txt", "one");
+  tmp.write("d2/g.txt", "two");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"mv.exe", {L"--exchange", L"d1", L"d2"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ(tmp.read("d1/g.txt"), "two");
+  EXPECT_EQ(tmp.read("d2/f.txt"), "one");
+}
+
+TEST(mv, mv_exchange_missing_operand_fails) {
+  TempDir tmp;
+  tmp.write("a.txt", "AAA");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"mv.exe", {L"--exchange", L"a.txt", L"nonexist"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_NE(r.stderr_text.find("No such file or directory"), std::string::npos);
+  EXPECT_EQ(tmp.read("a.txt"), "AAA");
+}

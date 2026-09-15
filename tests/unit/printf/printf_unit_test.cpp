@@ -123,3 +123,114 @@ TEST(printf, printf_dynamic_width_precision_and_shell_quote) {
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_EQ_TEXT(r.stdout_text, "|   42|3.14|'a b'|");
 }
+
+// [GNU] printf.c never calls getopt: --help/--version are honored only as
+// the sole argument; in every other position they are literal operands
+// (Savannah #1194 class).
+
+TEST(printf, printf_help_and_version_after_format_are_literal_operands) {
+  Pipeline help;
+  help.add(L"printf.exe", {L"%s\\n", L"--help"});
+  auto hr = help.run();
+  EXPECT_EQ(hr.exit_code, 0);
+  EXPECT_EQ_TEXT(hr.stdout_text, "--help\n");
+  EXPECT_EQ_TEXT(hr.stderr_text, "");
+
+  Pipeline version;
+  version.add(L"printf.exe", {L"%s\\n", L"--version"});
+  auto vr = version.run();
+  EXPECT_EQ(vr.exit_code, 0);
+  EXPECT_EQ_TEXT(vr.stdout_text, "--version\n");
+  EXPECT_EQ_TEXT(vr.stderr_text, "");
+}
+
+TEST(printf, printf_double_dash_makes_next_argument_the_format) {
+  Pipeline p;
+  p.add(L"printf.exe", {L"--", L"--help\\n"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "--help\n");
+  EXPECT_EQ_TEXT(r.stderr_text, "");
+}
+
+TEST(printf, printf_leading_help_is_format_when_not_sole_argument) {
+  Pipeline p;
+  p.add(L"printf.exe", {L"--help", L"extra"});
+
+  auto r = p.run();
+
+  // GNU treats "--help" as the format string (and warns about the excess
+  // argument); the exit status stays 0.
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "--help");
+}
+
+TEST(printf, printf_sole_help_still_prints_usage) {
+  Pipeline p;
+  p.add(L"printf.exe", {L"--help"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_NE(r.stdout_text.find("Usage"), std::string::npos);
+}
+
+TEST(printf, printf_sole_version_still_prints_version) {
+  Pipeline p;
+  p.add(L"printf.exe", {L"--version"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_NE(r.stdout_text.find("printf (WinuxCmd)"), std::string::npos);
+}
+
+TEST(printf, printf_help_abbreviation_is_literal_format) {
+  // [GNU] printf parses options directly precisely so that abbreviations
+  // such as "--he" are the format string, not --help.
+  Pipeline p;
+  p.add(L"printf.exe", {L"--he"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "--he");
+}
+
+TEST(printf, printf_dash_arguments_after_format_are_literal) {
+  // GNU: `printf '%d\n' -5` prints -5. GNU printf has no getopt layer at
+  // all, so `--` is a literal operand too: `printf '%d\n' -- -5` prints
+  // "0\n-5\n" (0 for the invalid number `--`) and fails.
+  Pipeline negative;
+  negative.add(L"printf.exe", {L"%d\\n", L"-5"});
+  auto nr = negative.run();
+  EXPECT_EQ(nr.exit_code, 0);
+  EXPECT_EQ_TEXT(nr.stdout_text, "-5\n");
+
+  Pipeline dd;
+  dd.add(L"printf.exe", {L"%d\\n", L"--", L"-5"});
+  auto dr = dd.run();
+  EXPECT_EQ(dr.exit_code, 1);
+  EXPECT_EQ_TEXT(dr.stdout_text, "0\n-5\n");
+
+  // Even the -v extension is data once the format operand was seen.
+  Pipeline v;
+  v.add(L"printf.exe", {L"%s\\n", L"-v", L"x"});
+  auto vr = v.run();
+  EXPECT_EQ(vr.exit_code, 0);
+  EXPECT_EQ_TEXT(vr.stdout_text, "-v\nx\n");
+}
+
+TEST(printf, printf_leading_v_extension_still_parses) {
+  // WinuxCmd extension (not in standalone GNU printf): "-v VAR" ahead of
+  // the format keeps working.
+  Pipeline p;
+  p.add(L"printf.exe", {L"-v", L"var", L"%s\\n", L"x"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "x\n");
+}

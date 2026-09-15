@@ -91,7 +91,7 @@ auto constexpr MV_OPTIONS =
                OPTION("-b", "", "like --backup but does not accept an argument"),
                // [GNU] --debug: explain how a file is moved
                OPTION("", "--debug", "explain how a file is moved"),
-               // [DIFFERS] --exchange is not supported on Windows
+               // [DIFFERS] --exchange is emulated via non-atomic renames
                OPTION("", "--exchange", "exchange source and destination"),
                // [GNU]
                OPTION("-f", "--force", "do not prompt before overwriting"),
@@ -592,19 +592,91 @@ auto process_single_source(const std::string& src_path,
                           move_ctx.update_mode);
 }
 
+// Emulate renameat2(RENAME_EXCHANGE): Windows has no atomic swap, so do a
+// best-effort three-rename exchange (src -> tmp, dest -> src, tmp -> dest).
+// Both operands must exist and live on the same volume, matching GNU's
+// constraint that the exchange is a same-filesystem rename operation.
+auto exchange_paths(const std::string& src_path, const std::string& dest_path,
+                    bool verbose) -> cp::Result<bool> {
+  std::wstring wsrc = utf8_to_wstring(src_path);
+  std::wstring wdest = utf8_to_wstring(dest_path);
+  DWORD src_attr = GetFileAttributesW(wsrc.c_str());
+  if (src_attr == INVALID_FILE_ATTRIBUTES) {
+    return std::unexpected("cannot stat '" + src_path +
+                           "': No such file or directory");
+  }
+  DWORD dest_attr = GetFileAttributesW(wdest.c_str());
+  if (dest_attr == INVALID_FILE_ATTRIBUTES) {
+    return std::unexpected("cannot stat '" + dest_path +
+                           "': No such file or directory");
+  }
+  // RENAME_EXCHANGE requires same filesystem; cheap check: same volume root.
+  wchar_t src_root[MAX_PATH] = {};
+  wchar_t dest_root[MAX_PATH] = {};
+  if (GetVolumePathNameW(wsrc.c_str(), src_root, MAX_PATH) &&
+      GetVolumePathNameW(wdest.c_str(), dest_root, MAX_PATH) &&
+      _wcsicmp(src_root, dest_root) != 0) {
+    return std::unexpected("cannot exchange '" + src_path + "' and '" +
+                           dest_path + "': different volumes");
+  }
+  std::filesystem::path tmp =
+      std::filesystem::path(wsrc).parent_path() /
+      (".mv-exchange-" + std::to_string(GetCurrentProcessId()) + "-" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::wstring wtmp = tmp.wstring();
+  auto rollback = [&]() {
+    // Best effort: restore whichever step already completed.
+    if (GetFileAttributesW(wtmp.c_str()) != INVALID_FILE_ATTRIBUTES) {
+      MoveFileExW(wtmp.c_str(), wsrc.c_str(), 0);
+    }
+  };
+  if (!MoveFileExW(wsrc.c_str(), wtmp.c_str(), 0)) {
+    return std::unexpected("cannot move '" + src_path +
+                           "': rename to temporary failed");
+  }
+  if (!MoveFileExW(wdest.c_str(), wsrc.c_str(), 0)) {
+    rollback();
+    return std::unexpected("cannot move '" + dest_path + "' to '" + src_path +
+                           "'");
+  }
+  if (!MoveFileExW(wtmp.c_str(), wdest.c_str(), 0)) {
+    // Try to put dest back before restoring src.
+    MoveFileExW(wsrc.c_str(), wdest.c_str(), 0);
+    rollback();
+    return std::unexpected("cannot move temporary to '" + dest_path + "'");
+  }
+  if (verbose) {
+    safePrint("'");
+    safePrint(src_path);
+    safePrint("' <-> '");
+    safePrint(dest_path);
+    safePrint("'\n");
+  }
+  return true;
+}
+
 template <size_t N>
 auto process_command(const CommandContext<N>& ctx) -> cp::Result<bool> {
-  if (ctx.has("--exchange")) {
-    safeErrorPrintLn(
-        "mv: --exchange option not yet fully implemented on Windows");
-    return std::unexpected("--exchange is not supported on Windows");
-  }
+  bool want_exchange = ctx.has("--exchange");
 
   return parse_arguments(ctx).and_then(
-      [&](MoveContext move_ctx) -> cp::Result<bool> {
+      [&, want_exchange](MoveContext move_ctx) -> cp::Result<bool> {
         auto overwrite_mode = parse_overwrite_mode(ctx);
         if (!overwrite_mode) {
           return std::unexpected(overwrite_mode.error());
+        }
+
+        if (want_exchange) {
+          if (move_ctx.source_paths.size() != 1) {
+            return std::unexpected(
+                "--exchange requires exactly one source and one destination");
+          }
+          bool verbose = ctx.get<bool>("--verbose", false) ||
+                         ctx.get<bool>("-v", false) ||
+                         ctx.get<bool>("--debug", false);
+          return exchange_paths(move_ctx.source_paths[0], move_ctx.dest_path,
+                                verbose);
         }
 
         auto dest_exists = check_path_exists(move_ctx.dest_path);

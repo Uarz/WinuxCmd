@@ -138,3 +138,61 @@ TEST(test, test_three_plain_args_binary_operator_expected) {
   EXPECT_EQ(r.exit_code, 2);
   EXPECT_EQ_TEXT(r.stderr_text, "test: 'y': binary operator expected\n");
 }
+
+// [GNU] test.c never calls getopt: --help/--version are honored only as
+// the sole argument; otherwise they are expression operands diagnosed by
+// the expression parser with status 2 (Savannah #1194 class).
+
+TEST(test, test_help_only_as_sole_argument) {
+  Pipeline p;
+  p.add(L"test.exe", {L"--help"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_NE(r.stdout_text.find("Usage"), std::string::npos);
+}
+
+TEST(test, test_version_only_as_sole_argument) {
+  Pipeline p;
+  p.add(L"test.exe", {L"--version"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_NE(r.stdout_text.find("test (WinuxCmd)"), std::string::npos);
+}
+
+TEST(test, test_help_with_extra_operand_is_expression_error) {
+  Pipeline p;
+  p.add(L"test.exe", {L"--help", L"x"});
+  auto r = p.run();
+  EXPECT_EQ(r.exit_code, 2);
+  EXPECT_EQ_TEXT(r.stderr_text, "test: missing argument after 'x'\n");
+}
+
+TEST(test, test_help_after_operand_is_expression_error) {
+  Pipeline p;
+  p.add(L"test.exe", {L"x", L"--help"});
+  auto r = p.run();
+  EXPECT_EQ(r.exit_code, 2);
+  EXPECT_EQ_TEXT(r.stderr_text, "test: missing argument after '--help'\n");
+}
+
+TEST(test, test_version_with_extra_operand_is_expression_error) {
+  Pipeline p;
+  p.add(L"test.exe", {L"--version", L"x"});
+  auto r = p.run();
+  EXPECT_EQ(r.exit_code, 2);
+  EXPECT_EQ_TEXT(r.stderr_text, "test: missing argument after 'x'\n");
+}
+
+TEST(test, test_long_option_operand_is_a_nonempty_string) {
+  // GNU: `test --foo` is a single non-empty STRING test -> true (0),
+  // not an "unrecognized option" error.
+  Pipeline p;
+  p.add(L"test.exe", {L"--foo"});
+  auto r = p.run();
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stderr_text, "");
+}

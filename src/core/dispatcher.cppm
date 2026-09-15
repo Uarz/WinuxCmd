@@ -84,6 +84,10 @@ struct CommandBehavior {
   size_t rewrite_hook_count = 0;
   SpecialDispatchHook special_dispatch = nullptr;
   StandardInterceptionHook standard_interception_enabled = nullptr;
+  // [GNU] printf, test and [ never call getopt: they recognize --help and
+  // --version only as the sole command-line argument (printf.c/test.c use
+  // `argc == 2`); anywhere else the token is an operand or format string.
+  bool help_version_only_when_sole_argument = false;
 };
 
 auto is_posixly_correct() -> bool {
@@ -949,6 +953,12 @@ auto behavior_for(std::string_view name) -> CommandBehavior {
     behavior.special_dispatch = dispatch_wpm_help_version;
   }
 
+  // [GNU] printf/test/[ recognize --help/--version only when one of them
+  // is the sole argument; in any other position the token is data.
+  if (name == "printf" || name == "test" || name == "[") {
+    behavior.help_version_only_when_sole_argument = true;
+  }
+
   // These commands own structured help output and translate it themselves.
   // Let their handlers receive --help instead of the generic metadata path.
   if (name == "top" || name == "mpicalc" || name == "tzset") {
@@ -1036,8 +1046,11 @@ class RegistryImpl {
     // same behaviour. Commands whose leading arguments are data strings are
     // excluded (e.g. `echo --hel` must print "--hel", not help).
     {
+      // [GNU] printf also belongs here: printf.c parses options directly
+      // rather than via getopt_long, precisely so that abbreviations such
+      // as "--hel" are treated as the format string, not as --help.
       static constexpr std::string_view kLiteralArgCommands[] = {
-          "echo", "yes", "test", "[", "true", "false"};
+          "echo", "yes", "test", "[", "true", "false", "printf"};
       const bool literal_args = std::ranges::any_of(
           kLiteralArgCommands, [cmdName](auto n) { return n == cmdName; });
       if (!literal_args) {
@@ -1119,15 +1132,23 @@ class RegistryImpl {
     // Check if it contains help. [GNU] "--" ends option processing, so a
     // "--help" after it is data (e.g. `echo -- --help` must print
     // "--help", not show help) — same rule wants_standard_version uses.
+    // printf/test/[ narrow it further: their --help/--version are honored
+    // only as the sole argument, so `printf '%s\n' --help` prints
+    // "--help" and `test --help x` is an expression error, not help.
     bool wants_help = false;
     if (behavior.standard_interception_enabled(args)) {
-      for (const auto &arg : effective_args) {
-        if (arg == "--") {
-          break;
-        }
-        if (arg == "--help") {
-          wants_help = true;
-          break;
+      if (behavior.help_version_only_when_sole_argument) {
+        wants_help =
+            effective_args.size() == 1 && effective_args[0] == "--help";
+      } else {
+        for (const auto &arg : effective_args) {
+          if (arg == "--") {
+            break;
+          }
+          if (arg == "--help") {
+            wants_help = true;
+            break;
+          }
         }
       }
     }
@@ -1137,7 +1158,11 @@ class RegistryImpl {
       return 0;
     }
 
-    if (wants_standard_version(cmdName, effective_args, options)) {
+    const bool wants_version =
+        behavior.help_version_only_when_sole_argument
+            ? (effective_args.size() == 1 && effective_args[0] == "--version")
+            : wants_standard_version(cmdName, effective_args, options);
+    if (wants_version) {
       // [GNU] --version prints a multi-line block in the shape of
       // "cmd (suite) version" + copyright/license/warranty/author (#1044).
       safePrintLn(std::string(cmdName) + " (WinuxCmd) " +

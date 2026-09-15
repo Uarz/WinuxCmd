@@ -325,12 +325,23 @@ int wmain(int argc, wchar_t* wargv[]) noexcept {
 
                                                args.size() - 1);
 
-    // Check for --version in command arguments
+    // Check for --version in command arguments.  [GNU] Commands whose
+    // arguments are data (echo, yes, test, [, true, false, printf) do not
+    // honor "--version" in any position — e.g. `printf '%s\n' --version`
+    // prints "--version" — so the dispatcher's per-command rule applies
+    // to them instead of this scan.
+    static constexpr std::string_view kLiteralArgCommands[] = {
+        "echo", "yes", "test", "[", "true", "false", "printf"};
+    const bool literal_arg_command = std::ranges::any_of(
+        kLiteralArgCommands,
+        [cmd_name](std::string_view n) { return n == cmd_name; });
     bool has_version = false;
-    for (const auto& arg : cmd_args) {
-      if (arg == "--version") {
-        has_version = true;
-        break;
+    if (!literal_arg_command) {
+      for (const auto& arg : cmd_args) {
+        if (arg == "--version") {
+          has_version = true;
+          break;
+        }
       }
     }
 

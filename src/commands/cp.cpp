@@ -54,7 +54,7 @@ import utils;
  *
  * - @a -a, @a --archive: Same as -dR --preserve=all [IMPLEMENTED]
  * - @a -b: Like --backup but does not accept an argument [IMPLEMENTED]
- * - @a -d: Same as --no-dereference --preserve=links [TODO]
+ * - @a -d: Same as --no-dereference --preserve=links [IMPLEMENTED]
  * - @a -f, @a --force: If an existing destination file cannot be opened, remove
  * it and try again [TODO]
  * - @a -i, @a --interactive: Prompt before overwrite [IMPLEMENTED]
@@ -63,7 +63,8 @@ import utils;
  * - @a -L, @a --dereference: Always follow symbolic links in SOURCE [TODO]
  * - @a -n, @a --no-clobber: Do not overwrite an existing file and do not fail
  * [TODO]
- * - @a -P, @a --no-dereference: Never follow symbolic links in SOURCE [TODO]
+ * - @a -P, @a --no-dereference: Never follow symbolic links in SOURCE
+ * [IMPLEMENTED]
  * - @a -p: Same as --preserve=mode,ownership,timestamps [TODO]
  * - @a -R, @a --recursive: Copy directories recursively [IMPLEMENTED]
  * - @a -r, @a --recursive: Copy directories recursively [IMPLEMENTED]
@@ -175,6 +176,9 @@ auto constexpr CP_OPTIONS = std::array{
            "don't copy the file data, just the attributes"),
     OPTION("", "--parents", "use full source file name under DIRECTORY"),
     OPTION("", "--parent", "use full source file name under DIRECTORY"),
+    // [GNU] --path: deprecated compatibility alias for --parents (kept in
+    // the GNU option table since the fileutils era) (#1066).
+    OPTION("", "--path", "use full source file name under DIRECTORY"),
     OPTION("", "--sparse", "control creation of sparse files", STRING_TYPE),
     OPTION("", "--reflink", "control clone/CoW copies", OPTIONAL_STRING_TYPE),
     OPTION("", "--preserve", "preserve the specified attributes", STRING_TYPE),
@@ -297,13 +301,19 @@ auto validate_arguments(const CommandContext<CP_OPTIONS.size()>& ctx)
 // ----------------------------------------------
 auto check_destination(
     const std::pair<std::vector<std::string>, std::string>& paths,
-    bool no_target_directory)
+    bool no_target_directory, bool parents)
     -> cp::Result<std::tuple<std::vector<std::string>, std::string, bool>> {
   const auto& [sourcePaths, destPath] = paths;
 
   DWORD attr = native_path::attributes_w(utf8_to_wstring(destPath));
   bool destIsDir = !no_target_directory && (attr != INVALID_FILE_ATTRIBUTES) &&
                    (attr & FILE_ATTRIBUTE_DIRECTORY);
+
+  // [GNU] --parents requires an existing directory destination (#1066).
+  if (parents && !destIsDir) {
+    return std::unexpected(
+        "with --parents, the destination must be a directory");
+  }
 
   if (sourcePaths.size() > 1 && !destIsDir) {
     // GNU 9.4: errno-style diagnostics naming the target operand.
@@ -734,6 +744,47 @@ auto recursive_enabled(const CommandContext<CP_OPTIONS.size()>& ctx) -> bool {
          ctx.get<bool>("-R", false) || archive_enabled(ctx);
 }
 
+// [GNU] --sparse=WHEN: 'always' writes only non-zero extents, 'auto' does
+// so only when the source occupies fewer clusters than its length, 'never'
+// performs an ordinary copy (#1066).
+enum class SparseMode { Never, Auto, Always };
+
+auto parse_sparse_mode(const CommandContext<CP_OPTIONS.size()>& ctx)
+    -> cp::Result<SparseMode> {
+  if (!ctx.has("--sparse")) {
+    return SparseMode::Never;
+  }
+  const std::string value = ctx.get<std::string>("--sparse", "");
+  if (value == "always") return SparseMode::Always;
+  if (value == "auto") return SparseMode::Auto;
+  if (value == "never") return SparseMode::Never;
+  return std::unexpected("invalid argument '" + value +
+                         "' for '--sparse'\n"
+                         "Valid arguments are:\n  'never'\n  'auto'\n  "
+                         "'always'\n"
+                         "Try 'cp --help' for more information.");
+}
+
+// [GNU] --reflink[=WHEN]: bare --reflink means 'auto'; 'always' reports the
+// clone failure while 'auto' silently falls back to a plain copy (#1066).
+enum class ReflinkMode { Never, Auto, Always };
+
+auto parse_reflink_mode(const CommandContext<CP_OPTIONS.size()>& ctx)
+    -> cp::Result<ReflinkMode> {
+  if (!ctx.has("--reflink")) {
+    return ReflinkMode::Never;
+  }
+  const std::string value = ctx.get<std::string>("--reflink", "");
+  if (value.empty() || value == "auto") return ReflinkMode::Auto;
+  if (value == "always") return ReflinkMode::Always;
+  if (value == "never") return ReflinkMode::Never;
+  return std::unexpected("invalid argument '" + value +
+                         "' for '--reflink'\n"
+                         "Valid arguments are:\n  'always'\n  'auto'\n  "
+                         "'never'\n"
+                         "Try 'cp --help' for more information.");
+}
+
 // The (volume, file-index) pair is the Windows analogue of GNU's (dev, ino)
 // cyclic-link detection key: CreateFileW follows a junction/symlink, so a
 // link to an ancestor reports the ancestor's own identity.
@@ -829,6 +880,218 @@ auto create_symlink_copy(const std::string& srcPath,
   return true;
 }
 
+// Shared tail of a completed copy: attribute preservation then verbose
+// output, identical for every copy mechanism.
+auto finish_copy(const std::string& srcPath, const std::string& destPath,
+                 const CommandContext<CP_OPTIONS.size()>& ctx, bool verbose)
+    -> cp::Result<bool> {
+  if (preserve_metadata_enabled(ctx)) {
+    auto preserveResult = preserve_metadata(srcPath, destPath);
+    if (!preserveResult) return preserveResult;
+  }
+  if (verbose) {
+    // OPTIMIZED: Avoid wstring concatenation
+    safePrint("'");
+    safePrint(srcPath);
+    safePrint("' -> '");
+    safePrint(destPath);
+    safePrint("'\n");
+  }
+  return true;
+}
+
+// The clone ioctl fails with these codes on every filesystem that cannot do
+// copy-on-write; GNU reports the clone errno, whose POSIX spelling for this
+// situation is ENOTSUP ("Not supported") (#1066).
+auto clone_error_text(DWORD error) -> std::string {
+  switch (error) {
+    case ERROR_NOT_SUPPORTED:
+    case ERROR_INVALID_FUNCTION:
+    case ERROR_INVALID_PARAMETER:
+      return "Not supported";
+    default:
+      return win32_posix_error_text(error);
+  }
+}
+
+// [GNU] --reflink: attempt a copy-on-write clone through
+// FSCTL_DUPLICATE_EXTENTS_TO_FILE (ReFS).  The destination must be sized to
+// the source length first: the clone region must already exist there.
+auto clone_file(const std::string& srcPath, const std::string& destPath)
+    -> cp::Result<bool> {
+  const auto src_operand = native_path::make_api_path_operand(srcPath);
+  UniqueHandle src(
+      CreateFileW(src_operand.extended.c_str(), GENERIC_READ,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+  if (!src) {
+    return std::unexpected(win32_posix_error_text(GetLastError()));
+  }
+  LARGE_INTEGER size{};
+  if (!GetFileSizeEx(src.get(), &size)) {
+    return std::unexpected(win32_posix_error_text(GetLastError()));
+  }
+
+  const auto dest_operand = native_path::make_api_path_operand(destPath);
+  UniqueHandle dest(
+      CreateFileW(dest_operand.extended.c_str(), GENERIC_READ | GENERIC_WRITE,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+  if (!dest) {
+    return std::unexpected(win32_posix_error_text(GetLastError()));
+  }
+
+  if (size.QuadPart > 0) {
+    if (!SetFilePointerEx(dest.get(), size, nullptr, FILE_BEGIN) ||
+        !SetEndOfFile(dest.get())) {
+      return std::unexpected(win32_posix_error_text(GetLastError()));
+    }
+    DUPLICATE_EXTENTS_DATA request{};
+    request.FileHandle = src.get();
+    request.SourceFileOffset.QuadPart = 0;
+    request.TargetFileOffset.QuadPart = 0;
+    request.ByteCount.QuadPart = size.QuadPart;
+    DWORD returned = 0;
+    if (!DeviceIoControl(dest.get(), FSCTL_DUPLICATE_EXTENTS_TO_FILE, &request,
+                         sizeof(request), nullptr, 0, &returned, nullptr)) {
+      return std::unexpected(clone_error_text(GetLastError()));
+    }
+  }
+  return true;
+}
+
+// [GNU] --sparse=auto copies sparsely only when the source has holes (the
+// st_blocks < st_size test).  On Windows holes require the sparse attribute,
+// and FSCTL_QUERY_ALLOCATED_RANGES reports the actually allocated extents;
+// a gap in their coverage is a hole (#1066).
+auto source_may_have_holes(const std::string& srcPath) -> bool {
+  const auto operand = native_path::make_api_path_operand(srcPath);
+  DWORD attrs = GetFileAttributesW(operand.extended.c_str());
+  if (attrs == INVALID_FILE_ATTRIBUTES ||
+      (attrs & FILE_ATTRIBUTE_SPARSE_FILE) == 0) {
+    return false;
+  }
+  UniqueHandle src(
+      CreateFileW(operand.extended.c_str(), FILE_READ_DATA,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+  if (!src) {
+    // The sparse attribute was set; give the sparse path a chance to report
+    // its own error rather than silently downgrading to a plain copy.
+    return true;
+  }
+  LARGE_INTEGER size{};
+  if (!GetFileSizeEx(src.get(), &size) || size.QuadPart <= 0) {
+    return false;
+  }
+  FILE_ALLOCATED_RANGE_BUFFER query{};
+  query.FileOffset.QuadPart = 0;
+  query.Length.QuadPart = size.QuadPart;
+  std::array<FILE_ALLOCATED_RANGE_BUFFER, 64> ranges{};
+  DWORD returned = 0;
+  if (!DeviceIoControl(src.get(), FSCTL_QUERY_ALLOCATED_RANGES, &query,
+                       sizeof(query), ranges.data(),
+                       static_cast<DWORD>(ranges.size() * sizeof(ranges[0])),
+                       &returned, nullptr)) {
+    // The filesystem declined the query; trust the sparse attribute.
+    return true;
+  }
+  LONGLONG covered_until = 0;
+  const DWORD count = returned / sizeof(FILE_ALLOCATED_RANGE_BUFFER);
+  for (DWORD i = 0; i < count; ++i) {
+    if (ranges[i].FileOffset.QuadPart > covered_until) {
+      return true;  // gap between allocated extents
+    }
+    covered_until = (std::max)(covered_until, ranges[i].FileOffset.QuadPart +
+                                                  ranges[i].Length.QuadPart);
+  }
+  return covered_until < size.QuadPart;
+}
+
+// [GNU] --sparse=always: mark the destination sparse and write only the
+// non-zero runs, seeking over zero regions.  FSCTL_SET_SPARSE is
+// best-effort: on filesystems without sparse support the copy still
+// succeeds, it just saves no space (same as GNU on any filesystem) (#1066).
+auto copy_sparse_file(const std::string& srcPath, const std::string& destPath,
+                      bool force) -> cp::Result<bool> {
+  const auto src_operand = native_path::make_api_path_operand(srcPath);
+  UniqueHandle src(
+      CreateFileW(src_operand.extended.c_str(), GENERIC_READ,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+  if (!src) {
+    return std::unexpected("cannot open '" + srcPath + "' for reading: " +
+                           win32_posix_error_text(GetLastError()));
+  }
+
+  const auto dest_operand = native_path::make_api_path_operand(destPath);
+  UniqueHandle dest(
+      CreateFileW(dest_operand.extended.c_str(), GENERIC_READ | GENERIC_WRITE,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+  if (!dest) {
+    DWORD open_err = GetLastError();
+    if (force) {
+      SetFileAttributesW(dest_operand.extended.c_str(), FILE_ATTRIBUTE_NORMAL);
+      DeleteFileW(dest_operand.extended.c_str());
+      dest.reset(CreateFileW(
+          dest_operand.extended.c_str(), GENERIC_READ | GENERIC_WRITE,
+          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+          CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+      if (dest) open_err = 0;
+    }
+    if (open_err != 0) {
+      return std::unexpected("cannot create regular file '" + destPath +
+                             "': " + win32_posix_error_text(open_err));
+    }
+  }
+
+  DWORD ioctl_returned = 0;
+  DeviceIoControl(dest.get(), FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0,
+                  &ioctl_returned, nullptr);
+
+  constexpr DWORD kChunkSize = 1u << 20;
+  std::vector<char> buffer(kChunkSize);
+  unsigned long long position = 0;
+  for (;;) {
+    DWORD got = 0;
+    if (!ReadFile(src.get(), buffer.data(), kChunkSize, &got, nullptr)) {
+      return std::unexpected("error reading '" + srcPath +
+                             "': " + win32_posix_error_text(GetLastError()));
+    }
+    if (got == 0) break;
+    DWORD i = 0;
+    while (i < got) {
+      while (i < got && buffer[i] == 0) ++i;
+      const DWORD run_begin = i;
+      while (i < got && buffer[i] != 0) ++i;
+      if (i > run_begin) {
+        LARGE_INTEGER offset;
+        offset.QuadPart = static_cast<LONGLONG>(position + run_begin);
+        if (!SetFilePointerEx(dest.get(), offset, nullptr, FILE_BEGIN)) {
+          return std::unexpected("error writing '" + destPath + "'");
+        }
+        DWORD written = 0;
+        if (!WriteFile(dest.get(), buffer.data() + run_begin, i - run_begin,
+                       &written, nullptr) ||
+            written != i - run_begin) {
+          return std::unexpected("error writing '" + destPath + "'");
+        }
+      }
+    }
+    position += got;
+  }
+  // A trailing run of zeros is never written: extend the file size so the
+  // sparse tail is part of the destination.
+  LARGE_INTEGER end;
+  end.QuadPart = static_cast<LONGLONG>(position);
+  if (!SetFilePointerEx(dest.get(), end, nullptr, FILE_BEGIN) ||
+      !SetEndOfFile(dest.get())) {
+    return std::unexpected("error writing '" + destPath + "'");
+  }
+  return true;
+}
+
 // ----------------------------------------------
 // 6. Copy a single file
 // ----------------------------------------------
@@ -856,6 +1119,10 @@ auto copy_file(const std::string& srcPath, const std::string& destPath,
       deref_mode == DerefMode::Never ||
       (deref_mode == DerefMode::Default && recursive_enabled(ctx)) ||
       (deref_mode == DerefMode::CommandLine && !command_line_arg);
+  // Both were validated in process_command; failures here are impossible.
+  const SparseMode sparse = parse_sparse_mode(ctx).value_or(SparseMode::Never);
+  const ReflinkMode reflink =
+      parse_reflink_mode(ctx).value_or(ReflinkMode::Never);
 
   std::error_code equivalent_ec;
   // Use the error_code overload: pseudo-device operands such as "NUL" make
@@ -1057,6 +1324,29 @@ auto copy_file(const std::string& srcPath, const std::string& destPath,
     return true;
   }
 
+  // [GNU] --reflink: try a CoW clone first.  'auto' falls back to a plain
+  // copy when the clone is unavailable; 'always' reports the failure
+  // (#1066).
+  if (reflink != ReflinkMode::Never) {
+    auto clone = clone_file(srcPath, destPath);
+    if (clone) {
+      return finish_copy(srcPath, destPath, ctx, verbose);
+    }
+    if (reflink == ReflinkMode::Always) {
+      return std::unexpected("failed to clone '" + destPath + "' from '" +
+                             srcPath + "': " + clone.error());
+    }
+  }
+
+  // [GNU] --sparse: 'always' writes only non-zero extents; 'auto' does so
+  // only when the source actually has unallocated regions (#1066).
+  if (sparse != SparseMode::Never &&
+      (sparse == SparseMode::Always || source_may_have_holes(srcPath))) {
+    auto sparseResult = copy_sparse_file(srcPath, destPath, force);
+    if (!sparseResult) return sparseResult;
+    return finish_copy(srcPath, destPath, ctx, verbose);
+  }
+
   // Check if source file exists and is readable
   errno = 0;
   std::ifstream src = file_io::open_binary_file(srcPath);
@@ -1095,21 +1385,7 @@ auto copy_file(const std::string& srcPath, const std::string& destPath,
   dest.close();
   src.close();
 
-  if (preserve_metadata_enabled(ctx)) {
-    auto preserveResult = preserve_metadata(srcPath, destPath);
-    if (!preserveResult) return preserveResult;
-  }
-
-  if (verbose) {
-    // OPTIMIZED: Avoid wstring concatenation
-    safePrint("'");
-    safePrint(srcPath);
-    safePrint("' -> '");
-    safePrint(destPath);
-    safePrint("'\n");
-  }
-
-  return true;
+  return finish_copy(srcPath, destPath, ctx, verbose);
 }
 
 // ----------------------------------------------
@@ -1320,7 +1596,8 @@ auto process_source_paths(
     bool srcIsDir = *isDirResult;
     std::string finalDestPath = destPath;
 
-    bool parents = ctx.has("--parents") || ctx.has("--parent");
+    bool parents =
+        ctx.has("--parents") || ctx.has("--parent") || ctx.has("--path");
     if (destIsDir) {
       if (parents) {
         // --parents: use relative source path under destination
@@ -1425,24 +1702,19 @@ auto process_command(const CommandContext<N>& ctx) -> cp::Result<bool> {
         "Try 'cp --help' for more information.");
   }
 
-  // [DIFFERS] --sparse: control creation of sparse files.
-  // Not yet implemented; would require DeviceIoControl(SET_SPARSE).
-  if (ctx.has("--sparse")) {
-    return std::unexpected("--sparse is not supported on Windows");
+  // [GNU] --sparse=WHEN / --reflink[=WHEN]: validate the mode argument up
+  // front so a bad value is diagnosed before any operand checks (#1066).
+  if (auto sparse = parse_sparse_mode(ctx); !sparse) {
+    return std::unexpected(sparse.error());
+  }
+  if (auto reflink = parse_reflink_mode(ctx); !reflink) {
+    return std::unexpected(reflink.error());
   }
 
-  // [DIFFERS] --reflink: control clone/CoW copies.
-  // Not yet implemented; would require CopyFile2 or equivalent.
-  if (ctx.has("--reflink")) {
-    return std::unexpected("--reflink is not supported on Windows");
-  }
-
-  // [DIFFERS] --copy-contents: copy contents of special files when recursive.
-  // Windows special files (named pipes, device files) differ from POSIX;
-  // this flag is not applicable.
-  if (ctx.has("--copy-contents")) {
-    return std::unexpected("--copy-contents is not supported on Windows");
-  }
+  // [GNU] --copy-contents: copy contents of special files when recursive.
+  // Pseudo-device sources (/dev/null, NUL, /dev/std*) are already read as
+  // streams here, so accepting the flag is a compatible no-op (#1066).
+  (void)ctx.get<bool>("--copy-contents", false);
 
   // [COMPAT NO-OP] -g/--progress-bar: WinuxCmd extension for progress display.
   (void)ctx.get<bool>("-g", false);
@@ -1465,9 +1737,11 @@ auto process_command(const CommandContext<N>& ctx) -> cp::Result<bool> {
 
   bool no_target_directory = ctx.get<bool>("-T", false) ||
                              ctx.get<bool>("--no-target-directory", false);
+  const bool parents =
+      ctx.has("--parents") || ctx.has("--parent") || ctx.has("--path");
   return validate_arguments(ctx)
       .and_then([&](std::pair<std::vector<std::string>, std::string> paths) {
-        return check_destination(paths, no_target_directory);
+        return check_destination(paths, no_target_directory, parents);
       })
       .and_then([&](std::tuple<std::vector<std::string>, std::string, bool>
                         pathsAndDir) {

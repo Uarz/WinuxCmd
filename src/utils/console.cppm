@@ -50,6 +50,7 @@ thread_local HANDLE g_cached_stderr = INVALID_HANDLE_VALUE;
 thread_local bool g_handles_valid = false;
 thread_local bool g_stdout_pipe_closed = false;
 thread_local bool g_stderr_pipe_closed = false;
+thread_local DWORD g_stdout_write_error = 0;
 thread_local bool g_stdout_is_console = false;
 thread_local bool g_stderr_is_console = false;
 thread_local bool g_console_checked = false;
@@ -87,6 +88,19 @@ HANDLE getStdErr() {
 
 bool isBrokenPipeError(DWORD err) {
   return err == ERROR_BROKEN_PIPE || err == ERROR_NO_DATA;
+}
+
+// Record a failed write to stdout. A broken pipe maps to GNU's SIGPIPE
+// death (the command exits quietly); any other failure — for example
+// ERROR_INVALID_HANDLE when the caller closed stdout (`>&-`) — is a fatal
+// "write error" the command is expected to report.
+void note_stdout_write_failure() {
+  const DWORD err = GetLastError();
+  if (isBrokenPipeError(err)) {
+    g_stdout_pipe_closed = true;
+  } else if (err != ERROR_SUCCESS) {
+    g_stdout_write_error = err;
+  }
 }
 
 bool env_var_present(const char* name) {
@@ -143,9 +157,20 @@ export bool is_stdout_pipe_closed() { return g_stdout_pipe_closed; }
 
 export bool is_stderr_pipe_closed() { return g_stderr_pipe_closed; }
 
+// True once a stdout write failed for a reason other than a closed pipe
+// (broken-pipe failures raise is_stdout_pipe_closed() instead). Commands
+// that stream output should treat this as fatal: GNU reports a "write
+// error" diagnostic and exits non-zero rather than silently dropping data.
+export bool is_stdout_write_failed() { return g_stdout_write_error != 0; }
+
+// The Win32 error code recorded by the first failed stdout write; 0 when
+// is_stdout_write_failed() is false.
+export DWORD stdout_write_error() { return g_stdout_write_error; }
+
 export void clear_pipe_closed_flags() {
   g_stdout_pipe_closed = false;
   g_stderr_pipe_closed = false;
+  g_stdout_write_error = 0;
 }
 
 bool isConsoleHandle(HANDLE h) {

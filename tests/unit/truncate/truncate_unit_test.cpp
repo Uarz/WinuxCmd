@@ -156,7 +156,26 @@ TEST(truncate, truncate_round_up) {
   EXPECT_EQ(std::filesystem::file_size(tmp.path / "test.txt"), 8);
 }
 
+// [GNU] --reference combines with a *relative* --size applied to the
+// reference file's size: ref=10, -6 -> 4 (truncate.c, uutils #12963).
 TEST(truncate, truncate_size_overrides_reference) {
+  TempDir tmp;
+  tmp.write("reference.txt", "1234567890");
+  tmp.write("test.txt", "abc");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"truncate.exe",
+        {L"--reference", L"reference.txt", L"--size", L"-6", L"test.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ(std::filesystem::file_size(tmp.path / "test.txt"), 4);
+}
+
+// [GNU] --reference with an *absolute* --size is a usage error.
+TEST(truncate, truncate_absolute_size_with_reference_is_error) {
   TempDir tmp;
   tmp.write("reference.txt", "1234567890");
   tmp.write("test.txt", "abc");
@@ -168,8 +187,30 @@ TEST(truncate, truncate_size_overrides_reference) {
 
   auto r = p.run();
 
-  EXPECT_EQ(r.exit_code, 0);
-  EXPECT_EQ(std::filesystem::file_size(tmp.path / "test.txt"), 4);
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stderr_text.find(
+                  "you must specify a relative '--size' with '--reference'") !=
+              std::string::npos);
+  EXPECT_EQ(std::filesystem::file_size(tmp.path / "test.txt"), 3);
+}
+
+// [GNU] a missing reference reports "cannot stat 'R': No such file or
+// directory" and exits 1 before touching any file.
+TEST(truncate, truncate_missing_reference_cannot_stat) {
+  TempDir tmp;
+  tmp.write("test.txt", "abc");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"truncate.exe",
+        {L"-r", L"nonexistent.ref", L"-s", L"+2", L"test.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stderr_text.find("cannot stat 'nonexistent.ref': No such file "
+                                 "or directory") != std::string::npos);
+  EXPECT_EQ(std::filesystem::file_size(tmp.path / "test.txt"), 3);
 }
 
 TEST(truncate, truncate_reference_operand_is_literal_not_globbed) {

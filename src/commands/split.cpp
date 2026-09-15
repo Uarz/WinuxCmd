@@ -81,7 +81,11 @@ auto constexpr SPLIT_OPTIONS = std::array{
            STRING_TYPE),
     // [GNU] -u, --unbuffered
     OPTION("-u", "--unbuffered",
-           "immediately copy input to output with '-n r/...'")};
+           "immediately copy input to output with '-n r/...'"),
+    // [GNU] -NUMBER: obsolete shorthand for -l NUMBER; hidden like GNU
+    OPTION("-NUM", "", "", INT_TYPE),
+    // [GNU] ---io-blksize=SIZE: hidden debugging option (triple dash)
+    OPTION("", "---io-blksize", "", STRING_TYPE)};
 
 namespace split_pipeline {
 namespace cp = core::pipeline;
@@ -269,11 +273,17 @@ auto build_config(const CommandContext<SPLIT_OPTIONS.size()>& ctx)
   auto number_opt = ctx.get<std::string>("--number", "");
   if (number_opt.empty()) number_opt = ctx.get<std::string>("-n", "");
 
+  // [GNU] obsolete "-NUMBER" operand is another way to request -l NUMBER;
+  // it conflicts with any other split mode like -l itself does.
+  const bool has_numeric_lines = ctx.has("-NUM");
+  const int numeric_lines = ctx.get<int>("-NUM", 0);
+
   int split_modes = 0;
   if (!bytes_opt.empty()) ++split_modes;
   if (!line_bytes_opt.empty()) ++split_modes;
   if (!lines_opt.empty()) ++split_modes;
   if (!number_opt.empty()) ++split_modes;
+  if (has_numeric_lines) ++split_modes;
   if (split_modes > 1) {
     return std::unexpected("cannot split in more than one way");
   }
@@ -308,6 +318,15 @@ auto build_config(const CommandContext<SPLIT_OPTIONS.size()>& ctx)
           quoted_number_error("invalid number of lines", lines_opt));
     }
     cfg.chunk_lines = *lines_result;
+    cfg.mode = Config::Mode::Lines;
+  }
+
+  if (has_numeric_lines) {
+    if (numeric_lines <= 0) {
+      return std::unexpected(quoted_number_error(
+          "invalid number of lines", std::to_string(numeric_lines)));
+    }
+    cfg.chunk_lines = numeric_lines;
     cfg.mode = Config::Mode::Lines;
   }
 
@@ -407,6 +426,18 @@ auto build_config(const CommandContext<SPLIT_OPTIONS.size()>& ctx)
   if (cfg.additional_suffix.find('/') != std::string::npos ||
       cfg.additional_suffix.find('\\') != std::string::npos) {
     return std::unexpected("additional suffix must not contain slash");
+  }
+
+  // [GNU] ---io-blksize=SIZE is a hidden debugging option: the size is
+  // validated like -b but only tunes the I/O block size, so the parsed
+  // value is intentionally unused here.
+  if (ctx.has("---io-blksize")) {
+    auto io_blksize = ctx.get<std::string>("---io-blksize", "");
+    auto size_result = parse_size(io_blksize);
+    if (!size_result || *size_result <= 0) {
+      return std::unexpected(
+          quoted_number_error("invalid IO block size", io_blksize));
+    }
   }
 
   cfg.filter_command = ctx.get<std::string>("--filter", "");

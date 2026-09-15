@@ -177,14 +177,23 @@ auto validate_arguments(std::span<const std::string_view> args)
   return paths;
 }
 
+// [GNU] wc reports open failures as "wc: PATH: REASON" (#1041), e.g.
+// "wc: nosuch: No such file or directory".
 auto wc_input_open_error(std::string_view path) -> std::string {
-  std::error_code ec;
-  auto status = std::filesystem::status(std::filesystem::u8path(path), ec);
-  if (!ec && status.type() == std::filesystem::file_type::directory) {
+  auto operand = native_path::make_api_path_operand(path);
+  const DWORD attrs = native_path::operand_target_attributes_w(operand);
+  if (operand.had_trailing_separator &&
+      native_path::attributes_are_regular_file(attrs)) {
+    return std::string(path) + ": Not a directory";
+  }
+  if (native_path::attributes_are_directory(attrs)) {
     return std::string(path) + ": Is a directory";
   }
-  return "cannot open '" + std::string(path) +
-         "' for reading: No such file or directory";
+  if (attrs != INVALID_FILE_ATTRIBUTES) {
+    // The operand exists but could not be opened for reading.
+    return std::string(path) + ": Permission denied";
+  }
+  return std::string(path) + ": No such file or directory";
 }
 
 auto read_files0_from(const std::string& path) -> cp::Result<Files0ReadResult> {
@@ -192,10 +201,16 @@ auto read_files0_from(const std::string& path) -> cp::Result<Files0ReadResult> {
   std::ifstream file;
   Files0ReadResult result;
   if (path == "-") {
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected("'standard input': Bad file descriptor");
+    }
     input = &std::cin;
     result.from_stdin = true;
   } else {
-    file.open(native_path::normalize_api_operand(path), std::ios::binary);
+    // Route through the shared operand boundary: pseudo-devices (/dev/null,
+    // /dev/stdin) and >MAX_PATH extended paths open like other tools
+    // (#1055/#1056/#1061).
+    file = file_io::open_binary_file(path);
     if (!file) {
       return std::unexpected(wc_input_open_error(path));
     }
@@ -453,16 +468,27 @@ auto count_file(const std::string& path, const CountRequest& request)
     return count_stdin(true, request);
   }
 
-  std::ifstream file(native_path::normalize_api_operand(path),
-                     std::ios::binary);
+  // [GNU] /dev/stdin-family operands read the real fd 0 (#1056). A closed
+  // stdin dangles the /proc/self/fd symlink under GNU, so report ENOENT.
+  if (native_path::pseudo_device_std_fd(path) == std::optional<int>(0)) {
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected(wc_input_open_error(path));
+    }
+    return count_stream(std::cin, path, true, request);
+  }
+
+  std::ifstream file = file_io::open_binary_file(path);
   if (!file) {
     return std::unexpected(wc_input_open_error(path));
   }
 
   if (request.only_bytes()) {
     std::error_code ec;
+    // Probe size on the extended API path so >MAX_PATH operands do not fall
+    // back to the streaming path needlessly (#1061).
+    const auto operand = native_path::make_api_path_operand(path);
     const auto size =
-        std::filesystem::file_size(std::filesystem::u8path(path), ec);
+        std::filesystem::file_size(std::filesystem::path(operand.extended), ec);
     if (!ec) {
       CountResult result = make_empty_result(path, true);
       result.bytes = static_cast<std::uintmax_t>(size);
@@ -507,7 +533,8 @@ auto compute_number_width(const CountBatch& batch,
       continue;
     }
 
-    const auto path = std::filesystem::u8path(result.filename);
+    const auto operand = native_path::make_api_path_operand(result.filename);
+    const auto path = std::filesystem::path(operand.extended);
     std::error_code ec;
     const auto status = std::filesystem::status(path, ec);
     if (ec || !std::filesystem::is_regular_file(status)) {
@@ -591,12 +618,20 @@ auto process_command(const CommandContext<N>& ctx, const CountRequest& request)
     paths = std::move(*validated);
   }
 
+  // [GNU] A closed standard input (<&-) is a read error, not EOF (#973).
+  // GNU still prints the (zero) counts, then reports "Bad file descriptor".
+  const bool stdin_bad = file_io::stdin_is_bad();
+
   CountBatch batch;
   if (paths.empty() && files0_from.empty()) {
     auto stdin_result = count_stdin(false, request);
     if (!stdin_result) return std::unexpected(stdin_result.error());
     batch.results.push_back(*stdin_result);
     batch.requested_input_count = 1;
+    if (stdin_bad) {
+      safeErrorPrint("wc: 'standard input': Bad file descriptor\n");
+      batch.any_error = true;
+    }
     return batch;
   }
 
@@ -616,6 +651,10 @@ auto process_command(const CommandContext<N>& ctx, const CountRequest& request)
       continue;
     }
     batch.results.push_back(*file_result);
+    if (path == "-" && stdin_bad) {
+      safeErrorPrint("wc: -: Bad file descriptor\n");
+      batch.any_error = true;
+    }
   }
 
   return batch;

@@ -234,9 +234,9 @@ export std::string translate_error(std::string_view error) {
           const auto what = rest.substr(0, value_sep);
           auto value = rest.substr(value_sep + kPrValueSep.size());
           value.remove_suffix(1);
-          return ::winux::i18n::format(
-              "command.pr.error.invalid_number",
-              "'{}' invalid number of {}: '{}'", label, what, value);
+          return ::winux::i18n::format("command.pr.error.invalid_number",
+                                       "'{}' invalid number of {}: '{}'", label,
+                                       what, value);
         }
       }
     }

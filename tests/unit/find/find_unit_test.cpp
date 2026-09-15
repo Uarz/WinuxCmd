@@ -2554,7 +2554,7 @@ TEST(find, find_new_file_predicates_and_listing_actions) {
   tmp.write("file.txt", "x");
   // Backdate ref so -anewer stays deterministic: files written back to
   // back can share an NTFS timestamp tick.
-  struct __utimbuf64 old_times {};
+  struct __utimbuf64 old_times{};
   old_times.actime = 1000000000;
   old_times.modtime = 1000000000;
   ASSERT_EQ(_wutime64((tmp.path / "ref").c_str(), &old_times), 0);

@@ -84,6 +84,10 @@ struct CommandBehavior {
   size_t rewrite_hook_count = 0;
   SpecialDispatchHook special_dispatch = nullptr;
   StandardInterceptionHook standard_interception_enabled = nullptr;
+  // [GNU] printf, test and [ never call getopt: they recognize --help and
+  // --version only as the sole command-line argument (printf.c/test.c use
+  // `argc == 2`); anywhere else the token is an operand or format string.
+  bool help_version_only_when_sole_argument = false;
 };
 
 auto is_posixly_correct() -> bool {
@@ -711,6 +715,31 @@ auto rewrite_fold_obsolete_args(std::span<std::string_view> args)
   return rewritten;
 }
 
+// GNU fmt accepts the obsolete "-WIDTH" form (e.g. "fmt -60"), but only when
+// it is the very first argument; a digit option in any other position is a
+// getopt error in fmt.c. The whole rest of the argument must be digits —
+// "fmt -60s" fails with "invalid width: '60s'" — so the token is rewritten
+// to "-w <rest>" and fmt's own validation reports the same diagnostic.
+auto rewrite_fmt_obsolete_args(std::span<std::string_view> args)
+    -> std::optional<std::vector<std::string>> {
+  if (args.empty()) {
+    return std::nullopt;
+  }
+
+  std::string_view first = args[0];
+  if (first.size() < 2 || first[0] != '-' || first[1] == '-' ||
+      !std::isdigit(static_cast<unsigned char>(first[1]))) {
+    return std::nullopt;
+  }
+
+  std::vector<std::string> rewritten;
+  rewritten.reserve(args.size() + 1);
+  rewritten.emplace_back("-w");
+  rewritten.emplace_back(first.substr(1));
+  append_remaining_args(rewritten, args, 1);
+  return rewritten;
+}
+
 auto echo_posixly_correct_literal_mode(std::string_view cmdName,
                                        std::span<std::string_view> args)
     -> bool {
@@ -777,9 +806,68 @@ auto rewrite_echo_posix_args(std::string_view cmdName,
   return rewritten;
 }
 
+// [GNU] echo.c never uses getopt: it scans leading arguments made solely
+// of 'e', 'E', 'n' characters and stops option processing at the first
+// argument outside that set, echoing it as data along with the rest of the
+// line (just_echo). "--" is not an option terminator for GNU echo, so
+// `echo -- --` prints "-- --" and `echo --help x` prints "--help x".
+// The WinuxCmd -u/--upper and -r/--repeat extensions keep working by
+// counting them as option arguments during the scan.
+auto rewrite_echo_gnu_args(std::span<std::string_view> args)
+    -> std::optional<std::vector<std::string>> {
+  // [GNU] --help/--version are honored only as the sole argument.
+  if (args.size() == 1 && (args[0] == "--help" || args[0] == "--version")) {
+    return std::nullopt;
+  }
+
+  auto is_nEe_option = [](std::string_view arg) {
+    return arg.size() > 1 && arg[0] == '-' && arg[1] != '-' &&
+           std::ranges::all_of(arg.substr(1), [](char c) {
+             return c == 'n' || c == 'e' || c == 'E';
+           });
+  };
+
+  size_t options_end = 0;
+  while (options_end < args.size()) {
+    const std::string_view arg = args[options_end];
+    if (is_nEe_option(arg) || arg == "-u" || arg == "--upper" ||
+        arg.starts_with("--repeat=") ||
+        (arg.size() > 2 && arg.starts_with("-r"))) {
+      ++options_end;
+      continue;
+    }
+    if (arg == "-r" || arg == "--repeat") {
+      // The repeat count occupies the next argument; keep them together.
+      options_end += 2;
+      continue;
+    }
+    break;
+  }
+
+  if (options_end >= args.size()) {
+    return std::nullopt;
+  }
+
+  // Everything from options_end on is literal data; guard it behind a "--"
+  // terminator so the generic parser keeps "--" and "-x" as positionals.
+  std::vector<std::string> rewritten;
+  rewritten.reserve(args.size() + 1);
+  for (size_t i = 0; i < options_end; ++i) {
+    rewritten.emplace_back(args[i]);
+  }
+  rewritten.emplace_back("--");
+  for (size_t i = options_end; i < args.size(); ++i) {
+    rewritten.emplace_back(args[i]);
+  }
+  return rewritten;
+}
+
 auto rewrite_echo_args(std::span<std::string_view> args)
     -> std::optional<std::vector<std::string>> {
-  return rewrite_echo_posix_args("echo", args);
+  if (echo_posixly_correct_literal_mode("echo", args)) {
+    return rewrite_echo_posix_args("echo", args);
+  }
+  return rewrite_echo_gnu_args(args);
 }
 
 auto echo_standard_interception_enabled(std::span<std::string_view> args)
@@ -830,7 +918,11 @@ auto behavior_for(std::string_view name) -> CommandBehavior {
     behavior.parse_error_exit_code = 125;
   } else if (name == "nohup") {
     behavior.parse_error_exit_code = is_posixly_correct() ? 127 : 125;
-  } else if (name == "printenv" || name == "tty") {
+  } else if (name == "printenv" || name == "tty" || name == "sort" ||
+             name == "ls" || name == "dir" || name == "vdir" ||
+             name == "getopt" || name == "expr" || name == "test" ||
+             name == "[") {
+    // [GNU] these commands exit 2 on option/usage errors.
     behavior.parse_error_exit_code = 2;
   }
 
@@ -852,11 +944,19 @@ auto behavior_for(std::string_view name) -> CommandBehavior {
     append_rewrite_hook(behavior, rewrite_pr_args);
   } else if (name == "fold") {
     append_rewrite_hook(behavior, rewrite_fold_obsolete_args);
+  } else if (name == "fmt") {
+    append_rewrite_hook(behavior, rewrite_fmt_obsolete_args);
   } else if (name == "echo") {
     append_rewrite_hook(behavior, rewrite_echo_args);
     behavior.standard_interception_enabled = echo_standard_interception_enabled;
   } else if (name == "wpm") {
     behavior.special_dispatch = dispatch_wpm_help_version;
+  }
+
+  // [GNU] printf/test/[ recognize --help/--version only when one of them
+  // is the sole argument; in any other position the token is data.
+  if (name == "printf" || name == "test" || name == "[") {
+    behavior.help_version_only_when_sole_argument = true;
   }
 
   // These commands own structured help output and translate it themselves.
@@ -940,19 +1040,115 @@ class RegistryImpl {
     // Get meta data from the command
     auto options = it->second.options;  // std::span<const OptionMeta>
 
+    // GNU getopt_long accepts any unambiguous abbreviation of a long option.
+    // Normalise abbreviations against the command's declared long options plus
+    // the implicit --help/--version, so hand-rolled option parsers get the
+    // same behaviour. Commands whose leading arguments are data strings are
+    // excluded (e.g. `echo --hel` must print "--hel", not help).
+    {
+      // [GNU] printf also belongs here: printf.c parses options directly
+      // rather than via getopt_long, precisely so that abbreviations such
+      // as "--hel" are treated as the format string, not as --help.
+      static constexpr std::string_view kLiteralArgCommands[] = {
+          "echo", "yes", "test", "[", "true", "false", "printf"};
+      const bool literal_args = std::ranges::any_of(
+          kLiteralArgCommands, [cmdName](auto n) { return n == cmdName; });
+      if (!literal_args) {
+        std::vector<std::string> abbrev_storage;
+        bool end_of_options = false;
+        std::optional<std::string> ambiguous;
+        for (std::string_view arg : effective_args) {
+          if (end_of_options || arg.size() <= 2 || !arg.starts_with("--")) {
+            if (arg == "--") end_of_options = true;
+            abbrev_storage.emplace_back(arg);
+            continue;
+          }
+          std::string_view name = arg;
+          std::string_view suffix;
+          if (auto eq = arg.find('='); eq != std::string_view::npos) {
+            name = arg.substr(0, eq);
+            suffix = arg.substr(eq);
+          }
+          if (name.size() <= 2) {
+            abbrev_storage.emplace_back(arg);
+            continue;
+          }
+          bool exact = (name == "--help" || name == "--version");
+          for (const auto &m : options) {
+            exact = exact || m.long_name == name;
+          }
+          if (exact) {
+            abbrev_storage.emplace_back(arg);
+            continue;
+          }
+          std::vector<std::string_view> matches;
+          auto consider = [&matches](std::string_view candidate,
+                                     std::string_view prefix) {
+            if (candidate.size() > prefix.size() &&
+                candidate.starts_with(prefix) &&
+                std::ranges::find(matches, candidate) == matches.end()) {
+              matches.push_back(candidate);
+            }
+          };
+          for (const auto &m : options) consider(m.long_name, name);
+          consider(std::string_view("--help"), name);
+          consider(std::string_view("--version"), name);
+          if (matches.empty()) {
+            abbrev_storage.emplace_back(arg);
+            continue;
+          }
+          if (matches.size() > 1) {
+            std::string msg = "option '" + std::string(name) +
+                              "' is ambiguous; possibilities:";
+            for (std::string_view p : matches) {
+              msg += " '";
+              msg += p;
+              msg += "'";
+            }
+            ambiguous = std::move(msg);
+            break;
+          }
+          abbrev_storage.push_back(std::string(matches[0]) +
+                                   std::string(suffix));
+        }
+        if (ambiguous) {
+          safeErrorPrintLn(std::string(cmdName) + ": " + *ambiguous);
+          safeErrorPrintLn(winux::i18n::format(
+              "common.try_help", "Try '{} --help' for more information.",
+              cmdName));
+          return behavior.parse_error_exit_code;
+        }
+        effective_args = replace_effective_args(
+            std::move(abbrev_storage), rewritten_storage, rewritten_views);
+      }
+    }
+
     if (behavior.special_dispatch != nullptr) {
       if (auto status = behavior.special_dispatch(it->second, effective_args)) {
         return *status;
       }
     }
 
-    // Check if it contains help
+    // Check if it contains help. [GNU] "--" ends option processing, so a
+    // "--help" after it is data (e.g. `echo -- --help` must print
+    // "--help", not show help) — same rule wants_standard_version uses.
+    // printf/test/[ narrow it further: their --help/--version are honored
+    // only as the sole argument, so `printf '%s\n' --help` prints
+    // "--help" and `test --help x` is an expression error, not help.
     bool wants_help = false;
     if (behavior.standard_interception_enabled(args)) {
-      for (const auto &arg : effective_args) {
-        if (arg == "--help") {
-          wants_help = true;
-          break;
+      if (behavior.help_version_only_when_sole_argument) {
+        wants_help =
+            effective_args.size() == 1 && effective_args[0] == "--help";
+      } else {
+        for (const auto &arg : effective_args) {
+          if (arg == "--") {
+            break;
+          }
+          if (arg == "--help") {
+            wants_help = true;
+            break;
+          }
         }
       }
     }
@@ -962,9 +1158,23 @@ class RegistryImpl {
       return 0;
     }
 
-    if (wants_standard_version(cmdName, effective_args, options)) {
+    const bool wants_version =
+        behavior.help_version_only_when_sole_argument
+            ? (effective_args.size() == 1 && effective_args[0] == "--version")
+            : wants_standard_version(cmdName, effective_args, options);
+    if (wants_version) {
+      // [GNU] --version prints a multi-line block in the shape of
+      // "cmd (suite) version" + copyright/license/warranty/author (#1044).
       safePrintLn(std::string(cmdName) + " (WinuxCmd) " +
                   std::string(WinuxCmd::VERSION_STRING));
+      safePrintLn("Copyright (C) 2026 WinuxCmd");
+      safePrintLn("License MIT <https://opensource.org/license/mit>.");
+      safePrintLn(
+          "This is free software: you are free to change and "
+          "redistribute it.");
+      safePrintLn("There is NO WARRANTY, to the extent permitted by law.");
+      safePrintLn("");
+      safePrintLn("Written by WinuxCmd contributors.");
       return 0;
     }
 

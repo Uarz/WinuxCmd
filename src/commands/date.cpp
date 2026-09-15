@@ -32,11 +32,11 @@
 /// @License: MIT
 /// @Copyright: Copyright © 2026 WinuxCmd
 
+#include <cstdlib>  // std::getenv
+#include <ctime>    // _tzset, localtime_s, mktime (TZ env support)
+
 #include "core/command_macros.h"
 #include "pch/pch.h"
-
-#include <ctime>   // _tzset, localtime_s, mktime (TZ env support)
-#include <cstdlib> // std::getenv
 
 // Standard library symbols (std::regex, std::istringstream, ...) come from the
 // `import std;` below. Do NOT also #include standard C++ headers in a
@@ -96,6 +96,10 @@ auto constexpr DATE_OPTIONS = std::array{
            STRING_TYPE),
     // [DIFFERS]
     OPTION("", "--universal", "alias for --utc"),
+    // [GNU] --uct: deprecated alias for --utc; hidden like GNU
+    OPTION("", "--uct", "", BOOL_TYPE),
+    // [GNU] --rfc-822: deprecated alias for -R/--rfc-email; hidden like GNU
+    OPTION("", "--rfc-822", "", BOOL_TYPE),
     // [GNU] --debug: annotate the parsed date, and warn about dubious usage
     OPTION("", "--debug",
            "annotate the parsed date, and warn about dubious usage to stderr"),
@@ -230,6 +234,80 @@ auto tz_env_active() -> bool {
   return tz != nullptr && *tz != '\0';
 }
 
+// [GNU] Parse the TZ environment variable as a POSIX proleptic fixed-offset
+// zone — "NAME[±]hh[:mm[:ss]]" or "<NAME>[±]hh[:mm[:ss]]" — with NO daylight
+// saving part. Returns the offset EAST of UTC in seconds (POSIX offsets count
+// west, so the sign is inverted), or nullopt when the zone has DST rules or
+// is otherwise not a plain fixed offset; callers then keep the CRT
+// localtime/mktime path. Unlike the CRT (which rejects time_t before 1970
+// and after ~3000), pure arithmetic covers the whole FILETIME range, so
+// e.g. TZ=UTC0 date -d @253402300739 -> year 9999 (WinuxCmd#352).
+auto env_tz_fixed_offset_seconds() -> std::optional<long long> {
+  const char *tz_env = std::getenv("TZ");
+  if (tz_env == nullptr || *tz_env == '\0') return std::nullopt;
+  std::string s = tz_env;
+  if (s.front() == ':') s.erase(0, 1);
+
+  size_t pos = 0;
+  std::string name;
+  if (pos < s.size() && s[pos] == '<') {
+    auto close = s.find('>', pos);
+    if (close == std::string::npos) return std::nullopt;
+    name = s.substr(pos + 1, close - pos - 1);
+    pos = close + 1;
+  } else {
+    size_t start = pos;
+    while (pos < s.size() && std::isalpha(static_cast<unsigned char>(s[pos]))) {
+      ++pos;
+    }
+    name = s.substr(start, pos - start);
+  }
+  if (name.empty()) return std::nullopt;
+
+  if (pos == s.size()) {
+    // Bare zone name: only the unambiguous UTC spellings are fixed-offset.
+    std::string upper = name;
+    for (auto &c : upper) {
+      c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    if (upper == "UTC" || upper == "GMT" || upper == "UT" || upper == "Z") {
+      return 0;
+    }
+    return std::nullopt;
+  }
+
+  int sign = 1;
+  if (s[pos] == '+' || s[pos] == '-') {
+    sign = s[pos] == '-' ? -1 : 1;
+    ++pos;
+  }
+  auto read_num = [&](int &out) -> bool {
+    size_t start = pos;
+    while (pos < s.size() && std::isdigit(static_cast<unsigned char>(s[pos]))) {
+      ++pos;
+    }
+    if (pos == start) return false;
+    out = *parse_int(std::string_view(s).substr(start, pos - start));
+    return true;
+  };
+  int hours = 0, minutes = 0, seconds = 0;
+  if (!read_num(hours)) return std::nullopt;
+  if (pos < s.size() && s[pos] == ':') {
+    ++pos;
+    if (!read_num(minutes)) return std::nullopt;
+    if (pos < s.size() && s[pos] == ':') {
+      ++pos;
+      if (!read_num(seconds)) return std::nullopt;
+    }
+  }
+  // Trailing DST name or rule set ("PST8PDT", "EST5EDT,M3.2.0,...") -> not a
+  // fixed zone; defer to the CRT implementation.
+  if (pos != s.size() || hours > 24 || minutes > 59 || seconds > 59) {
+    return std::nullopt;
+  }
+  return -sign * (hours * 3600LL + minutes * 60LL + seconds);
+}
+
 auto filetime_to_local_st(const FILETIME &ft) -> std::optional<SYSTEMTIME> {
   if (!tz_env_active()) {
     FILETIME local_ft{};
@@ -238,12 +316,21 @@ auto filetime_to_local_st(const FILETIME &ft) -> std::optional<SYSTEMTIME> {
     if (!FileTimeToSystemTime(&local_ft, &st)) return std::nullopt;
     return st;
   }
+  // Fixed-offset POSIX TZ ("UTC0", "EST5", ...): shift arithmetically so the
+  // whole FILETIME range works (CRT localtime_s stops at ~year 3000 and
+  // refuses negative time_t).
+  if (auto east = env_tz_fixed_offset_seconds()) {
+    FILETIME shifted = add_seconds(ft, *east);
+    SYSTEMTIME st{};
+    if (!FileTimeToSystemTime(&shifted, &st)) return std::nullopt;
+    return st;
+  }
   _tzset();
   const unsigned long long ticks = filetime_to_ticks(ft);
   const long long secs =
       static_cast<long long>(ticks / 10000000ULL) - 11644473600LL;
   const time_t t = static_cast<time_t>(secs);
-  struct tm tmv {};
+  struct tm tmv{};
   if (localtime_s(&tmv, &t) != 0) return std::nullopt;
   SYSTEMTIME st{};
   st.wYear = static_cast<WORD>(tmv.tm_year + 1900);
@@ -268,8 +355,14 @@ auto local_st_to_filetime(const SYSTEMTIME &local) -> std::optional<FILETIME> {
     if (!SystemTimeToFileTime(&utc, &ft)) return std::nullopt;
     return ft;
   }
+  if (auto east = env_tz_fixed_offset_seconds()) {
+    if (!valid_system_time(local)) return std::nullopt;
+    FILETIME as_utc{};
+    if (!SystemTimeToFileTime(&local, &as_utc)) return std::nullopt;
+    return add_seconds(as_utc, -*east);
+  }
   if (!valid_system_time(local)) return std::nullopt;
-  struct tm tmv {};
+  struct tm tmv{};
   tmv.tm_year = static_cast<int>(local.wYear) - 1900;
   tmv.tm_mon = static_cast<int>(local.wMonth) - 1;
   tmv.tm_mday = static_cast<int>(local.wDay);
@@ -318,11 +411,62 @@ auto parse_epoch_time(std::string_view s) -> std::optional<FILETIME> {
   return add_seconds(*ft, seconds);
 }
 
+// [GNU] parse-datetime.y time_zone_table: named fixed-offset zones. Values
+// are minutes EAST of UTC; the *DT/*ST summer entries already include the
+// DST hour (tDAYZONE = standard offset + 60). J is intentionally absent
+// (military table handles it).
+auto named_zone_offset_minutes(std::string_view name) -> std::optional<int> {
+  static const std::pair<std::string_view, int> table[] = {
+      {"GMT", 0},     {"UT", 0},     {"UTC", 0},     {"WET", 0},
+      {"WEST", 60},   {"BST", 60},   {"ART", -180},  {"BRT", -180},
+      {"BRST", -120}, {"NST", -210}, {"NDT", -150},  {"AST", -240},
+      {"ADT", -180},  {"CLT", -240}, {"CLST", -180}, {"EST", -300},
+      {"EDT", -240},  {"CST", -360}, {"CDT", -300},  {"MST", -420},
+      {"MDT", -360},  {"PST", -480}, {"PDT", -420},  {"AKST", -540},
+      {"AKDT", -480}, {"HST", -600}, {"HAST", -600}, {"HADT", -540},
+      {"SST", -720},  {"WAT", 60},   {"CET", 60},    {"CEST", 120},
+      {"MET", 60},    {"MEZ", 60},   {"MEST", 120},  {"MESZ", 120},
+      {"EET", 120},   {"EEST", 180}, {"CAT", 120},   {"SAST", 120},
+      {"EAT", 180},   {"MSK", 180},  {"MSD", 240},   {"IST", 330},
+      {"SGT", 480},   {"KST", 540},  {"JST", 540},   {"GST", 600},
+      {"NZST", 720},  {"NZDT", 780},
+  };
+  std::string upper(name);
+  for (auto &c : upper) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  for (const auto &[zone, off] : table) {
+    if (zone == upper) return off;
+  }
+  return std::nullopt;
+}
+
 auto parse_timezone_suffix(std::string &s) -> std::optional<int> {
   std::string lowered = lower_copy(s);
   if (lowered.ends_with(" utc") || lowered.ends_with(" gmt")) {
     s = trim_copy(s.substr(0, s.size() - 4));
     return 0;
+  }
+  // [GNU] Other named zones ("... PST", "... MEST"): a trailing alphabetic
+  // word found in the gnulib zone table is a fixed offset (uutils#12954 /
+  // WinuxCmd#358).
+  {
+    size_t end = s.find_last_not_of(' ');
+    if (end != std::string::npos) {
+      size_t begin = s.find_last_of(' ', end);
+      std::string_view word = std::string_view(s).substr(
+          begin == std::string::npos ? 0 : begin + 1,
+          end - (begin == std::string::npos ? 0 : begin + 1) + 1);
+      bool alpha = !word.empty() && std::ranges::all_of(word, [](char c) {
+        return std::isalpha(static_cast<unsigned char>(c)) != 0;
+      });
+      if (alpha && begin != std::string::npos) {
+        if (auto off = named_zone_offset_minutes(word)) {
+          s = trim_copy(s.substr(0, begin));
+          return *off;
+        }
+      }
+    }
   }
   if (lowered.ends_with("z") && s.size() > 1 &&
       std::isdigit(static_cast<unsigned char>(s[s.size() - 2]))) {
@@ -366,12 +510,103 @@ auto parse_timezone_suffix(std::string &s) -> std::optional<int> {
   return std::nullopt;
 }
 
-auto parse_fixed_date_time(std::string input, bool use_utc)
+// [GNU] --debug annotation support: the parser records which grammar items
+// it recognized (in input order) plus the aggregate relative offsets, so the
+// caller can replay gnulib parse-datetime.y's debug trace (uutils#7342 /
+// WinuxCmd#239). All fields are optional outputs; callers pass nullptr when
+// --debug is not in effect.
+struct DateDebugInfo {
+  // (input position, text) pairs like "parsed date part: (Y-M-D) 2026-01-02".
+  std::vector<std::pair<size_t, std::string>> items;
+  bool epoch = false;
+  bool zone_seen = false;  // explicit zone in the string (tZONE / military)
+  int zone_seconds = 0;    // parsed zone offset, seconds east of UTC
+  bool have_date = false;
+  bool have_time = false;
+  bool have_day = false;      // named weekday item ("next monday")
+  std::string day_label;      // str_days() text, e.g. "next/first Mon"
+  bool start_is_now = false;  // no explicit date/time: base is 'now'
+  bool meridian_pm = false;   // trailing PM suffix was parsed
+  int raw_hour = 0, raw_minute = 0, raw_second = 0;  // before meridian fix
+  SYSTEMTIME start{};  // wall-clock start in the effective zone
+  int nsec = 0;
+  // Aggregate relative offsets (ago/hence already folded into the sign).
+  long long rel_year = 0, rel_month = 0, rel_day = 0;
+  long long rel_hour = 0, rel_minute = 0, rel_second = 0;
+};
+
+// gnulib time_zone_str(): "+HH[:MM[:SS]]" for a seconds-east offset.
+auto debug_zone_str(int seconds_east) -> std::string {
+  char buf[16]{};
+  char sign = seconds_east < 0 ? '-' : '+';
+  int total = std::abs(seconds_east);
+  int hour = total / 3600;
+  int rem = total % 3600;
+  if (rem == 0) {
+    snprintf(buf, sizeof(buf), "%c%02d", sign, hour);
+  } else if (rem % 60 == 0) {
+    snprintf(buf, sizeof(buf), "%c%02d:%02d", sign, hour, rem / 60);
+  } else {
+    snprintf(buf, sizeof(buf), "%c%02d:%02d:%02d", sign, hour, rem / 60,
+             rem % 60);
+  }
+  return buf;
+}
+
+auto debug_date_str(const SYSTEMTIME &st) -> std::string {
+  char buf[32]{};
+  snprintf(buf, sizeof(buf), "(Y-M-D) %04u-%02u-%02u", st.wYear, st.wMonth,
+           st.wDay);
+  return buf;
+}
+
+auto debug_time_str(const SYSTEMTIME &st) -> std::string {
+  char buf[16]{};
+  snprintf(buf, sizeof(buf), "%02u:%02u:%02u", st.wHour, st.wMinute,
+           st.wSecond);
+  return buf;
+}
+
+auto debug_datetime_str(const SYSTEMTIME &st, bool zone_seen, int zone_seconds)
+    -> std::string {
+  std::string s = debug_date_str(st) + " " + debug_time_str(st);
+  if (zone_seen) s += " TZ=" + debug_zone_str(zone_seconds);
+  return s;
+}
+
+auto parse_fixed_date_time(std::string input, bool use_utc,
+                           DateDebugInfo *dbg = nullptr)
     -> std::optional<FILETIME> {
   input = trim_copy(input);
-  if (auto epoch = parse_epoch_time(input)) return epoch;
+  if (auto epoch = parse_epoch_time(input)) {
+    if (dbg != nullptr) {
+      dbg->epoch = true;
+      // Re-derive the seconds for the annotation (the regex-free fast path
+      // already validated them).
+      long long secs = 0;
+      auto rest = std::string_view(input).substr(1);
+      std::from_chars(rest.data(), rest.data() + rest.size(), secs);
+      dbg->items.emplace_back(
+          0, "parsed number of seconds part: number of seconds: " +
+                 std::to_string(secs));
+    }
+    return epoch;
+  }
 
+  // Named zones (" UTC"/" GMT"/trailing 'Z') are reported as a separate
+  // "parsed zone part" item; a numeric ±hhmm/±hh:mm offset is folded into
+  // the time item like gnulib does ("parsed time part: 03:04:05 UTC+08").
+  const std::string before_tz = input;
   auto tz_offset = parse_timezone_suffix(input);
+  bool named_zone = false;
+  if (tz_offset && before_tz.size() != input.size()) {
+    // A named zone (" PST", " UTC") was stripped when the removed suffix is
+    // all alphabetic.
+    std::string removed = trim_copy(before_tz.substr(input.size()));
+    named_zone = !removed.empty() && std::ranges::all_of(removed, [](char c) {
+      return std::isalpha(static_cast<unsigned char>(c)) != 0;
+    });
+  }
   std::ranges::replace(input, 'T', ' ');
 
   // Tokenize: locate the Y-M-D date token (loose single-digit fields and
@@ -383,6 +618,8 @@ auto parse_fixed_date_time(std::string input, bool use_utc)
       R"(^[0-9]{4}[-/][0-9]{1,2}[-/][0-9]{1,2}$|^[0-9]{8}$)");
   std::string date_part;
   std::string time_part;
+  size_t date_pos = std::string::npos;
+  size_t time_pos = std::string::npos;
   {
     std::vector<std::string> time_tokens;
     std::istringstream iss(input);
@@ -391,6 +628,7 @@ auto parse_fixed_date_time(std::string input, bool use_utc)
     while (iss >> tok) {
       if (!date_found && std::regex_match(tok, date_token_re)) {
         date_part = tok;
+        date_pos = input.find(tok);
         date_found = true;
       } else {
         time_tokens.push_back(tok);
@@ -400,13 +638,44 @@ auto parse_fixed_date_time(std::string input, bool use_utc)
       if (i) time_part += ' ';
       time_part += time_tokens[i];
     }
-    if (!date_found) date_part = input;  // legacy: whole string as date
+    if (!time_tokens.empty()) {
+      time_pos = input.find(time_tokens.front());
+    }
+    if (!date_found) {
+      // [GNU] A bare wall-clock time uses the current date: "-d '15:04'"
+      // is today at 15:04. Anything else still fails the date parse below
+      // unless it forms a valid time on its own.
+      time_part = trim_copy(input);
+      if (time_pos == std::string::npos && !time_tokens.empty()) {
+        time_pos = 0;
+      }
+    }
   }
 
   int year = 0;
   int month = 0;
   int day = 0;
-  {
+  if (date_part.empty()) {
+    // No date token: GNU keeps the current date in the effective zone.
+    FILETIME now_ft{};
+    GetSystemTimeAsFileTime(&now_ft);
+    std::optional<SYSTEMTIME> today;
+    if (tz_offset || use_utc) {
+      // For an explicit parsed zone the current date is taken in that zone.
+      FILETIME shifted =
+          add_seconds(now_ft, tz_offset ? *tz_offset * 60LL : 0LL);
+      SYSTEMTIME utc_st{};
+      if (!FileTimeToSystemTime(&shifted, &utc_st)) return std::nullopt;
+      today = utc_st;
+    } else {
+      today = filetime_to_local_st(now_ft);
+    }
+    if (!today) return std::nullopt;
+    year = today->wYear;
+    month = today->wMonth;
+    day = today->wDay;
+    if (dbg != nullptr) dbg->start_is_now = true;
+  } else {
     static const std::regex ymd_re(
         R"(^([0-9]{4})([-/])([0-9]{1,2})\2([0-9]{1,2})$)");
     std::smatch ymd;
@@ -426,6 +695,7 @@ auto parse_fixed_date_time(std::string input, bool use_utc)
   int hour = 0;
   int minute = 0;
   int second = 0;
+  int frac_nsec = 0;
   if (!time_part.empty()) {
     // [GNU] Optional trailing AM/PM (case-insensitive, with or without a
     // space: "03:04:05 PM" and "03:04:05PM"). 12 AM = 00:xx, 12 PM = 12:xx,
@@ -473,6 +743,20 @@ auto parse_fixed_date_time(std::string input, bool use_utc)
       tv.remove_prefix(colon + 1);
     }
     if (pieces.size() < 2 || pieces.size() > 3) return std::nullopt;
+    // [GNU] The seconds field may carry a fractional part
+    // ("03:04:05.123456789", e.g. ls -l / stat output; WinuxCmd#976).
+    // GNU keeps full nanosecond resolution; FILETIME only stores 100ns
+    // ticks, so digits past the 7th are truncated.
+    if (pieces.size() == 3) {
+      if (auto dot = pieces[2].find('.'); dot != std::string_view::npos) {
+        auto frac = pieces[2].substr(dot + 1);
+        if (frac.empty() || !is_digits(frac)) return std::nullopt;
+        for (size_t i = 0; i < 9; ++i) {
+          frac_nsec = frac_nsec * 10 + (i < frac.size() ? frac[i] - '0' : 0);
+        }
+        pieces[2] = pieces[2].substr(0, dot);
+      }
+    }
     auto h = parse_int(pieces[0]);
     auto m = parse_int(pieces[1]);
     auto sec =
@@ -481,12 +765,23 @@ auto parse_fixed_date_time(std::string input, bool use_utc)
     hour = *h;
     minute = *m;
     second = *sec;
+    if (dbg != nullptr) {
+      dbg->nsec = frac_nsec;
+      dbg->raw_hour = hour;
+      dbg->raw_minute = minute;
+      dbg->raw_second = second;
+    }
     if (has_am || has_pm) {
       if (hour < 1 || hour > 12) return std::nullopt;
-      if (has_pm && hour < 12) hour += 12;
-      else if (has_am && hour == 12) hour = 0;
+      if (has_pm && hour < 12)
+        hour += 12;
+      else if (has_am && hour == 12)
+        hour = 0;
     }
+    if (dbg != nullptr && has_pm) dbg->meridian_pm = true;
   }
+
+  if (dbg != nullptr && !time_part.empty()) dbg->have_time = true;
 
   SYSTEMTIME st{};
   st.wYear = static_cast<WORD>(year);
@@ -496,15 +791,71 @@ auto parse_fixed_date_time(std::string input, bool use_utc)
   st.wMinute = static_cast<WORD>(minute);
   st.wSecond = static_cast<WORD>(second);
 
+  if (dbg != nullptr) {
+    if (!date_part.empty()) {
+      char item[64]{};
+      snprintf(item, sizeof(item), "parsed date part: (Y-M-D) %04d-%02d-%02d",
+               year, month, day);
+      dbg->items.emplace_back(date_pos, item);
+      dbg->have_date = true;
+    }
+    if (dbg->have_time) {
+      // gnulib prints the raw parsed time with a "pm" suffix, before the
+      // meridian is folded in ("03:04:00pm").
+      char raw[16]{};
+      snprintf(raw, sizeof(raw), "%02d:%02d:%02d", dbg->raw_hour,
+               dbg->raw_minute, dbg->raw_second);
+      std::string item = std::string("parsed time part: ") + raw;
+      if (dbg->nsec != 0) {
+        char ns[16]{};
+        snprintf(ns, sizeof(ns), ".%09d", dbg->nsec);
+        item += ns;
+      }
+      if (dbg->meridian_pm) item += "pm";
+      if (tz_offset && !named_zone) {
+        item += " UTC" + debug_zone_str(*tz_offset * 60);
+      }
+      dbg->items.emplace_back(time_pos == std::string::npos ? 0 : time_pos,
+                              item);
+    }
+    if (named_zone) {
+      // " UTC"/" PST" suffix: separate "parsed zone part" item.
+      dbg->items.emplace_back(
+          input.size(),
+          "parsed zone part: UTC" + debug_zone_str(*tz_offset * 60));
+      dbg->zone_seen = true;
+      dbg->zone_seconds = *tz_offset * 60;
+    } else if (tz_offset) {
+      dbg->zone_seen = true;
+      dbg->zone_seconds = *tz_offset * 60;
+      if (!dbg->have_time) {
+        dbg->items.emplace_back(
+            input.size(),
+            "parsed zone part: UTC" + debug_zone_str(*tz_offset * 60));
+      }
+    }
+    dbg->start = st;
+  }
+
+  // Fold the parsed fractional seconds into the FILETIME (100ns ticks).
+  const long long frac_ticks = frac_nsec / 100;
+
   if (tz_offset) {
     auto ft = utc_system_time_to_filetime(st);
     if (!ft) return std::nullopt;
-    return add_seconds(*ft, -static_cast<long long>(*tz_offset) * 60);
+    return ticks_to_filetime(
+        filetime_to_ticks(
+            add_seconds(*ft, -static_cast<long long>(*tz_offset) * 60)) +
+        frac_ticks);
   }
   // [GNU] -u/--utc makes zone-less date strings parse as UTC instead of
   // local time.
-  if (use_utc) return utc_system_time_to_filetime(st);
-  return local_system_time_to_filetime(st);
+  std::optional<FILETIME> result = use_utc ? utc_system_time_to_filetime(st)
+                                           : local_system_time_to_filetime(st);
+  if (result && frac_ticks != 0) {
+    result = ticks_to_filetime(filetime_to_ticks(*result) + frac_ticks);
+  }
+  return result;
 }
 
 auto timezone_offset_minutes(const FILETIME &utc, bool use_utc) -> int {
@@ -641,6 +992,10 @@ auto format_time(const TimeValue &tv, const std::string &format)
           no_pad = true;
         } else if (flag == '_') {
           pad_char = ' ';
+        } else if (flag == 'E' || flag == 'O') {
+          // [GNU] %E/%O select the locale's alternative representation;
+          // in the C/POSIX locale (and on Windows, which has no alternate
+          // digits/eras) they fall back to the base conversion (#1088).
         } else if (flag >= '0' && flag <= '9') {
           has_width = true;
           width = width * 10 + (flag - '0');
@@ -697,14 +1052,16 @@ auto format_time(const TimeValue &tv, const std::string &format)
           append_number(result, st.wSecond, 2);
           break;
         case 'N': {
-          // [GNU] %N prints 9-digit nanoseconds. An explicit width smaller
-          // than 9 truncates (%3N -> "123"), a larger width left-pads
-          // (%12N), '-' keeps the first digit only.
-          std::string nanos = pad_left(std::to_string(
-                                           static_cast<long long>(
-                                               st.wMilliseconds) *
-                                           1000000),
-                                       9, '0');
+          // [GNU] %N prints 9-digit nanoseconds. Derived from the FILETIME
+          // 100ns ticks (rather than wMilliseconds) so parsed fractional
+          // seconds like "...05.123456789" keep their precision
+          // (WinuxCmd#976); the last two digits are always 0 on this
+          // platform.
+          std::string nanos = pad_left(
+              std::to_string(static_cast<long long>(filetime_to_ticks(tv.utc) %
+                                                    10000000ULL) *
+                             100),
+              9, '0');
           if (no_pad) {
             result += nanos.substr(0, 1);
           } else if (has_width) {
@@ -786,7 +1143,8 @@ auto format_time(const TimeValue &tv, const std::string &format)
               apply_case(format_time(tv, "%H:%M:%S"), to_uppcase, to_lowcase);
           break;
         case 'R':
-          result += apply_case(format_time(tv, "%H:%M"), to_uppcase, to_lowcase);
+          result +=
+              apply_case(format_time(tv, "%H:%M"), to_uppcase, to_lowcase);
           break;
         case 'r':
           result += apply_case(format_time(tv, "%I:%M:%S %p"), to_uppcase,
@@ -896,12 +1254,18 @@ struct RelativeItem {
 // in encounter order. Leaves the remainder (base date) in place. Returns
 // nullopt when an amount does not fit in the relative accumulator, which the
 // caller turns into GNU's "invalid date" (see parse_amount).
-auto strip_relative_items(std::string &s)
+//
+// [GNU] Each item may carry a trailing "ago"/"hence" (parse-datetime.y
+// `rel: relunit tAGO`): "ago" negates just that item, matching GNU's
+// per-relunit sign. Weeks/fortnights count toward the day aggregate, like
+// gnulib's tDAY_UNIT multipliers (week=7, fortnight=14).
+auto strip_relative_items(std::string &s, DateDebugInfo *dbg = nullptr)
     -> std::optional<std::vector<RelativeItem>> {
   static const std::regex item_re(
-      R"(([+-]?[0-9]+)\s*(fortnights|fortnight|seconds|second|secs|sec|minutes|minute|mins|min|hours|hour|days|day|weeks|week|months|month|years|year)\s*$)",
+      R"(([+-]?[0-9]+)\s*(fortnights|fortnight|seconds|second|secs|sec|minutes|minute|mins|min|hours|hour|days|day|weeks|week|months|month|years|year)\s*(ago|hence)?\s*$)",
       std::regex::icase);
   std::vector<RelativeItem> items;
+  std::vector<std::pair<size_t, std::string>> dbg_items;
   std::string work = trim_copy(s);
   std::smatch m;
   while (std::regex_search(work, m, item_re) &&
@@ -911,28 +1275,91 @@ auto strip_relative_items(std::string &s)
     std::string unit = lower_copy(m[2].str());
     bool is_year = unit.starts_with("year");
     bool is_month = unit.starts_with("month");
+    long long effective = *amount;
+    if (m[3].matched && lower_copy(m[3].str()) == "ago") {
+      effective = -effective;
+    }
     long long unit_seconds = 1;
-    if (unit.starts_with("fortnight"))
+    long long day_scale = 0;
+    if (unit.starts_with("fortnight")) {
       unit_seconds = 1209600;
-    else if (unit.starts_with("week"))
+      day_scale = 14;
+    } else if (unit.starts_with("week")) {
       unit_seconds = 604800;
-    else if (unit.starts_with("day"))
+      day_scale = 7;
+    } else if (unit.starts_with("day")) {
       unit_seconds = 86400;
-    else if (unit.starts_with("hour"))
+      day_scale = 1;
+    } else if (unit.starts_with("hour")) {
       unit_seconds = 3600;
-    else if (unit.starts_with("min"))
+    } else if (unit.starts_with("min")) {
       unit_seconds = 60;
-    items.push_back({*amount, is_month || is_year, is_year ? 12 : 1,
-                     unit_seconds});
+    }
+    items.push_back(
+        {effective, is_month || is_year, is_year ? 12 : 1, unit_seconds});
+    if (dbg != nullptr) {
+      if (is_year)
+        dbg->rel_year += effective;
+      else if (is_month)
+        dbg->rel_month += effective;
+      else if (day_scale != 0)
+        dbg->rel_day += effective * day_scale;
+      else if (unit_seconds == 3600)
+        dbg->rel_hour += effective;
+      else if (unit_seconds == 60)
+        dbg->rel_minute += effective;
+      else
+        dbg->rel_second += effective;
+      // Items are stripped right-to-left; positions are absolute in the
+      // original string, so sort order is recovered by reversing below.
+      dbg_items.emplace_back(m.position(0), "");
+    }
     work = trim_copy(work.substr(0, m.position(0)));
+  }
+  if (dbg != nullptr && !dbg_items.empty()) {
+    // Replay in input order with running totals to match gnulib's
+    // cumulative "parsed relative part:" annotations.
+    long long ry = 0, rm = 0, rd = 0, rh = 0, rmin = 0, rs = 0;
+    for (size_t i = items.size(); i-- > 0;) {
+      const auto &it = items[i];
+      long long scaled =
+          it.amount * (it.calendar ? it.months_per_unit : it.unit_seconds);
+      if (it.calendar && it.months_per_unit == 12)
+        ry += it.amount;
+      else if (it.calendar)
+        rm += it.amount;
+      else if (it.unit_seconds % 86400 == 0)
+        rd += scaled / 86400;
+      else if (it.unit_seconds == 3600)
+        rh += it.amount;
+      else if (it.unit_seconds == 60)
+        rmin += it.amount;
+      else
+        rs += scaled;
+      std::string line = "parsed relative part:";
+      auto rel_part = [&](long long v, const char *name) {
+        if (v != 0) {
+          char buf[40]{};
+          snprintf(buf, sizeof(buf), " %+lld %s", v, name);
+          line += buf;
+        }
+      };
+      rel_part(ry, "year(s)");
+      rel_part(rm, "month(s)");
+      rel_part(rd, "day(s)");
+      rel_part(rh, "hour(s)");
+      rel_part(rmin, "minutes");
+      rel_part(rs, "seconds");
+      dbg->items.emplace_back(dbg_items[i].first, line);
+    }
   }
   s = work;
   return items;
 }
 
 auto apply_relative_items(const FILETIME &base,
-                          const std::vector<RelativeItem> &items,
-                          bool use_utc) -> std::optional<FILETIME> {
+                          const std::vector<RelativeItem> &items, bool use_utc)
+    -> std::optional<FILETIME> {
   long long delta_seconds = 0;
   long long delta_months = 0;
   for (const auto &item : items) {
@@ -956,8 +1383,8 @@ auto apply_relative_items(const FILETIME &base,
       if (!local) return std::nullopt;
       st = *local;
     }
-    long long total = static_cast<long long>(st.wYear) * 12 +
-                      (st.wMonth - 1) + delta_months;
+    long long total =
+        static_cast<long long>(st.wYear) * 12 + (st.wMonth - 1) + delta_months;
     int year = static_cast<int>(total / 12);
     int month = static_cast<int>(total % 12) + 1;
     if (year < 1 || year > 9999) return std::nullopt;
@@ -982,7 +1409,8 @@ auto apply_relative_items(const FILETIME &base,
   return result;
 }
 
-auto parse_date_argument(const std::string &arg, bool use_utc)
+auto parse_date_argument(const std::string &arg, bool use_utc,
+                         DateDebugInfo *dbg = nullptr)
     -> std::optional<FILETIME> {
   std::string value = trim_copy(arg);
   std::string lower = lower_copy(value);
@@ -993,11 +1421,11 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
   };
 
   // [GNU] Trailing relative items ("2026-01-01 +1 month", "+2 days",
-  // "1 hour"). The remainder is parsed as the base date; with no remainder
-  // the base is now.
+  // "1 hour", "3 days ago"). The remainder is parsed as the base date;
+  // with no remainder the base is now.
   {
     std::string work = value;
-    auto rel_items = strip_relative_items(work);
+    auto rel_items = strip_relative_items(work, dbg);
     // An unrepresentable amount is an invalid date, exactly like GNU's
     // overflow check in parse-datetime.y — never a thrown exception.
     if (!rel_items) return std::nullopt;
@@ -1006,8 +1434,9 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
       std::optional<FILETIME> base;
       if (rest.empty()) {
         base = now;
+        if (dbg != nullptr) dbg->start_is_now = true;
       } else {
-        base = parse_date_argument(rest, use_utc);
+        base = parse_date_argument(rest, use_utc, dbg);
       }
       if (!base) return std::nullopt;
       auto applied = apply_relative_items(*base, *rel_items, use_utc);
@@ -1016,10 +1445,27 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
     }
   }
 
-  // [GNU] Natural language date support
-  if (lower == "now" || lower == "today") return now;
-  if (lower == "tomorrow") return relative(1, 86400);
-  if (lower == "yesterday") return relative(-1, 86400);
+  // [GNU] Natural language date support. "today"/"now" are a zero-valued
+  // relative item ("today/this/now"); "tomorrow"/"yesterday" are day shifts
+  // that keep the current wall-clock time.
+  if (lower == "now" || lower == "today") {
+    if (dbg != nullptr) {
+      dbg->items.emplace_back(0, "parsed relative part: today/this/now");
+      dbg->start_is_now = true;
+    }
+    return now;
+  }
+  if (lower == "tomorrow" || lower == "yesterday") {
+    const long long shift = lower == "tomorrow" ? 1 : -1;
+    if (dbg != nullptr) {
+      char buf[64]{};
+      snprintf(buf, sizeof(buf), "parsed relative part: %+lld day(s)", shift);
+      dbg->items.emplace_back(0, buf);
+      dbg->rel_day += shift;
+      dbg->start_is_now = true;
+    }
+    return relative(shift, 86400);
+  }
 
   // [GNU] "yesterday 10:00 GMT" / "tomorrow 09:30" / "today 08:00" — a
   // relative day word followed by a wall-clock time and an optional
@@ -1027,7 +1473,7 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
   // hot path free of regex machinery.
   {
     const std::string_view day_words[] = {"yesterday", "today", "tomorrow"};
-    for (const auto& word : day_words) {
+    for (const auto &word : day_words) {
       if (!lower.starts_with(word)) continue;
       std::string rest = trim_copy(lower.substr(word.size()));
       if (rest.empty()) continue;  // bare day word handled above
@@ -1038,8 +1484,8 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
       if (auto space = rest.find(' '); space != std::string::npos) {
         time_part = trim_copy(rest.substr(0, space));
         std::string zone = trim_copy(rest.substr(space + 1));
-        utc_zone = zone == "gmt" || zone == "utc" || zone == "ut" ||
-                   zone == "z";
+        utc_zone =
+            zone == "gmt" || zone == "utc" || zone == "ut" || zone == "z";
         if (!utc_zone) return std::nullopt;
       }
       int hour = -1;
@@ -1049,19 +1495,19 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
         const auto colon1 = time_part.find(':');
         if (colon1 == std::string::npos) return std::nullopt;
         const auto colon2 = time_part.find(':', colon1 + 1);
-        auto parse_field = [](const std::string& text) -> int {
+        auto parse_field = [](const std::string &text) -> int {
           if (text.empty() || text.size() > 2) return -1;
           for (const char ch : text) {
             if (!std::isdigit(static_cast<unsigned char>(ch))) return -1;
           }
-          return (text[0] - '0') * 10 +
-                 (text.size() > 1 ? text[1] - '0' : 0);
+          return (text[0] - '0') * 10 + (text.size() > 1 ? text[1] - '0' : 0);
         };
         hour = parse_field(time_part.substr(0, colon1));
         if (colon2 == std::string::npos) {
           minute = parse_field(time_part.substr(colon1 + 1));
         } else {
-          minute = parse_field(time_part.substr(colon1 + 1, colon2 - colon1 - 1));
+          minute =
+              parse_field(time_part.substr(colon1 + 1, colon2 - colon1 - 1));
           second = parse_field(time_part.substr(colon2 + 1));
         }
       }
@@ -1070,16 +1516,45 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
         return std::nullopt;
       }
       long long day_shift = 0;
-      if (word == "yesterday") day_shift = -86400;
-      else if (word == "tomorrow") day_shift = 86400;
+      if (word == "yesterday")
+        day_shift = -86400;
+      else if (word == "tomorrow")
+        day_shift = 86400;
       const FILETIME shifted = add_seconds(now, day_shift);
       SYSTEMTIME base{};
+      if (dbg != nullptr) {
+        // The day word reduces first (position 0), then the time token.
+        if (word == "today") {
+          dbg->items.emplace_back(0, "parsed relative part: today/this/now");
+        } else {
+          char buf[64]{};
+          snprintf(buf, sizeof(buf), "parsed relative part: %+lld day(s)",
+                   day_shift / 86400);
+          dbg->items.emplace_back(0, buf);
+        }
+        dbg->rel_day += day_shift / 86400;
+        dbg->have_time = true;
+        const size_t tpos = lower.find(time_part);
+        dbg->items.emplace_back(
+            tpos == std::string::npos ? word.size() + 1 : tpos,
+            "parsed time part: " + ([&] {
+              char t[16]{};
+              snprintf(t, sizeof(t), "%02d:%02d:%02d", hour, minute, second);
+              return std::string(t);
+            })());
+        if (utc_zone) {
+          dbg->items.emplace_back(value.size(), "parsed zone part: UTC+00");
+          dbg->zone_seen = true;
+          dbg->zone_seconds = 0;
+        }
+      }
       if (utc_zone) {
         if (!FileTimeToSystemTime(&shifted, &base)) return std::nullopt;
         base.wHour = static_cast<WORD>(hour);
         base.wMinute = static_cast<WORD>(minute);
         base.wSecond = static_cast<WORD>(second);
         base.wMilliseconds = 0;
+        if (dbg != nullptr) dbg->start = base;
         FILETIME out{};
         if (!SystemTimeToFileTime(&base, &out)) return std::nullopt;
         return out;
@@ -1093,101 +1568,149 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
       base.wMinute = static_cast<WORD>(minute);
       base.wSecond = static_cast<WORD>(second);
       base.wMilliseconds = 0;
+      if (dbg != nullptr) dbg->start = base;
       return local_system_time_to_filetime(base);
     }
   }
 
-  // "next monday", "next week", etc.
-  std::smatch next_match;
-  const std::regex next_re(
-      R"(^next\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|week|month|year)$)");
-  if (std::regex_match(lower, next_match, next_re)) {
-    std::string unit = next_match[1].str();
-    if (unit == "week") return relative(1, 604800);
-    if (unit == "month") return relative(1, 2629746);
-    if (unit == "year") return relative(1, 31557600);
-    // For days of the week, calculate next occurrence
-    SYSTEMTIME st{};
-    FileTimeToSystemTime(&now, &st);
-    int current_dow = st.wDayOfWeek;  // 0=Sunday, 1=Monday, ...
-    int target_dow = 0;
-    if (unit == "monday")
-      target_dow = 1;
-    else if (unit == "tuesday")
-      target_dow = 2;
-    else if (unit == "wednesday")
-      target_dow = 3;
-    else if (unit == "thursday")
-      target_dow = 4;
-    else if (unit == "friday")
-      target_dow = 5;
-    else if (unit == "saturday")
-      target_dow = 6;
-    else if (unit == "sunday")
-      target_dow = 0;
-    int days_ahead = (target_dow - current_dow + 7) % 7;
-    if (days_ahead == 0) days_ahead = 7;
-    return relative(days_ahead, 86400);
+  // "next monday", "next week", etc. GNU treats next/last week as a day
+  // shift, month/year as calendar items, and weekday names as day items
+  // that reset the time to midnight (gnulib days_seen path).
+  static const std::regex next_last_re(
+      R"(^(next|last)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|week|month|year)$)");
+  std::smatch nl_match;
+  if (std::regex_match(lower, nl_match, next_last_re)) {
+    const std::string dir = nl_match[1].str();
+    const std::string unit = nl_match[2].str();
+    const long long sign = dir == "next" ? 1 : -1;
+
+    if (unit == "week") {
+      if (dbg != nullptr) {
+        dbg->items.emplace_back(
+            0, "parsed relative part: " + std::to_string(sign * 7) + " day(s)");
+        dbg->rel_day += sign * 7;
+        dbg->start_is_now = true;
+      }
+      return relative(sign, 604800);
+    }
+    if (unit == "month" || unit == "year") {
+      // Calendar arithmetic like parse-datetime.y's rel.month/rel.year.
+      const bool is_year = unit == "year";
+      const RelativeItem item{sign, true, is_year ? 12 : 1, 1};
+      if (dbg != nullptr) {
+        dbg->items.emplace_back(
+            0, "parsed relative part: " + std::to_string(sign) +
+                   (is_year ? " year(s)" : " month(s)"));
+        if (is_year)
+          dbg->rel_year += sign;
+        else
+          dbg->rel_month += sign;
+        dbg->start_is_now = true;
+      }
+      return apply_relative_items(now, {item}, use_utc);
+    }
+
+    // Weekday names: GNU shifts to the named day and resets the wall
+    // clock to midnight ("warning: using midnight as starting time").
+    static const char *day_names[] = {"sunday",    "monday",   "tuesday",
+                                      "wednesday", "thursday", "friday",
+                                      "saturday"};
+    static const char *day_abbr[] = {"Sun", "Mon", "Tue", "Wed",
+                                     "Thu", "Fri", "Sat"};
+    int target_dow = -1;
+    for (int i = 0; i < 7; ++i) {
+      if (unit == day_names[i]) target_dow = i;
+    }
+    auto local_now = use_utc ? filetime_to_system_time(now, true)
+                             : filetime_to_local_st(now);
+    if (!local_now) return std::nullopt;
+    int current_dow = local_now->wDayOfWeek;  // 0=Sunday, 1=Monday, ...
+    int days_delta = sign > 0 ? (target_dow - current_dow + 7) % 7
+                              : (current_dow - target_dow + 7) % 7;
+    if (days_delta == 0) days_delta = 7;
+    const FILETIME shifted = add_seconds(now, sign * days_delta * 86400LL);
+    auto target = use_utc ? filetime_to_system_time(shifted, true)
+                          : filetime_to_local_st(shifted);
+    if (!target) return std::nullopt;
+    target->wHour = 0;
+    target->wMinute = 0;
+    target->wSecond = 0;
+    target->wMilliseconds = 0;
+    if (dbg != nullptr) {
+      // gnulib str_days(): "next/first Mon", "last Fri".
+      const char *ord = sign > 0 ? "next/first" : "last";
+      dbg->items.emplace_back(0, std::string("parsed day part: ") + ord + " " +
+                                     day_abbr[target_dow] +
+                                     " (day ordinal=" + std::to_string(sign) +
+                                     " number=" + std::to_string(target_dow) +
+                                     ")");
+      dbg->have_day = true;
+      dbg->day_label = std::string(ord) + " " + day_abbr[target_dow];
+      dbg->start = *target;
+    }
+    return use_utc ? utc_system_time_to_filetime(*target)
+                   : local_system_time_to_filetime(*target);
   }
 
-  // "last monday", "last week", etc.
-  std::smatch last_match;
-  const std::regex last_re(
-      R"(^last\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|week|month|year)$)");
-  if (std::regex_match(lower, last_match, last_re)) {
-    std::string unit = last_match[1].str();
-    if (unit == "week") return relative(-1, 604800);
-    if (unit == "month") return relative(-1, 2629746);
-    if (unit == "year") return relative(-1, 31557600);
-    // For days of the week, calculate last occurrence
-    SYSTEMTIME st{};
-    FileTimeToSystemTime(&now, &st);
-    int current_dow = st.wDayOfWeek;
-    int target_dow = 0;
-    if (unit == "monday")
-      target_dow = 1;
-    else if (unit == "tuesday")
-      target_dow = 2;
-    else if (unit == "wednesday")
-      target_dow = 3;
-    else if (unit == "thursday")
-      target_dow = 4;
-    else if (unit == "friday")
-      target_dow = 5;
-    else if (unit == "saturday")
-      target_dow = 6;
-    else if (unit == "sunday")
-      target_dow = 0;
-    int days_back = (current_dow - target_dow + 7) % 7;
-    if (days_back == 0) days_back = 7;
-    return relative(-days_back, 86400);
-  }
-
-  // [GNU] military timezone specs: <digits><letter>, e.g. 9a, 1230z.
-  // A-I = UTC+1..+9, K-M = UTC+10..+12, N-Y = UTC-1..-12, Z = UTC;
-  // J is skipped and must be rejected (uutils #12684, #12895)
+  // [GNU] military timezone specs (parse-datetime.y military_table):
+  // "<HH|HHMM><L>", "<HH>:<MM>[:<SS>]<L>", or a lone "<L>" meaning today at
+  // 00:00 in that zone. A-I = UTC+1..+9, K-M = UTC+10..+12 (J is not in the
+  // sequence), N-Y = UTC-1..-12, Z = UTC, and J is the LOCAL zone. 'T' is the
+  // ISO 8601 date/time separator, not a zone.
+  //
+  // J was added upstream in gnulib commit 9cde39f8 (2022-05-17,
+  // "parse-datetime: support 'J' military time zone", released in
+  // coreutils 9.2), which added
+  // `{ "J", 'J', 0 }` to military_table and a matching `item: 'J'` grammar
+  // rule. Coreutils 8.32 predates it and rejects J outright, so J is the one
+  // military letter whose expected result depends on the oracle version: the
+  // differential cases carry an `oracle_version:` precondition for exactly that
+  // reason. (uutils #12893, #12895)
   {
-    static const std::regex military_re(R"(^([0-9]{1,4})([A-Za-z])$)");
+    static const std::regex military_hms_re(
+        R"(^([0-9]{1,2}):([0-9]{2})(?::([0-9]{2}))?\s*([A-Za-z])$)");
+    static const std::regex military_re(R"(^([0-9]{1,4})\s*([A-Za-z])$)");
+    static const std::regex military_zone_re(R"(^([A-Za-z])$)");
     std::smatch mil;
-    if (std::regex_match(value, mil, military_re)) {
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+    char letter = '\0';
+    size_t digits_len = 0;
+    bool matched = false;
+    if (std::regex_match(value, mil, military_hms_re)) {
+      hour = std::stoi(mil[1].str());
+      minute = std::stoi(mil[2].str());
+      if (mil[3].matched) second = std::stoi(mil[3].str());
+      letter = static_cast<char>(
+          std::tolower(static_cast<unsigned char>(mil[4].str()[0])));
+      digits_len = mil[1].str().size() + mil[2].str().size() +
+                   (mil[3].matched ? mil[3].str().size() : 0);
+      matched = true;
+    } else if (std::regex_match(value, mil, military_re)) {
       const std::string digits = mil[1].str();
-      const char letter = static_cast<char>(std::tolower(
-          static_cast<unsigned char>(mil[2].str()[0])));
-      int hour = 0;
-      int minute = 0;
+      digits_len = digits.size();
       if (digits.size() <= 2) {
         hour = std::stoi(digits);
       } else {
         hour = std::stoi(digits.substr(0, digits.size() - 2));
         minute = std::stoi(digits.substr(digits.size() - 2));
       }
-      bool ok = hour <= 23 && minute <= 59;
+      letter = static_cast<char>(
+          std::tolower(static_cast<unsigned char>(mil[2].str()[0])));
+      matched = true;
+    } else if (std::regex_match(value, mil, military_zone_re)) {
+      letter = static_cast<char>(
+          std::tolower(static_cast<unsigned char>(mil[1].str()[0])));
+      matched = true;
+    }
+    if (matched) {
+      bool ok = letter != 't' && hour <= 23 && minute <= 59 && second <= 59;
       int zone_offset_minutes = 0;
+      bool local_zone = false;
       if (letter == 'j') {
-        // [GNU] J is deliberately absent from the military zone table
-        // (uutils#12895 / WinuxCmd#354): both "1024j" and "1024J" must be
-        // rejected as invalid dates.
-        ok = false;
+        // [GNU] 'J' is the local zone (parse-datetime.y: {"J", 'J', 0}).
+        local_zone = true;
       } else if (letter >= 'a' && letter <= 'i') {
         zone_offset_minutes = (letter - 'a' + 1) * 60;
       } else if (letter >= 'k' && letter <= 'm') {
@@ -1214,18 +1737,233 @@ auto parse_date_argument(const std::string &arg, bool use_utc)
       target.wDay = local_now.wDay;
       target.wHour = static_cast<WORD>(hour);
       target.wMinute = static_cast<WORD>(minute);
+      target.wSecond = static_cast<WORD>(second);
 
       auto as_local = local_system_time_to_filetime(target);
       if (!as_local) return std::nullopt;
       // Shift from "wall time as local" to "wall time in the target zone"
       const int local_offset = timezone_offset_minutes(now_ft, false);
-      return add_seconds(*as_local, static_cast<long long>(
-                                        local_offset - zone_offset_minutes) *
-                                        60);
+      if (local_zone) zone_offset_minutes = local_offset;
+      if (dbg != nullptr) {
+        char t[16]{};
+        snprintf(t, sizeof(t), "%02d:%02d:%02d", hour, minute, second);
+        dbg->items.emplace_back(0, std::string("parsed number part: ") + t);
+        dbg->items.emplace_back(
+            digits_len,
+            "parsed zone part: UTC" + debug_zone_str(zone_offset_minutes * 60));
+        dbg->zone_seen = true;
+        dbg->zone_seconds = zone_offset_minutes * 60;
+        dbg->have_time = true;
+        dbg->start = target;
+      }
+      return add_seconds(
+          *as_local,
+          static_cast<long long>(local_offset - zone_offset_minutes) * 60);
     }
   }
 
-  return parse_fixed_date_time(arg, use_utc);
+  return parse_fixed_date_time(arg, use_utc, dbg);
+}
+
+// gnulib mktime-style normalization for the --debug "new date/time" line:
+// add year/month/day aggregates to a wall-clock SYSTEMTIME, rolling day
+// overflow/underflow across month boundaries.
+auto debug_shift_date(SYSTEMTIME st, long long rel_year, long long rel_month,
+                      long long rel_day) -> SYSTEMTIME {
+  long long total_months = static_cast<long long>(st.wYear) * 12 +
+                           (st.wMonth - 1) + rel_year * 12 + rel_month;
+  long long year = total_months / 12;
+  long long month = total_months % 12;
+  if (month < 0) {
+    month += 12;
+    --year;
+  }
+  ++month;
+  if (year < 1) year = 1;  // clamp: the real conversion fails anyway
+  long long day = static_cast<long long>(st.wDay) + rel_day;
+  while (day > days_in_month(static_cast<int>(year), static_cast<int>(month))) {
+    day -= days_in_month(static_cast<int>(year), static_cast<int>(month));
+    if (++month > 12) {
+      month = 1;
+      ++year;
+    }
+  }
+  while (day < 1) {
+    if (--month < 1) {
+      month = 12;
+      --year;
+    }
+    day += days_in_month(static_cast<int>(year), static_cast<int>(month));
+  }
+  st.wYear = static_cast<WORD>(year);
+  st.wMonth = static_cast<WORD>(month);
+  st.wDay = static_cast<WORD>(day);
+  return st;
+}
+
+// Convert a wall-clock SYSTEMTIME in the effective parse zone to FILETIME.
+auto debug_st_to_filetime(const SYSTEMTIME &st, const DateDebugInfo &dbg,
+                          bool use_utc) -> std::optional<FILETIME> {
+  if (dbg.zone_seen) {
+    auto ft = utc_system_time_to_filetime(st);
+    if (!ft) return std::nullopt;
+    return add_seconds(*ft, -static_cast<long long>(dbg.zone_seconds));
+  }
+  if (use_utc) return utc_system_time_to_filetime(st);
+  return local_system_time_to_filetime(st);
+}
+
+// [GNU] Replay the parse-datetime.y debug trace for a successfully parsed
+// -d/-s string (and the partial "parsed ... part" lines for a failed one).
+// Message shapes follow lib/parse-datetime.y's debugging block
+// (uutils#7342 / WinuxCmd#239).
+auto emit_date_debug(const DateDebugInfo &dbg, const FILETIME &result,
+                     bool use_utc, const std::string &format) -> void {
+  auto items = dbg.items;
+  std::ranges::sort(
+      items, [](const auto &a, const auto &b) { return a.first < b.first; });
+  for (const auto &[pos, line] : items) {
+    safeErrorPrintLn("date: " + line);
+  }
+
+  // Effective TZ string like GNU date.c: -u maps to "UTC0".
+  const char *tz_env = std::getenv("TZ");
+  const std::string tzstring =
+      use_utc ? "UTC0" : (tz_env != nullptr ? tz_env : "");
+
+  // input timezone
+  std::string input_tz;
+  if (dbg.epoch) {
+    input_tz = "'@timespec' - always UTC";
+  } else if (dbg.zone_seen) {
+    input_tz =
+        "parsed date/time string (" + debug_zone_str(dbg.zone_seconds) + ")";
+  } else if (!tzstring.empty()) {
+    input_tz = tzstring == "UTC0" ? "TZ=\"UTC0\" environment value or -u"
+                                  : "TZ=\"" + tzstring + "\" environment value";
+  } else {
+    input_tz = "system default";
+  }
+  safeErrorPrintLn("date: input timezone: " + input_tz);
+
+  const bool rels_seen = dbg.rel_year != 0 || dbg.rel_month != 0 ||
+                         dbg.rel_day != 0 || dbg.rel_hour != 0 ||
+                         dbg.rel_minute != 0 || dbg.rel_second != 0;
+
+  if (!dbg.epoch) {
+    SYSTEMTIME start = dbg.start;
+    if (dbg.start_is_now) {
+      FILETIME now_ft{};
+      GetSystemTimeAsFileTime(&now_ft);
+      auto cur = use_utc ? filetime_to_system_time(now_ft, true)
+                         : filetime_to_local_st(now_ft);
+      if (cur) start = *cur;
+    }
+
+    if (dbg.have_time) {
+      safeErrorPrintLn("date: using specified time as starting value: '" +
+                       debug_time_str(start) + "'");
+    } else if (rels_seen && !dbg.have_date && !dbg.have_day) {
+      safeErrorPrintLn("date: using current time as starting value: '" +
+                       debug_time_str(start) + "'");
+    } else {
+      safeErrorPrintLn(
+          "date: warning: using midnight as starting time: 00:00:00");
+    }
+    if (dbg.have_day) {
+      safeErrorPrintLn(
+          "date: new start date: '" + dbg.day_label + "' is '" +
+          debug_datetime_str(start, dbg.zone_seen, dbg.zone_seconds) + "'");
+    }
+    if (!dbg.have_date && !dbg.have_day) {
+      safeErrorPrintLn("date: using current date as starting value: '" +
+                       debug_date_str(start) + "'");
+    }
+    safeErrorPrintLn(
+        "date: starting date/time: '" +
+        debug_datetime_str(start, dbg.zone_seen, dbg.zone_seconds) + "'");
+
+    SYSTEMTIME adjusted = start;
+    if (dbg.rel_year != 0 || dbg.rel_month != 0 || dbg.rel_day != 0) {
+      if ((dbg.rel_year != 0 || dbg.rel_month != 0) && start.wDay != 15) {
+        safeErrorPrintLn(
+            "date: warning: when adding relative months/years, it is "
+            "recommended to specify the 15th of the months");
+      }
+      if (dbg.rel_day != 0 && start.wHour != 12) {
+        safeErrorPrintLn(
+            "date: warning: when adding relative days, it is recommended "
+            "to specify noon");
+      }
+      adjusted =
+          debug_shift_date(start, dbg.rel_year, dbg.rel_month, dbg.rel_day);
+      char buf[128]{};
+      snprintf(buf, sizeof(buf),
+               "after date adjustment (%+lld years, %+lld months, %+lld "
+               "days),",
+               dbg.rel_year, dbg.rel_month, dbg.rel_day);
+      safeErrorPrintLn(std::string("date: ") + buf);
+      safeErrorPrintLn(
+          "date:     new date/time = '" +
+          debug_datetime_str(adjusted, dbg.zone_seen, dbg.zone_seconds) + "'");
+    }
+
+    // "'(Y-M-D) ...' = N epoch-seconds": convert the adjusted wall clock
+    // through the effective zone.
+    if (auto base_ft = debug_st_to_filetime(adjusted, dbg, use_utc)) {
+      safeErrorPrintLn(
+          "date: '" +
+          debug_datetime_str(adjusted, dbg.zone_seen, dbg.zone_seconds) +
+          "' = " + std::to_string(epoch_seconds(*base_ft)) + " epoch-seconds");
+    }
+
+    if (dbg.rel_hour != 0 || dbg.rel_minute != 0 || dbg.rel_second != 0) {
+      char buf[128]{};
+      snprintf(buf, sizeof(buf),
+               "after time adjustment (%+lld hours, %+lld minutes, %+lld "
+               "seconds, +0 ns),",
+               dbg.rel_hour, dbg.rel_minute, dbg.rel_second);
+      safeErrorPrintLn(std::string("date: ") + buf);
+      safeErrorPrintLn(
+          "date:     new time = " + std::to_string(epoch_seconds(result)) +
+          " epoch-seconds");
+    }
+  }
+
+  // timezone / final lines
+  if (tzstring.empty()) {
+    safeErrorPrintLn("date: timezone: system default");
+  } else if (tzstring == "UTC0") {
+    safeErrorPrintLn("date: timezone: Universal Time");
+  } else {
+    safeErrorPrintLn("date: timezone: TZ=\"" + tzstring +
+                     "\" environment value");
+  }
+  const auto ticks = static_cast<long long>(filetime_to_ticks(result));
+  const long long secs = epoch_seconds(result);
+  char nbuf[32]{};
+  snprintf(nbuf, sizeof(nbuf), "%09lld", (ticks % 10000000LL) * 100);
+  safeErrorPrintLn("date: final: " + std::to_string(secs) + "." + nbuf +
+                   " (epoch-seconds)");
+  if (auto utc_st = filetime_to_system_time(result, true)) {
+    safeErrorPrintLn("date: final: " + debug_datetime_str(*utc_st, false, 0) +
+                     " (UTC)");
+  }
+  std::optional<SYSTEMTIME> local_st;
+  int local_off = 0;
+  if (use_utc) {
+    local_st = filetime_to_system_time(result, true);
+  } else {
+    local_st = filetime_to_local_st(result);
+    local_off = timezone_offset_minutes(result, false);
+  }
+  if (local_st) {
+    safeErrorPrintLn("date: final: " + debug_datetime_str(*local_st, false, 0) +
+                     " (UTC" + debug_zone_str(local_off * 60) + ")");
+  }
+
+  // [GNU] The debug dump ends with the effective output format string.
+  safeErrorPrintLn("date: output format: '" + format + "'");
 }
 
 auto normalize_timespec(std::string spec, bool default_date) -> std::string {
@@ -1240,7 +1978,10 @@ auto iso_format_for(std::string spec) -> std::optional<std::string> {
   if (spec == "hours") return "%Y-%m-%dT%H%:z";
   if (spec == "minutes") return "%Y-%m-%dT%H:%M%:z";
   if (spec == "seconds") return "%Y-%m-%dT%H:%M:%S%:z";
-  if (spec == "ns" || spec == "nanoseconds") return "%Y-%m-%dT%H:%M:%S.%N%:z";
+  // [GNU] -Ins uses the ISO 8601 decimal comma before nanoseconds
+  // ("2026-09-14T08:27:11,355532700+00:00"), unlike --rfc-3339=ns which
+  // keeps a dot (uutils#6387 / WinuxCmd#219).
+  if (spec == "ns" || spec == "nanoseconds") return "%Y-%m-%dT%H:%M:%S,%N%:z";
   return std::nullopt;
 }
 
@@ -1372,12 +2113,13 @@ REGISTER_COMMAND(
     return 1;
   }
 
-  // [GNU] --universal: alias for --utc
+  // [GNU] --universal/--uct: aliases for --utc
   bool use_utc = ctx.get<bool>("-u", false) || ctx.get<bool>("--utc", false) ||
-                 ctx.get<bool>("--universal", false);
-  bool rfc2822 = ctx.get<bool>("-R", false) ||
-                 ctx.get<bool>("--rfc-email", false) ||
-                 ctx.get<bool>("--rfc-2822", false);
+                 ctx.get<bool>("--universal", false) ||
+                 ctx.get<bool>("--uct", false);
+  bool rfc2822 =
+      ctx.get<bool>("-R", false) || ctx.get<bool>("--rfc-email", false) ||
+      ctx.get<bool>("--rfc-2822", false) || ctx.get<bool>("--rfc-822", false);
 
   // [GNU] -R/-I/--rfc-3339 all set the output format; a '+' operand may not
   // override them ("multiple output formats specified").
@@ -1390,6 +2132,14 @@ REGISTER_COMMAND(
       safeErrorPrint("date: invalid argument '");
       safeErrorPrint(iso_arg);
       safeErrorPrint("' for '--iso-8601'\n");
+      // [GNU] list the accepted timespecs plus the help hint.
+      safeErrorPrintLn("Valid arguments are:");
+      safeErrorPrintLn("  - 'hours'");
+      safeErrorPrintLn("  - 'minutes'");
+      safeErrorPrintLn("  - 'date'");
+      safeErrorPrintLn("  - 'seconds'");
+      safeErrorPrintLn("  - 'ns'");
+      safeErrorPrintLn("Try 'date --help' for more information.");
       return 1;
     }
     format = *iso_format;
@@ -1401,6 +2151,11 @@ REGISTER_COMMAND(
       safeErrorPrint("date: invalid argument '");
       safeErrorPrint(rfc3339_arg);
       safeErrorPrint("' for '--rfc-3339'\n");
+      safeErrorPrintLn("Valid arguments are:");
+      safeErrorPrintLn("  - 'date'");
+      safeErrorPrintLn("  - 'seconds'");
+      safeErrorPrintLn("  - 'ns'");
+      safeErrorPrintLn("Try 'date --help' for more information.");
       return 1;
     }
     format = *rfc3339_format;
@@ -1441,14 +2196,30 @@ REGISTER_COMMAND(
     format = has_resolution ? "%s.%N" : "%a %b %e %H:%M:%S %Z %Y";
   }
 
+  const bool debug = ctx.has("--debug");
+
+  // [GNU] On a failed parse, --debug still prints the "parsed ... part"
+  // lines for whatever was recognized before the error.
+  auto emit_partial_debug = [](const DateDebugInfo &dbg) {
+    auto items = dbg.items;
+    std::ranges::sort(
+        items, [](const auto &a, const auto &b) { return a.first < b.first; });
+    for (const auto &[pos, line] : items) {
+      safeErrorPrintLn("date: " + line);
+    }
+  };
+
   if (is_set) {
-    auto parsed = parse_date_argument(set_arg, use_utc);
+    DateDebugInfo dbg;
+    auto parsed = parse_date_argument(set_arg, use_utc, debug ? &dbg : nullptr);
     if (!parsed) {
+      if (debug) emit_partial_debug(dbg);
       safeErrorPrint("date: invalid date '");
       safeErrorPrint(set_arg);
       safeErrorPrintLn("'");
       return 1;
     }
+    if (debug) emit_date_debug(dbg, *parsed, use_utc, format);
 
     // SetSystemTime expects a UTC SYSTEMTIME; the parsed value is already
     // an absolute UTC FILETIME, so no local-time conversion is needed here.
@@ -1481,18 +2252,18 @@ REGISTER_COMMAND(
     }
     selected_time = *reference_time;
   } else if (!date_arg.empty()) {
-    auto parsed = parse_date_argument(date_arg, use_utc);
+    DateDebugInfo dbg;
+    auto parsed =
+        parse_date_argument(date_arg, use_utc, debug ? &dbg : nullptr);
     if (!parsed) {
+      if (debug) emit_partial_debug(dbg);
       safeErrorPrint("date: invalid date '");
       safeErrorPrint(date_arg);
       safeErrorPrint("'\n");
       return 1;
     }
     selected_time = *parsed;
-    if (ctx.has("--debug")) {
-      safeErrorPrint("date: parsed date ");
-      safeErrorPrintLn(date_arg);
-    }
+    if (debug) emit_date_debug(dbg, *parsed, use_utc, format);
   } else if (has_resolution) {
     // [GNU] date --resolution prints the available timestamp resolution;
     // FILETIME ticks are 100 ns wide.
@@ -1544,6 +2315,9 @@ REGISTER_COMMAND(
       }
     }
     // Print the (attempted) new date like GNU does.
+    if (debug) {
+      safeErrorPrintLn("date: output format: '" + format + "'");
+    }
     auto tv = make_time_value(utc_ft, use_utc);
     if (tv) safePrintLn(format_time(*tv, format));
     return exit_code;
@@ -1574,9 +2348,8 @@ REGISTER_COMMAND(
               "date: {}: read error: Is a directory", date_file));
         } else {
           const int open_errno = errno;
-          const char* reason =
-              open_errno != 0 ? std::strerror(open_errno)
-                              : "No such file or directory";
+          const char *reason = open_errno != 0 ? std::strerror(open_errno)
+                                               : "No such file or directory";
           // The common ENOENT case gets a dedicated key so translators can
           // render the whole message; anything else keeps the raw strerror.
           if (std::strcmp(reason, "No such file or directory") == 0) {
@@ -1584,23 +2357,26 @@ REGISTER_COMMAND(
                 "command.date.error.cannot_open",
                 "date: {}: No such file or directory", date_file));
           } else {
-            safeErrorPrintLn(winux::i18n::format(
-                "command.date.error.cannot_open_generic", "date: {}: {}",
-                date_file, reason));
+            safeErrorPrintLn(
+                winux::i18n::format("command.date.error.cannot_open_generic",
+                                    "date: {}: {}", date_file, reason));
           }
         }
         return 1;
       }
     }
-    std::istream& in = from_stdin ? static_cast<std::istream&>(std::cin)
-                                  : static_cast<std::istream&>(file_stream);
+    std::istream &in = from_stdin ? static_cast<std::istream &>(std::cin)
+                                  : static_cast<std::istream &>(file_stream);
     std::string line;
     bool ok = true;
     while (std::getline(in, line)) {
-      auto parsed = parse_date_argument(line, use_utc);
+      DateDebugInfo line_dbg;
+      auto parsed =
+          parse_date_argument(line, use_utc, debug ? &line_dbg : nullptr);
       if (!parsed) {
         // [GNU] batch mode reports each invalid line and keeps going; the
         // exit status is 1 after every line has been processed.
+        if (debug) emit_partial_debug(line_dbg);
         safeErrorPrint("date: invalid date '");
         safeErrorPrint(line);
         safeErrorPrintLn("'");
@@ -1613,12 +2389,21 @@ REGISTER_COMMAND(
         ok = false;
         continue;
       }
+      if (debug) emit_date_debug(line_dbg, *parsed, use_utc, format);
+      if (debug) {
+        safeErrorPrintLn("date: output format: '" + format + "'");
+      }
       safePrint(format_time(*file_tv, format));
       safePrint("\n");
     }
     return ok ? 0 : 1;
   }
 
+  // [GNU] --debug annotates the output format even for non-parsed sources
+  // (-r FILE, "now", --resolution).
+  if (debug) {
+    safeErrorPrintLn("date: output format: '" + format + "'");
+  }
   std::string output = format_time(*tv, format);
   safePrintLn(output);
 

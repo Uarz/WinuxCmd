@@ -149,10 +149,25 @@ auto run(const Config& cfg) -> int {
       continue;
     }
 
-    safeErrorPrint("mkfifo: cannot create fifo '");
-    safeErrorPrint(fifo);
-    safeErrorPrint("': filesystem FIFOs are not supported on Windows\n");
-    exit_code = 1;
+    // A mode without any write bit maps to the DOS readonly attribute.
+    bool readonly = false;
+    if (!cfg.mode.empty() &&
+        cfg.mode.find_first_of("02367") == std::string::npos &&
+        std::ranges::all_of(cfg.mode,
+                            [](char ch) { return ch >= '0' && ch <= '7'; })) {
+      readonly = true;
+    }
+    const DWORD created =
+        native_path::create_winux_fifo_w(utf8_to_wstring(fifo), readonly);
+    if (created != ERROR_SUCCESS) {
+      safeErrorPrint("mkfifo: cannot create fifo '");
+      safeErrorPrint(fifo);
+      safeErrorPrint("': ");
+      safeErrorPrint(win32_posix_error_text(
+          created, {.file_exists = true, .invalid_name_as_missing = true}));
+      safeErrorPrint("\n");
+      exit_code = 1;
+    }
   }
   return exit_code;
 }
@@ -163,10 +178,10 @@ REGISTER_COMMAND(
     mkfifo, "mkfifo", "mkfifo [OPTION]... NAME...",
     "Create named pipes (FIFOs) with the given NAMEs.\n"
     "\n"
-    "WinuxCmd accepts the GNU-compatible command line surface for mkfifo, but\n"
-    "Windows does not provide filesystem FIFOs equivalent to POSIX named\n"
-    "pipes. This command therefore acts as a compatibility placeholder and\n"
-    "reports that filesystem FIFOs are not supported on Windows.",
+    "Windows has no filesystem FIFO node type, so WinuxCmd emulates one with\n"
+    "an on-disk marker file. WinuxCmd commands opening the marker for\n"
+    "reading or writing are bridged to a Windows named pipe with blocking\n"
+    "POSIX open() semantics; other tools see a small marker file.",
     "  mkfifo mypipe\n"
     "  mkfifo -m 600 mypipe\n"
     "  mkfifo --context system_u:object_r:fifo_file_t:s0 mypipe",

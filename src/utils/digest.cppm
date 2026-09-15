@@ -35,11 +35,22 @@ module;
 
 export module utils:digest;
 import std;
+import :console;
+import :file_io;
 import :native_path;
 
 export namespace portable_digest {
 
-enum class HashAlgorithm { Sha224, Sha256, Sha384, Sha512, Blake2b };
+enum class HashAlgorithm {
+  Md5,
+  Sha1,
+  Sha224,
+  Sha256,
+  Sha384,
+  Sha512,
+  Blake2b,
+  Sm3
+};
 
 struct PosixCksumResult {
   uint32_t checksum = 0;
@@ -48,15 +59,39 @@ struct PosixCksumResult {
 
 namespace detail {
 
-auto input_open_error(std::string_view path) -> std::string {
+// [GNU] strerror-style reason for a failed input open(): "Is a directory"
+// for a directory (EISDIR), "Not a directory" when any path component —
+// including a trailing '/' on a regular file — is a non-directory
+// (ENOTDIR), "Permission denied" for an existing file that cannot be
+// opened (EACCES), otherwise "No such file or directory" (ENOENT).
+auto open_failure_reason(std::string_view path) -> std::string {
   std::error_code ec;
-  if (std::filesystem::is_directory(std::filesystem::u8path(path), ec) && !ec) {
-    return "cannot open '" + std::string(path) +
-           "' for reading: Is a directory";
+  const std::filesystem::path fs_path = std::filesystem::u8path(path);
+  if (std::filesystem::is_directory(fs_path, ec) && !ec) {
+    return "Is a directory";
   }
+  ec.clear();
+  if (std::filesystem::exists(fs_path, ec) && !ec) {
+    return "Permission denied";
+  }
+  // Walk the ancestors: the deepest existing component decides between
+  // ENOTDIR (it is not a directory) and ENOENT.
+  for (std::filesystem::path dir = fs_path.parent_path(); !dir.empty();
+       dir = dir.parent_path()) {
+    ec.clear();
+    if (std::filesystem::exists(dir, ec) && !ec) {
+      ec.clear();
+      return std::filesystem::is_directory(dir, ec) && !ec
+                 ? "No such file or directory"
+                 : "Not a directory";
+    }
+    if (dir == dir.parent_path()) break;  // reached a filesystem root
+  }
+  return "No such file or directory";
+}
 
-  return "cannot open '" + std::string(path) +
-         "' for reading: No such file or directory";
+auto input_open_error(std::string_view path) -> std::string {
+  return std::string(path) + ": " + open_failure_reason(path);
 }
 
 auto to_hex(std::span<const uint8_t> bytes) -> std::string {
@@ -74,6 +109,24 @@ WINUXCMD_DIGEST_FORCEINLINE auto load_be32(const uint8_t* p) -> uint32_t {
   return (static_cast<uint32_t>(p[0]) << 24) |
          (static_cast<uint32_t>(p[1]) << 16) |
          (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+}
+
+WINUXCMD_DIGEST_FORCEINLINE auto load_le32(const uint8_t* p) -> uint32_t {
+  return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+         (static_cast<uint32_t>(p[2]) << 16) |
+         (static_cast<uint32_t>(p[3]) << 24);
+}
+
+WINUXCMD_DIGEST_FORCEINLINE auto store_le32(uint8_t* p, uint32_t v) -> void {
+  p[0] = static_cast<uint8_t>(v);
+  p[1] = static_cast<uint8_t>(v >> 8);
+  p[2] = static_cast<uint8_t>(v >> 16);
+  p[3] = static_cast<uint8_t>(v >> 24);
+}
+
+WINUXCMD_DIGEST_FORCEINLINE auto rotl32(uint32_t value, unsigned bits)
+    -> uint32_t {
+  return (value << bits) | (value >> (32 - bits));
 }
 
 WINUXCMD_DIGEST_FORCEINLINE auto load_be64(const uint8_t* p) -> uint64_t {
@@ -566,6 +619,338 @@ class Blake2b {
   size_t buffered_ = 0;
   size_t out_bytes_ = 64;
 };
+
+class Md5 {
+ public:
+  Md5() = default;
+
+  auto update(std::span<const uint8_t> input) -> void {
+    total_bytes_ += input.size();
+    if (buffered_ != 0) {
+      size_t take = std::min(input.size(), block_.size() - buffered_);
+      std::copy_n(input.data(), take, block_.data() + buffered_);
+      buffered_ += take;
+      input = input.subspan(take);
+      if (buffered_ == block_.size()) {
+        compress(block_.data());
+        buffered_ = 0;
+      }
+    }
+
+    while (input.size() >= block_.size()) {
+      compress(input.data());
+      input = input.subspan(block_.size());
+    }
+
+    if (!input.empty()) {
+      std::copy_n(input.data(), input.size(), block_.data());
+      buffered_ = input.size();
+    }
+  }
+
+  auto final() -> std::vector<uint8_t> {
+    uint64_t bit_len = total_bytes_ * 8;
+    block_[buffered_++] = 0x80;
+    if (buffered_ > 56) {
+      std::fill(block_.begin() + buffered_, block_.end(), 0);
+      compress(block_.data());
+      buffered_ = 0;
+    }
+    std::fill(block_.begin() + buffered_, block_.begin() + 56, 0);
+    store_le64(block_.data() + 56, bit_len);
+    compress(block_.data());
+
+    std::array<uint8_t, 16> out{};
+    for (size_t i = 0; i < state_.size(); ++i) {
+      store_le32(out.data() + i * 4, state_[i]);
+    }
+    return {out.begin(), out.end()};
+  }
+
+ private:
+  static auto round_constants() -> const std::array<uint32_t, 64>& {
+    static const auto table = [] {
+      std::array<uint32_t, 64> generated{};
+      for (size_t i = 0; i < generated.size(); ++i) {
+        generated[i] = static_cast<uint32_t>(
+            std::fabs(std::sin(static_cast<double>(i) + 1.0)) * 4294967296.0);
+      }
+      return generated;
+    }();
+    return table;
+  }
+
+  auto compress(const uint8_t* block) -> void {
+    static constexpr std::array<uint8_t, 64> shifts{
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9,  14, 20, 5, 9,  14, 20, 5, 9,  14, 20, 5, 9,  14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
+
+    std::array<uint32_t, 16> m{};
+    for (size_t i = 0; i < m.size(); ++i) {
+      m[i] = load_le32(block + i * 4);
+    }
+
+    uint32_t a = state_[0];
+    uint32_t b = state_[1];
+    uint32_t c = state_[2];
+    uint32_t d = state_[3];
+
+    const auto& k = round_constants();
+    for (size_t i = 0; i < 64; ++i) {
+      uint32_t f;
+      size_t g;
+      if (i < 16) {
+        f = (b & c) | (~b & d);
+        g = i;
+      } else if (i < 32) {
+        f = (d & b) | (~d & c);
+        g = (5 * i + 1) % 16;
+      } else if (i < 48) {
+        f = b ^ c ^ d;
+        g = (3 * i + 5) % 16;
+      } else {
+        f = c ^ (b | ~d);
+        g = (7 * i) % 16;
+      }
+      uint32_t tmp = d;
+      d = c;
+      c = b;
+      b = b + rotl32(a + f + k[i] + m[g], shifts[i]);
+      a = tmp;
+    }
+
+    state_[0] += a;
+    state_[1] += b;
+    state_[2] += c;
+    state_[3] += d;
+  }
+
+  std::array<uint32_t, 4> state_{0x67452301U, 0xefcdab89U, 0x98badcfeU,
+                                 0x10325476U};
+  std::array<uint8_t, 64> block_{};
+  size_t buffered_ = 0;
+  uint64_t total_bytes_ = 0;
+};
+
+class Sha1 {
+ public:
+  Sha1() = default;
+
+  auto update(std::span<const uint8_t> input) -> void {
+    total_bytes_ += input.size();
+    if (buffered_ != 0) {
+      size_t take = std::min(input.size(), block_.size() - buffered_);
+      std::copy_n(input.data(), take, block_.data() + buffered_);
+      buffered_ += take;
+      input = input.subspan(take);
+      if (buffered_ == block_.size()) {
+        compress(block_.data());
+        buffered_ = 0;
+      }
+    }
+
+    while (input.size() >= block_.size()) {
+      compress(input.data());
+      input = input.subspan(block_.size());
+    }
+
+    if (!input.empty()) {
+      std::copy_n(input.data(), input.size(), block_.data());
+      buffered_ = input.size();
+    }
+  }
+
+  auto final() -> std::vector<uint8_t> {
+    uint64_t bit_len = total_bytes_ * 8;
+    block_[buffered_++] = 0x80;
+    if (buffered_ > 56) {
+      std::fill(block_.begin() + buffered_, block_.end(), 0);
+      compress(block_.data());
+      buffered_ = 0;
+    }
+    std::fill(block_.begin() + buffered_, block_.begin() + 56, 0);
+    store_be64(block_.data() + 56, bit_len);
+    compress(block_.data());
+
+    std::array<uint8_t, 20> out{};
+    for (size_t i = 0; i < state_.size(); ++i) {
+      store_be32(out.data() + i * 4, state_[i]);
+    }
+    return {out.begin(), out.end()};
+  }
+
+ private:
+  auto compress(const uint8_t* block) -> void {
+    std::array<uint32_t, 80> w{};
+    for (size_t i = 0; i < 16; ++i) {
+      w[i] = load_be32(block + i * 4);
+    }
+    for (size_t i = 16; i < 80; ++i) {
+      w[i] = rotl32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    }
+
+    uint32_t a = state_[0];
+    uint32_t b = state_[1];
+    uint32_t c = state_[2];
+    uint32_t d = state_[3];
+    uint32_t e = state_[4];
+
+    for (size_t i = 0; i < 80; ++i) {
+      uint32_t f;
+      uint32_t k;
+      if (i < 20) {
+        f = (b & c) | (~b & d);
+        k = 0x5a827999U;
+      } else if (i < 40) {
+        f = b ^ c ^ d;
+        k = 0x6ed9eba1U;
+      } else if (i < 60) {
+        f = (b & c) | (b & d) | (c & d);
+        k = 0x8f1bbcdcU;
+      } else {
+        f = b ^ c ^ d;
+        k = 0xca62c1d6U;
+      }
+      uint32_t tmp = rotl32(a, 5) + f + e + k + w[i];
+      e = d;
+      d = c;
+      c = rotl32(b, 30);
+      b = a;
+      a = tmp;
+    }
+
+    state_[0] += a;
+    state_[1] += b;
+    state_[2] += c;
+    state_[3] += d;
+    state_[4] += e;
+  }
+
+  std::array<uint32_t, 5> state_{0x67452301U, 0xefcdab89U, 0x98badcfeU,
+                                 0x10325476U, 0xc3d2e1f0U};
+  std::array<uint8_t, 64> block_{};
+  size_t buffered_ = 0;
+  uint64_t total_bytes_ = 0;
+};
+
+// SM3 (GB/T 32905-2016), as used by GNU cksum -a sm3.
+class Sm3 {
+ public:
+  Sm3() = default;
+
+  auto update(std::span<const uint8_t> input) -> void {
+    total_bytes_ += input.size();
+    if (buffered_ != 0) {
+      size_t take = std::min(input.size(), block_.size() - buffered_);
+      std::copy_n(input.data(), take, block_.data() + buffered_);
+      buffered_ += take;
+      input = input.subspan(take);
+      if (buffered_ == block_.size()) {
+        compress(block_.data());
+        buffered_ = 0;
+      }
+    }
+
+    while (input.size() >= block_.size()) {
+      compress(input.data());
+      input = input.subspan(block_.size());
+    }
+
+    if (!input.empty()) {
+      std::copy_n(input.data(), input.size(), block_.data());
+      buffered_ = input.size();
+    }
+  }
+
+  auto final() -> std::vector<uint8_t> {
+    uint64_t bit_len = total_bytes_ * 8;
+    block_[buffered_++] = 0x80;
+    if (buffered_ > 56) {
+      std::fill(block_.begin() + buffered_, block_.end(), 0);
+      compress(block_.data());
+      buffered_ = 0;
+    }
+    std::fill(block_.begin() + buffered_, block_.begin() + 56, 0);
+    store_be64(block_.data() + 56, bit_len);
+    compress(block_.data());
+
+    std::array<uint8_t, 32> out{};
+    for (size_t i = 0; i < state_.size(); ++i) {
+      store_be32(out.data() + i * 4, state_[i]);
+    }
+    return {out.begin(), out.end()};
+  }
+
+ private:
+  static auto p0(uint32_t x) -> uint32_t {
+    return x ^ rotl32(x, 9) ^ rotl32(x, 17);
+  }
+  static auto p1(uint32_t x) -> uint32_t {
+    return x ^ rotl32(x, 15) ^ rotl32(x, 23);
+  }
+
+  auto compress(const uint8_t* block) -> void {
+    std::array<uint32_t, 68> w{};
+    std::array<uint32_t, 64> w1{};
+    for (size_t i = 0; i < 16; ++i) {
+      w[i] = load_be32(block + i * 4);
+    }
+    for (size_t j = 16; j < 68; ++j) {
+      w[j] = p1(w[j - 16] ^ w[j - 9] ^ rotl32(w[j - 3], 15)) ^
+             rotl32(w[j - 13], 7) ^ w[j - 6];
+    }
+    for (size_t j = 0; j < 64; ++j) {
+      w1[j] = w[j] ^ w[j + 4];
+    }
+
+    uint32_t a = state_[0];
+    uint32_t b = state_[1];
+    uint32_t c = state_[2];
+    uint32_t d = state_[3];
+    uint32_t e = state_[4];
+    uint32_t f = state_[5];
+    uint32_t g = state_[6];
+    uint32_t h = state_[7];
+
+    for (size_t j = 0; j < 64; ++j) {
+      const uint32_t tj = j < 16 ? 0x79cc4519U : 0x7a879d8aU;
+      const uint32_t ss1 = rotl32(
+          rotl32(a, 12) + e + rotl32(tj, static_cast<unsigned>(j % 32)), 7);
+      const uint32_t ss2 = ss1 ^ rotl32(a, 12);
+      const uint32_t ff = j < 16 ? (a ^ b ^ c) : ((a & b) | (a & c) | (b & c));
+      const uint32_t gg = j < 16 ? (e ^ f ^ g) : ((e & f) | (~e & g));
+      const uint32_t tt1 = ff + d + ss2 + w1[j];
+      const uint32_t tt2 = gg + h + ss1 + w[j];
+      d = c;
+      c = rotl32(b, 9);
+      b = a;
+      a = tt1;
+      h = g;
+      g = rotl32(f, 19);
+      f = e;
+      e = p0(tt2);
+    }
+
+    state_[0] ^= a;
+    state_[1] ^= b;
+    state_[2] ^= c;
+    state_[3] ^= d;
+    state_[4] ^= e;
+    state_[5] ^= f;
+    state_[6] ^= g;
+    state_[7] ^= h;
+  }
+
+  std::array<uint32_t, 8> state_{0x7380166fU, 0x4914b2b9U, 0x172442d7U,
+                                 0xda8a0600U, 0xa96f30bcU, 0x163138aaU,
+                                 0xe38dee4dU, 0xb0fb0e4eU};
+  std::array<uint8_t, 64> block_{};
+  size_t buffered_ = 0;
+  uint64_t total_bytes_ = 0;
+};
+
 template <typename Hasher>
 auto feed_stream(std::istream& in, Hasher& hasher) -> bool {
   std::array<char, 65536> buffer{};
@@ -694,15 +1079,34 @@ auto hash_file_hex(HashAlgorithm algorithm, const std::string& filename,
   std::istream* input = &std::cin;
   std::ifstream file;
   if (!filename.empty() && filename != "-") {
-    file.open(native_path::normalize_api_operand(filename),
-              text_mode ? std::ios::in : std::ios::binary);
+    // Route through open_binary_file so /dev/stdin-family operands bind the
+    // real fd 0 (closed stdin reports an error instead of blocking on
+    // CONIN$, and pipes/hashable data flow through, #1091).
+    file = file_io::open_binary_file(filename);
     if (!file) {
       return std::unexpected(detail::input_open_error(filename));
     }
     input = &file;
+  } else if (file_io::stdin_is_bad()) {
+    // [GNU] `md5sum <&-` reports "-: Bad file descriptor" rather than
+    // hashing an empty stream (#1091).
+    return std::unexpected(std::string(filename.empty() ? "-" : filename) +
+                           ": Bad file descriptor");
   }
 
   switch (algorithm) {
+    case HashAlgorithm::Md5: {
+      auto hasher = detail::Md5();
+      return detail::hash_stream_to_hex(*input, hasher);
+    }
+    case HashAlgorithm::Sha1: {
+      auto hasher = detail::Sha1();
+      return detail::hash_stream_to_hex(*input, hasher);
+    }
+    case HashAlgorithm::Sm3: {
+      auto hasher = detail::Sm3();
+      return detail::hash_stream_to_hex(*input, hasher);
+    }
     case HashAlgorithm::Sha224: {
       auto hasher = detail::make_sha224();
       return detail::hash_stream_to_hex(*input, hasher);
@@ -797,6 +1201,382 @@ auto posix_cksum_stream(std::istream& in)
   }
   if (in.bad()) return std::unexpected("error reading input");
   return accumulator.final();
+}
+
+// [GNU] strerror-style reason for a failed input open(), for commands
+// that print "cmd: FILE: <reason>" diagnostics.  See
+// detail::open_failure_reason for the rules.
+auto open_error_reason(std::string_view path) -> std::string {
+  return detail::open_failure_reason(path);
+}
+
+// ===== GNU-compatible "--check" verification (src/cksum.c digest_check) =====
+//
+// Shared by the *sum commands.  Mirrors GNU semantics:
+//   * '#' comments and blank lines are skipped; trailing '\r' is stripped.
+//   * split_3(): leading blanks skipped, optional '\' escape prefix, BSD
+//     "TAG (file) = hex" and OpenSSL "TAG(file)= hex" forms, otherwise the
+//     untagged "hex [' '|'*']file" form.  The untagged form is remembered per
+//     invocation (bsd_reversed) and mixing it with the single-blank form in
+//     one direction is rejected.
+//   * Per-line results go to stdout ("name: OK"/"FAILED"/"FAILED open or
+//     read"), diagnostics to stderr, and a properly-formatted file produces
+//     up to three WARNING summary lines (improperly formatted / could not be
+//     read / did NOT match).
+struct SumCheckFlags {
+  bool status_only = false;
+  bool quiet = false;
+  bool warn = false;
+  bool strict = false;
+  bool ignore_missing = false;
+};
+
+struct SumCheckLine {
+  std::string expected_hash;
+  std::string filename;
+  size_t digest_bytes = 0;  // detected digest length (bytes) for this line
+};
+
+namespace detail {
+
+auto sum_is_blank(char c) -> bool { return c == ' ' || c == '\t'; }
+
+// GNU quotef(): print a file name verbatim unless it needs quoting.
+auto sum_quotef(std::string_view name) -> std::string {
+  if (name.empty()) return "''";
+  const bool simple = std::ranges::all_of(name, [](unsigned char c) {
+    return c > 0x20 && c != '\'' && c != '\\' && c != '"' && c != '|' &&
+           c != '&' && c != ';' && c != '<' && c != '>' && c != '(' &&
+           c != ')' && c != '$' && c != '`' && c != '*' && c != '?' &&
+           c != '[' && c != '#' && c != '~' && c != '=' && c != '!' &&
+           c != '^' && c != '{' && c != '}';
+  });
+  if (simple) return std::string(name);
+  std::string out = "'";
+  for (char c : name) {
+    if (c == '\'')
+      out += "'\\''";
+    else
+      out.push_back(c);
+  }
+  out.push_back('\'');
+  return out;
+}
+
+// GNU filename_unescape(): translate \\, \n and \r escapes introduced when
+// the check line started with '\'.  Returns nullopt on a bad escape.
+auto sum_unescape_filename(std::string_view s) -> std::optional<std::string> {
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] != '\\') {
+      out.push_back(s[i]);
+      continue;
+    }
+    if (++i >= s.size()) return std::nullopt;
+    switch (s[i]) {
+      case '\\':
+        out.push_back('\\');
+        break;
+      case 'n':
+        out.push_back('\n');
+        break;
+      case 'r':
+        out.push_back('\r');
+        break;
+      default:
+        return std::nullopt;
+    }
+  }
+  return out;
+}
+
+auto sum_open_reason(std::string_view path) -> std::string {
+  return open_failure_reason(path);
+}
+
+auto sum_all_hex(std::string_view s) -> bool {
+  return !s.empty() && std::ranges::all_of(s, [](unsigned char c) {
+    return std::isxdigit(c) != 0;
+  });
+}
+
+// GNU bsd_split_3(): S is the part after "TAG ("; find the last ')', take
+// everything before it as the file name, then require blanks, '=', blanks
+// and a valid digest.
+auto sum_bsd_split(std::string_view s, size_t digest_hex_bytes,
+                   bool escaped_filename) -> std::optional<SumCheckLine> {
+  if (s.empty()) return std::nullopt;
+
+  size_t i = s.size() - 1;
+  while (i > 0 && s[i] != ')') --i;
+  if (s[i] != ')') return std::nullopt;
+
+  std::string_view filename = s.substr(0, i);
+  ++i;
+  while (i < s.size() && sum_is_blank(s[i])) ++i;
+  if (i >= s.size() || s[i] != '=') return std::nullopt;
+  ++i;
+  while (i < s.size() && sum_is_blank(s[i])) ++i;
+
+  std::string_view digest = s.substr(i);
+  const size_t hex_len =
+      digest_hex_bytes != 0 ? digest_hex_bytes : digest.size();
+  if (digest.size() != hex_len || !sum_all_hex(digest)) return std::nullopt;
+  if (digest_hex_bytes == 0 &&
+      (digest.size() % 2 != 0 || digest.size() > 128)) {
+    return std::nullopt;
+  }
+
+  if (escaped_filename) {
+    auto unescaped = sum_unescape_filename(filename);
+    if (!unescaped) return std::nullopt;
+    return SumCheckLine{std::string(digest), *unescaped, digest.size() / 2};
+  }
+  return SumCheckLine{std::string(digest), std::string(filename),
+                      digest.size() / 2};
+}
+
+}  // namespace detail
+
+// GNU split_3() for a fixed-length hex digest command.  Pass
+// digest_hex_bytes == 0 to auto-detect any even hex length <= 128 (the b2sum
+// behaviour).  bsd_reversed is GNU's format-consistency latch (-1 initial,
+// then 0 or 1) shared across all check files of one invocation.
+inline auto sum_parse_check_line(std::string_view line,
+                                 std::string_view algo_tag,
+                                 size_t digest_hex_bytes, int& bsd_reversed)
+    -> std::optional<SumCheckLine> {
+  size_t i = 0;
+  while (i < line.size() && detail::sum_is_blank(line[i])) ++i;
+
+  bool escaped_filename = false;
+  if (i < line.size() && line[i] == '\\') {
+    ++i;
+    escaped_filename = true;
+  }
+
+  // BSD/OpenSSL tagged form: "TAG (file) = hex" or "TAG(file)= hex".
+  const size_t parse_offset = i;
+  if (line.substr(i).starts_with(algo_tag)) {
+    size_t j = i + algo_tag.size();
+    size_t tag_hex_bytes = digest_hex_bytes;
+    // "TAG-<bits>" length suffix (GNU supports it for blake2/sha2 tags).
+    if (digest_hex_bytes == 0 && j < line.size() && line[j] == '-') {
+      ++j;
+      const size_t num_start = j;
+      while (j < line.size() && std::isdigit(line[j])) ++j;
+      if (j == num_start) return std::nullopt;
+      long bits = 0;
+      std::from_chars(line.data() + num_start, line.data() + j, bits);
+      if (bits <= 0 || bits % 8 != 0 || bits > 512) return std::nullopt;
+      tag_hex_bytes = static_cast<size_t>(bits / 4);
+    }
+    if (j < line.size() && line[j] == ' ') ++j;
+    if (j < line.size() && line[j] == '(') {
+      return detail::sum_bsd_split(line.substr(j + 1), tag_hex_bytes,
+                                   escaped_filename);
+    }
+    i = parse_offset;
+  }
+
+  // Untagged form needs at least "<hex> <file>".
+  const size_t min_len = (digest_hex_bytes != 0 ? digest_hex_bytes : 2) + 2;
+  if (line.size() - i < min_len) return std::nullopt;
+
+  const size_t digest_start = i;
+  while (i < line.size() && !detail::sum_is_blank(line[i])) ++i;
+  if (i == line.size()) return std::nullopt;  // digest must be followed by ws
+
+  const std::string_view digest = line.substr(digest_start, i - digest_start);
+  if (digest_hex_bytes != 0) {
+    if (digest.size() != digest_hex_bytes || !detail::sum_all_hex(digest)) {
+      return std::nullopt;
+    }
+  } else if (digest.size() < 2 || digest.size() % 2 != 0 ||
+             digest.size() > 128 || !detail::sum_all_hex(digest)) {
+    return std::nullopt;
+  }
+  ++i;  // consume the single separator blank
+
+  std::string_view filename;
+  if (line.size() - i <= 1 ||
+      (i < line.size() && line[i] != ' ' && line[i] != '*')) {
+    // BSD-reversed form: separator was the only blank.
+    if (bsd_reversed == 0) return std::nullopt;
+    bsd_reversed = 1;
+    filename = line.substr(i);
+  } else if (bsd_reversed != 1) {
+    bsd_reversed = 0;
+    ++i;  // consume the ' ' or '*' mode marker
+    filename = line.substr(i);
+  } else {
+    filename = line.substr(i);
+  }
+
+  if (escaped_filename) {
+    auto unescaped = detail::sum_unescape_filename(filename);
+    if (!unescaped) return std::nullopt;
+    return SumCheckLine{std::string(digest), *unescaped, digest.size() / 2};
+  }
+  return SumCheckLine{std::string(digest), std::string(filename),
+                      digest.size() / 2};
+}
+
+// GNU digest_check(): verify every properly formatted line of one check
+// file.  hash_fn(filename, digest_bytes) must return the hex digest or an
+// error when the file cannot be opened/read.
+template <typename HashFn>
+auto sum_digest_check(const std::string& program, const std::string& algo_tag,
+                      size_t digest_hex_bytes, const SumCheckFlags& flags,
+                      const std::string& checkfile_name, int& bsd_reversed,
+                      HashFn&& hash_fn) -> bool {
+  intmax_t n_misformatted_lines = 0;
+  intmax_t n_mismatched_checksums = 0;
+  intmax_t n_open_or_read_failures = 0;
+  bool properly_formatted_lines = false;
+  bool matched_checksums = false;
+
+  const bool is_stdin = checkfile_name == "-";
+  std::string display_name = checkfile_name;
+  std::istream* input = &std::cin;
+  std::ifstream checkfile;
+  if (is_stdin) {
+    display_name = "standard input";
+  } else {
+    checkfile.open(native_path::normalize_api_operand(checkfile_name));
+    if (!checkfile) {
+      std::error_code ec;
+      // [GNU] fopen() succeeds on a directory and the first getline() then
+      // fails: GNU reports "<file>: read error", not "Is a directory".
+      if (std::filesystem::is_directory(std::filesystem::u8path(checkfile_name),
+                                        ec) &&
+          !ec) {
+        safeErrorPrintLn(program + ": " + detail::sum_quotef(checkfile_name) +
+                         ": read error");
+      } else {
+        safeErrorPrintLn(program + ": " + detail::sum_quotef(checkfile_name) +
+                         ": " + detail::sum_open_reason(checkfile_name));
+      }
+      return false;
+    }
+    input = &checkfile;
+  }
+
+  std::string line;
+  intmax_t line_number = 0;
+  while (std::getline(*input, line)) {
+    ++line_number;
+    if (!line.empty() && line.front() == '#') continue;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty()) continue;
+
+    auto parsed =
+        sum_parse_check_line(line, algo_tag, digest_hex_bytes, bsd_reversed);
+    if (!parsed || (is_stdin && parsed->filename == "-")) {
+      ++n_misformatted_lines;
+      if (flags.warn) {
+        safeErrorPrintLn(program + ": " + detail::sum_quotef(display_name) +
+                         ": " + std::to_string(line_number) +
+                         ": improperly formatted " + algo_tag +
+                         " checksum line");
+      }
+      continue;
+    }
+
+    properly_formatted_lines = true;
+
+    bool missing = false;
+    if (flags.ignore_missing && parsed->filename != "-") {
+      std::error_code ec;
+      missing = !std::filesystem::exists(
+          std::filesystem::u8path(parsed->filename), ec);
+    }
+
+    if (!missing) {
+      auto hash_result = hash_fn(parsed->filename, parsed->digest_bytes);
+      if (!hash_result) {
+        ++n_open_or_read_failures;
+        safeErrorPrintLn(program + ": " + detail::sum_quotef(parsed->filename) +
+                         ": " + detail::sum_open_reason(parsed->filename));
+        if (!flags.status_only) {
+          safePrintLn(detail::sum_quotef(parsed->filename) +
+                      ": FAILED open or read");
+        }
+        continue;
+      }
+
+      const bool match =
+          hash_result->size() == parsed->expected_hash.size() &&
+          std::equal(hash_result->begin(), hash_result->end(),
+                     parsed->expected_hash.begin(), [](char a, char b) {
+                       return std::tolower(static_cast<unsigned char>(a)) ==
+                              std::tolower(static_cast<unsigned char>(b));
+                     });
+      if (match) {
+        matched_checksums = true;
+      } else {
+        ++n_mismatched_checksums;
+      }
+
+      if (!flags.status_only) {
+        if (!match || !flags.quiet) {
+          safePrintLn(detail::sum_quotef(parsed->filename) +
+                      (match ? ": OK" : ": FAILED"));
+        }
+      }
+    }
+  }
+
+  if (!properly_formatted_lines) {
+    // [GNU] this diagnostic does not include the algorithm name.
+    safeErrorPrintLn(program + ": " + detail::sum_quotef(display_name) +
+                     ": no properly formatted checksum lines found");
+  } else if (!flags.status_only) {
+    if (n_misformatted_lines != 0) {
+      safeErrorPrintLn(
+          program + ": WARNING: " + std::to_string(n_misformatted_lines) +
+          (n_misformatted_lines == 1 ? " line is improperly formatted"
+                                     : " lines are improperly formatted"));
+    }
+    if (n_open_or_read_failures != 0) {
+      safeErrorPrintLn(
+          program + ": WARNING: " + std::to_string(n_open_or_read_failures) +
+          (n_open_or_read_failures == 1 ? " listed file could not be read"
+                                        : " listed files could not be read"));
+    }
+    if (n_mismatched_checksums != 0) {
+      safeErrorPrintLn(
+          program + ": WARNING: " + std::to_string(n_mismatched_checksums) +
+          (n_mismatched_checksums == 1 ? " computed checksum did NOT match"
+                                       : " computed checksums did NOT match"));
+    }
+    if (flags.ignore_missing && !matched_checksums) {
+      safeErrorPrintLn(program + ": " + detail::sum_quotef(display_name) +
+                       ": no file was verified");
+    }
+  }
+
+  return properly_formatted_lines && matched_checksums &&
+         n_mismatched_checksums == 0 && n_open_or_read_failures == 0 &&
+         (!flags.strict || n_misformatted_lines == 0);
+}
+
+// Verify all check files (GNU loops over every operand; "-" or no operand
+// means standard input).  Returns the process exit code.
+template <typename HashFn>
+auto sum_check_main(const std::string& program, const std::string& algo_tag,
+                    size_t digest_hex_bytes, const SumCheckFlags& flags,
+                    std::span<const std::string> checkfiles, HashFn&& hash_fn)
+    -> int {
+  int bsd_reversed = -1;
+  bool ok = true;
+  for (const auto& checkfile : checkfiles) {
+    ok = sum_digest_check(program, algo_tag, digest_hex_bytes, flags, checkfile,
+                          bsd_reversed, hash_fn) &&
+         ok;
+  }
+  return ok ? 0 : 1;
 }
 
 }  // namespace portable_digest

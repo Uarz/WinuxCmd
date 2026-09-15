@@ -191,9 +191,11 @@ TEST(ln, ln_missing_source_reports_gnu_style_error) {
 
   EXPECT_EQ(r.exit_code, 1);
   EXPECT_TRUE(r.stdout_text.empty());
+  // GNU 9.4 (ln.c do_link): stat of a missing hardlink SOURCE reports
+  // "failed to access 'src'", not a link-creation error.
   EXPECT_EQ_TEXT(
       r.stderr_text,
-      "ln: failed to create hard link 'link.txt': No such file or directory\n");
+      "ln: failed to access 'missing.txt': No such file or directory\n");
   EXPECT_FALSE(std::filesystem::exists(tmp.path / "link.txt"));
 }
 
@@ -300,7 +302,7 @@ TEST(ln, ln_multiple_sources_require_directory_target) {
 
   EXPECT_EQ(r.exit_code, 1);
   EXPECT_TRUE(r.stdout_text.empty());
-  EXPECT_EQ_TEXT(r.stderr_text,
-                 "ln: target 'not-dir.txt' is not a directory\n");
+  // GNU 9.4 ln.c: errno-style "target 'x': Not a directory".
+  EXPECT_EQ_TEXT(r.stderr_text, "ln: target 'not-dir.txt': Not a directory\n");
   EXPECT_FALSE(std::filesystem::exists(tmp.path / "not-dir.txt~"));
 }

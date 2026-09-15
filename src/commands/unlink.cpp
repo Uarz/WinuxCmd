@@ -135,7 +135,7 @@ REGISTER_COMMAND(unlink,
 
   std::wstring wfilename = utf8_to_wstring(expanded[0]);
   auto operand = native_path::make_api_path_operand_w(wfilename);
-  DWORD attrs = GetFileAttributesW(operand.extended.c_str());
+  DWORD attrs = native_path::operand_target_attributes_w(operand);
   if (operand.had_trailing_separator && attrs != INVALID_FILE_ATTRIBUTES &&
       (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
     safeErrorPrintLn("unlink: cannot unlink '" + expanded[0] +

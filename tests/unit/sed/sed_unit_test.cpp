@@ -1275,3 +1275,48 @@ TEST(sed, posix_rejects_gnu_substitution_modifier) {
   EXPECT_CONTAINS(r.stderr_text,
                   "POSIX sed rejects GNU substitution modifiers");
 }
+
+TEST(sed, brace_group_allows_semicolon_after_close) {
+  // [GNU] A ';' may follow '}' and start another command on the same line:
+  // sed '1{p};2{d}' (WinuxCmd#992).
+  TempDir tmp;
+  tmp.write("a.txt", "a\nb\nc\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sed.exe", {L"1{p};2{d}", L"a.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "a\na\nc\n");
+}
+
+TEST(sed, brace_group_spans_expression_options) {
+  // [GNU] All -e/-f sources are concatenated with newlines into one script
+  // before compiling, so a group may open in one -e and close in another
+  // (WinuxCmd#992).
+  TempDir tmp;
+  tmp.write("a.txt", "a\nb\nc\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sed.exe", {L"-n", L"-e", L"1{", L"-e", L"p", L"-e", L"}", L"a.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "a\n");
+}
+
+TEST(sed, empty_expression_script_treats_positional_as_input) {
+  // [GNU] sed -e '' FILE reads FILE as input, not as the script.
+  TempDir tmp;
+  tmp.write("a.txt", "x\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sed.exe", {L"-e", L"", L"a.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "x\n");
+}

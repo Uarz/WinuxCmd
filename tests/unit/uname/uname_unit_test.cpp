@@ -60,3 +60,25 @@ TEST(uname, uname_machine) {
               r.stdout_text.find("i386") != std::string::npos ||
               r.stdout_text.find("aarch64") != std::string::npos);
 }
+
+// [GNU] --sysname and --release are obsolescent hidden aliases for -s
+// and -r accepted for back-compat (issue #1074).
+TEST(uname, uname_obsolescent_sysname_release_aliases) {
+  Pipeline ps;
+  ps.add(L"uname.exe", {L"--sysname"});
+  Pipeline pc;
+  pc.add(L"uname.exe", {L"-s"});
+  auto rs = ps.run();
+  auto rc = pc.run();
+  EXPECT_EQ(rs.exit_code, 0);
+  EXPECT_EQ_TEXT(rs.stdout_text, rc.stdout_text);
+
+  Pipeline pr;
+  pr.add(L"uname.exe", {L"--release"});
+  Pipeline prc;
+  prc.add(L"uname.exe", {L"-r"});
+  auto rr = pr.run();
+  auto rrc = prc.run();
+  EXPECT_EQ(rr.exit_code, 0);
+  EXPECT_EQ_TEXT(rr.stdout_text, rrc.stdout_text);
+}

@@ -60,7 +60,9 @@ auto constexpr TR_OPTIONS = std::array{
            BOOL_TYPE),
     // [GNU] -t, --truncate-set1
     OPTION("-t", "--truncate-set1", "first truncate SET1 to length of SET2",
-           BOOL_TYPE)};
+           BOOL_TYPE),
+    // [GNU] -A: undocumented historical no-op, accepted and ignored
+    OPTION("-A", "", "", BOOL_TYPE)};
 
 namespace tr_pipeline {
 namespace cp = core::pipeline;
@@ -70,6 +72,12 @@ auto make_dynamic_error(std::string message) -> cp::Error {
   storage = std::move(message);
   return storage;
 }
+
+// [GNU] tr.c unquote diagnoses a lone backslash at the end of an operand:
+//   tr: warning: an unescaped backslash at end of string is not portable
+// Set by parse_atomic_token when it consumes a trailing unescaped
+// backslash; reset per operand in parse_set and reported by build_config.
+thread_local bool g_saw_trailing_backslash = false;
 
 // Parse escape sequences
 auto parse_escape_sequence(std::string_view& str) -> char {
@@ -160,7 +168,12 @@ auto parse_atomic_token(std::string_view& str) -> cp::Result<std::string> {
 
   if (str[0] == '\\') {
     str = str.substr(1);
-    if (str.empty()) return std::string("\\");
+    if (str.empty()) {
+      // [GNU] A backslash with nothing left to escape is taken literally
+      // but is diagnosed as non-portable.
+      g_saw_trailing_backslash = true;
+      return std::string("\\");
+    }
     return std::string(1, parse_escape_sequence(str));
   }
 
@@ -210,8 +223,9 @@ auto parse_repeat_spec(std::string_view digits) -> cp::Result<RepeatSpec> {
     return spec;
   }
   if (digits[0] < '0' || digits[0] > '9') {
-    return std::unexpected(make_dynamic_error(
-        "invalid repeat count '" + std::string(digits) + "' in [c*n] construct"));
+    return std::unexpected(make_dynamic_error("invalid repeat count '" +
+                                              std::string(digits) +
+                                              "' in [c*n] construct"));
   }
 
   // GNU parses the count in octal when the first digit is '0' (xstrtoumax).
@@ -220,9 +234,9 @@ auto parse_repeat_spec(std::string_view digits) -> cp::Result<RepeatSpec> {
   bool overflow = false;
   for (char ch : digits) {
     if (ch < '0' || ch >= static_cast<char>('0' + base)) {
-      return std::unexpected(make_dynamic_error(
-          "invalid repeat count '" + std::string(digits) +
-          "' in [c*n] construct"));
+      return std::unexpected(make_dynamic_error("invalid repeat count '" +
+                                                std::string(digits) +
+                                                "' in [c*n] construct"));
     }
     size_t digit = static_cast<size_t>(ch - '0');
     if (count > (std::numeric_limits<size_t>::max() - digit) / base) {
@@ -232,8 +246,9 @@ auto parse_repeat_spec(std::string_view digits) -> cp::Result<RepeatSpec> {
     count = count * base + digit;
   }
   if (overflow) {
-    return std::unexpected(make_dynamic_error(
-        "invalid repeat count '" + std::string(digits) + "' in [c*n] construct"));
+    return std::unexpected(make_dynamic_error("invalid repeat count '" +
+                                              std::string(digits) +
+                                              "' in [c*n] construct"));
   }
   if (count == 0) {
     spec.indefinite = true;  // [c*0] behaves like [c*]
@@ -277,9 +292,9 @@ auto parse_set_atom(std::string_view& str, RepeatSpec* repeat_out)
             return *atom;
           }
           // No repeat context (e.g. a range endpoint): expand here.
-          size_t n = spec->indefinite ? 0
-                                      : std::min(spec->count,
-                                                 kMaxMaterializedRepeat);
+          size_t n = spec->indefinite
+                         ? 0
+                         : std::min(spec->count, kMaxMaterializedRepeat);
           return std::string(n, (*atom)[0]);
         }
       }
@@ -301,6 +316,7 @@ struct SetParseResult {
 };
 
 auto parse_set(std::string_view str) -> cp::Result<SetParseResult> {
+  g_saw_trailing_backslash = false;
   SetParseResult out;
   std::string& result = out.chars;
 
@@ -316,8 +332,8 @@ auto parse_set(std::string_view str) -> cp::Result<SetParseResult> {
       continue;  // contributes nothing until the fill phase
     }
     if (spec.count > 0) {
-      result += std::string(std::min(spec.count, kMaxMaterializedRepeat),
-                            (*atom)[0]);
+      result +=
+          std::string(std::min(spec.count, kMaxMaterializedRepeat), (*atom)[0]);
       continue;
     }
 
@@ -493,7 +509,20 @@ auto build_config(const CommandContext<TR_OPTIONS.size()>& ctx)
     return std::unexpected("extra operand after delete");
   }
 
+  // [GNU] warn for a lone backslash at the end of each SET operand; the
+  // warning is emitted even when a later operand fails to parse.
+  auto warn_trailing_backslash = [] {
+    if (g_saw_trailing_backslash) {
+      g_saw_trailing_backslash = false;
+      safeErrorPrintLn(winux::i18n::format(
+          "command.tr.warn.trailing_backslash",
+          "tr: warning: an unescaped backslash at end of string is not "
+          "portable"));
+    }
+  };
+
   auto set1 = parse_set(ctx.positionals[0]);
+  warn_trailing_backslash();
   if (!set1) return std::unexpected(set1.error());
   if (set1->indefinite_count > 0) {
     return std::unexpected(make_dynamic_error(
@@ -505,6 +534,7 @@ auto build_config(const CommandContext<TR_OPTIONS.size()>& ctx)
   // (translation)
   if (ctx.positionals.size() > 1) {
     auto set2 = parse_set(ctx.positionals[1]);
+    warn_trailing_backslash();
     if (!set2) return std::unexpected(set2.error());
     if (set2->indefinite_count > 1) {
       return std::unexpected(make_dynamic_error(

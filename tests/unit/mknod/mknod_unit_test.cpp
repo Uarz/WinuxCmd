@@ -40,7 +40,7 @@ TEST(mknod, mknod_fifo_rejects_major_minor) {
   EXPECT_NE(r.stderr_text.find("Fifos do not have"), std::string::npos);
 }
 
-TEST(mknod, mknod_fifo_reports_windows_limitation) {
+TEST(mknod, mknod_fifo_creates_marker) {
   TempDir tmp;
 
   Pipeline p;
@@ -49,8 +49,13 @@ TEST(mknod, mknod_fifo_reports_windows_limitation) {
 
   auto r = p.run();
 
-  EXPECT_EQ(r.exit_code, 1);
-  EXPECT_NE(r.stderr_text.find("not supported on Windows"), std::string::npos);
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ(tmp.read("node1"), "!<fifo>");
+
+  Pipeline t;
+  t.set_cwd(tmp.wpath());
+  t.add(L"test.exe", {L"-p", L"node1"});
+  EXPECT_EQ(t.run().exit_code, 0);
 }
 
 TEST(mknod, mknod_existing_path_fails_like_gnu_shape) {

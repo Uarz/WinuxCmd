@@ -53,6 +53,15 @@ MANUAL_MESSAGES = {
     "common.error.extra_operand": "extra operand '{}'",
     "common.error.invalid_argument": "invalid argument '{}'",
     "common.error.reading": "error reading '{}'",
+    "command.join.error.file_not_sorted": "join: {}:{}: is not sorted: {}",
+    "command.join.error.not_sorted": "join: input is not in sorted order",
+    "command.join.error.both_stdin":
+        "join: both files cannot be standard input",
+    "command.join.error.incompatible_fields":
+        "incompatible join fields {}, {}",
+    "command.comm.error.file_not_sorted":
+        "comm: file {} is not in sorted order",
+    "command.comm.error.not_sorted": "comm: input is not in sorted order",
     "command.xxd.error.cannot_create": "xxd: cannot create {}",
     "command.xxd.error.cannot_open": "xxd: cannot open {}",
     "command.xxd.error.invalid_columns": "xxd: invalid column count",
@@ -274,6 +283,11 @@ MANUAL_MESSAGES = {
     "command.tr.error.repeat_only_translate": "the [c*] construct may appear in string2 only when translating",
     "command.csplit.error.line_out_of_range": "'{}': line number out of range",
     "command.csplit.error.match_not_found": "'{}': match not found",
+    "command.tail.replaced": "tail: '{}' has been replaced;  following new file\n",
+    "command.tail.follow.inaccessible": "tail: '{}' has become inaccessible: {}\n",
+    "command.tail.follow.appeared": "tail: '{}' has appeared;  following new file\n",
+    "command.tail.follow.file_truncated": "{}: file truncated",
+    "command.tail.follow.no_files": "tail: no files remaining\n",
     "command.date.error.cannot_open": "date: {}: No such file or directory",
     "command.date.error.cannot_open_generic": "date: {}: {}",
     "command.date.error.read_error": "date: {}: read error: Is a directory",
@@ -328,6 +342,9 @@ MANUAL_MESSAGES = {
     "command.dd.error.cannot_skip": "dd: {}: cannot skip: Value too large for defined data type",
     "command.dd.error.cannot_seek": "dd: {}: cannot seek: Value too large for defined data type",
     "command.pr.error.page_exceeds": "pr: starting page number {} exceeds page count {}",
+    "command.pr.error.page_width_narrow": "pr: page width too narrow",
+    "command.pr.error.invalid_line_offset": "'-o MARGIN' invalid line offset: '{}'",
+    "command.fmt.error.invalid_width": "invalid width: '{}'",
     "command.kill.error.invalid_signal": "'{}': invalid signal",
     "command.kill.error.multiple_signals": "'{}': multiple signals specified",
     "common.error.invalid_gap_width": "invalid gap width: '{}'",
@@ -345,6 +362,19 @@ MANUAL_MESSAGES = {
     "command.readlink.error.too_many_symlinks": "Too many levels of symbolic links",
     "command.tsort.error.odd_tokens": "tsort: input contains an odd number of tokens",
     "command.numfmt.error.valid_to_args": "Valid arguments are:\n  - 'none'\n  - 'si'\n  - 'iec'\n  - 'iec-i'\n",
+    "command.nl.error.numbering_style": "invalid {} numbering style: '{}'",
+    "command.nl.error.numbering_format": "invalid line numbering format: '{}'",
+    "command.nl.error.invalid_increment": "invalid line number increment: '{}'",
+    "command.nl.error.invalid_join": "invalid line number of blank lines: '{}'",
+    "command.nl.error.invalid_start": "invalid starting line number: '{}'",
+    "command.nl.error.invalid_width": "invalid line number field width: '{}'",
+    "common.error.result_out_of_range": ": Numerical result out of range",
+    "command.stdbuf.error.invalid_mode": "invalid mode '{}'",
+    "command.stdbuf.error.mode_required": "you must specify a buffering mode option",
+    "command.nproc.error.invalid_number": "invalid number: '{}'",
+    "common.error.tab_ascending": "tab sizes must be ascending",
+    "common.error.tab_repeat_last": "repeat tab stop must be last",
+    "common.error.tab_value_too_large": "tab stop value is too large",
 }
 
 
@@ -484,6 +514,24 @@ def extract(source_root: Path) -> dict:
                     digest ^= byte
                     digest = (digest * 1099511628211) & 0xFFFFFFFFFFFFFFFF
                 messages[f"legacy.{digest:016x}"] = value
+        # Explicit keyed calls: i18n::translate("key", "fallback") and
+        # i18n::format("key", "fallback", ...).  Only pure-literal key and
+        # fallback arguments qualify; dynamically built keys stay manual.
+        literal = r'(\s*"(?:\\.|[^"\\])*"\s*)+'
+        for call_name in ("i18n::translate", "i18n::format", "translate",
+                          "format"):
+            for body in calls(source, call_name):
+                args = split_args(body)
+                if len(args) < 2:
+                    continue
+                if not (re.fullmatch(literal, args[0])
+                        and re.fullmatch(literal, args[1])):
+                    continue
+                key = string_value(args[0])
+                fallback = string_value(args[1])
+                if (re.fullmatch(r"[a-z0-9_]+(?:\.[a-z0-9_]+)+", key)
+                        and fallback):
+                    messages.setdefault(key, fallback)
     messages.update(MANUAL_MESSAGES)
     return {"schema": 1, "locale": "en-US", "messages": dict(sorted(messages.items()))}
 

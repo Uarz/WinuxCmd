@@ -32,10 +32,10 @@
 /// @License: MIT
 /// @Copyright: Copyright © 2026 WinuxCmd
 
-#include <cerrno>
 #include <fcntl.h>
 #include <io.h>
 
+#include <cerrno>
 #include <csignal>
 
 #include "core/command_macros.h"
@@ -141,22 +141,20 @@ REGISTER_COMMAND(
   // Open output files
   SmallVector<std::ofstream, 32> file_streams;
   for (const auto& filename : output_files) {
-    std::ofstream file;
-    // Resolve through the shared operand boundary so MSYS-style paths and
-    // POSIX pseudo-devices (/dev/null -> NUL) work like other tools (#276).
-    // Error messages keep echoing the user-visible operand verbatim.
-    const std::string resolved = native_path::normalize_api_operand(filename);
-    if (append) {
-      file.open(resolved, std::ios::out | std::ios::app | std::ios::binary);
-    } else {
-      file.open(resolved, std::ios::out | std::ios::trunc | std::ios::binary);
-    }
-
+    // Resolve through the shared operand boundary so MSYS-style paths,
+    // POSIX pseudo-devices (/dev/null -> NUL), and the /dev/std{out,err}
+    // fd bindings work like other tools (#276/#1056). Error messages keep
+    // echoing the user-visible operand verbatim. A trailing separator
+    // requires a directory target (ENOTDIR on regular files); silently
+    // stripping it would truncate the file (#1052).
+    std::ofstream file = file_io::create_binary_file(filename, append);
     if (!file.is_open()) {
+      // Capture errno before printing: output helpers can clobber it.
+      const int saved_errno = errno;
       safeErrorPrint("tee: '");
       safeErrorPrint(filename);
       safeErrorPrint("': ");
-      safeErrorPrint(strerror(errno));
+      safeErrorPrint(strerror(saved_errno));
       safeErrorPrint("\n");
       encountered_error = true;
       continue;

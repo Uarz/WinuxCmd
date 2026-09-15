@@ -171,9 +171,12 @@ TEST(df, df_block_size_human_readable_alias) {
   TEST_LOG("df.exe --block-size=human-readable output", r.stdout_text);
 
   EXPECT_EQ(r.exit_code, 0);
+  // [GNU] --block-size=human-readable selects -h, whose header is
+  // "Filesystem Size Used Avail Use% Mounted on" ("Available"/"Capacity"
+  // only appear in POSIX -P mode).
   EXPECT_NE(r.stdout_text.find("Size"), std::string::npos);
-  EXPECT_NE(r.stdout_text.find("Available"), std::string::npos);
-  EXPECT_NE(r.stdout_text.find("Capacity"), std::string::npos);
+  EXPECT_NE(r.stdout_text.find("Avail"), std::string::npos);
+  EXPECT_NE(r.stdout_text.find("Use%"), std::string::npos);
 }
 
 // GNU appends the unit letter to values for a bare-suffix block size
@@ -405,4 +408,79 @@ TEST(df, df_wildcard_operands_expand) {
 
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_NE(r.stdout_text.find("Filesystem"), std::string::npos);
+}
+
+// [GNU] -m is a synonym for --block-size=1M (#308).
+TEST(df, df_m_selects_1m_blocks) {
+  TempDir tmp;
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"df.exe", {L"-m", L"."});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_NE(r.stdout_text.find("1M-blocks"), std::string::npos);
+}
+
+// [GNU] df stats each operand: a missing path is reported and the run fails
+// with exit 1, but valid operands are still listed (#336).
+TEST(df, df_missing_operand_errors_but_valid_operands_still_list) {
+  TempDir tmp;
+  tmp.write("real.txt", "abc");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"df.exe", {L"real.txt", L"zzz_missing_df_operand"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_NE(r.stderr_text.find("zzz_missing_df_operand"), std::string::npos);
+  EXPECT_NE(r.stderr_text.find("No such file or directory"), std::string::npos);
+  // The valid operand still produced a listing.
+  EXPECT_NE(r.stdout_text.find("Filesystem"), std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("real.txt") != std::string::npos ||
+              r.stdout_text.find(":\\") != std::string::npos);
+}
+
+// [GNU] With no size option the block size comes from DF_BLOCK_SIZE >
+// BLOCK_SIZE > BLOCKSIZE (#981).
+TEST(df, df_block_size_env_is_honored) {
+  TempDir tmp;
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.set_env(L"DF_BLOCK_SIZE", L"1M");
+  p.add(L"df.exe", {L"."});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_NE(r.stdout_text.find("1M-blocks"), std::string::npos);
+}
+
+TEST(df, df_block_size_env_falls_through_to_blocksize) {
+  TempDir tmp;
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.set_env(L"BLOCKSIZE", L"512");
+  p.add(L"df.exe", {L"."});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_NE(r.stdout_text.find("512B-blocks"), std::string::npos);
+}
+
+// [GNU] -F is an obsolete hidden synonym for -t/--type (issue #1078).
+TEST(df, df_obsolete_F_synonym_for_type) {
+  Pipeline pf;
+  pf.add(L"df.exe", {L"-F", L"NTFS"});
+  Pipeline pt;
+  pt.add(L"df.exe", {L"-t", L"NTFS"});
+
+  auto rf = pf.run();
+  auto rt = pt.run();
+  EXPECT_EQ(rf.exit_code, 0);
+  EXPECT_EQ(rt.exit_code, 0);
+  EXPECT_EQ(rf.stdout_text.empty(), rt.stdout_text.empty());
 }

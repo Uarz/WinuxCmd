@@ -1494,3 +1494,14 @@ TEST(grep, grep_binary_files_default_no_messages_keeps_diagnostic) {
   EXPECT_TRUE(r.stderr_text.find("binary.dat: binary file matches") !=
               std::string::npos);
 }
+
+// [GNU] -y is an obsolete hidden synonym for -i (issue #1077).
+TEST(grep, grep_obsolete_y_synonym_for_ignore_case) {
+  Pipeline p;
+  p.set_stdin("HELLO\n");
+  p.add(L"grep.exe", {L"-y", L"hello"});
+
+  auto r = p.run();
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "HELLO\n");
+}

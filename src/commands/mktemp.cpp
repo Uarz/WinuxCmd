@@ -331,8 +331,7 @@ auto build_config(const CommandContext<MKTEMP_OPTIONS.size()>& ctx)
   // -t flag: interpret template as single file name component, relative
   // to $TMPDIR (or default temp dir). Strip any directory from template.
   if (cfg.use_tmpdir_flag) {
-    cfg.template_str =
-        path_utf8(utf8_path(cfg.template_str).filename());
+    cfg.template_str = path_utf8(utf8_path(cfg.template_str).filename());
     if (cfg.template_str.empty()) {
       cfg.template_str = "tmp.XXXXXXXXXX";
     }
@@ -399,9 +398,8 @@ auto run(const Config& cfg) -> int {
 
   if (!cfg.tmpdir.empty()) {
     base_dir = utf8_path(normalize_win_shell_path(cfg.tmpdir));
-    template_component =
-        path_utf8(utf8_path(normalize_win_shell_path(cfg.template_str))
-                      .filename());
+    template_component = path_utf8(
+        utf8_path(normalize_win_shell_path(cfg.template_str)).filename());
   } else {
     std::filesystem::path template_path =
         utf8_path(normalize_win_shell_path(cfg.template_str));
@@ -447,8 +445,7 @@ auto run(const Config& cfg) -> int {
                     : path_utf8(candidate_path);
 
     // Check if file/directory already exists
-    DWORD attrs =
-        GetFileAttributesW(utf8_to_wstring(temp_file).c_str());
+    DWORD attrs = GetFileAttributesW(utf8_to_wstring(temp_file).c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES) {
       // File doesn't exist, we can use this name
       break;
@@ -469,23 +466,30 @@ auto run(const Config& cfg) -> int {
 
   // Create file or directory (unless dry-run)
   if (!cfg.dry_run) {
+    // [GNU] diagnostics keep the original template and the errno text:
+    // "failed to create file via template 'T': No such file or directory"
+    // (uutils #13720).
     if (cfg.make_directory) {
       if (!CreateDirectoryW(utf8_to_wstring(temp_file).c_str(), NULL)) {
         if (!cfg.quiet) {
-          cp::Result<int> result2 =
-              std::unexpected("failed to create temporary directory");
-          cp::report_error(result2, L"mktemp");
+          safeErrorPrintLn(winux::i18n::format(
+              "command.mktemp.error.failed_create_directory_template",
+              "mktemp: failed to create directory via template '{}': {}",
+              cfg.template_str, win32_posix_error_text(GetLastError())));
         }
         return 1;
       }
     } else {
       // Create file
+      errno = 0;
       std::ofstream f(utf8_path(temp_file), std::ios::binary);
       if (!f) {
         if (!cfg.quiet) {
-          cp::Result<int> result2 =
-              std::unexpected("failed to create temporary file");
-          cp::report_error(result2, L"mktemp");
+          const int err = errno != 0 ? errno : ENOENT;
+          safeErrorPrintLn(winux::i18n::format(
+              "command.mktemp.error.failed_create_file_template",
+              "mktemp: failed to create file via template '{}': {}",
+              cfg.template_str, std::string(std::strerror(err))));
         }
         return 1;
       }

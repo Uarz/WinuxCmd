@@ -9,8 +9,9 @@ import utils;
 import container;
 
 auto constexpr TSORT_OPTIONS =
-    // [GNU] option
-    std::array{OPTION("", "", "topological sort", STRING_TYPE)};
+    std::array{OPTION("", "", "topological sort", STRING_TYPE),
+               // [GNU] -w: accepted and ignored (POSIX.1-2024); hidden
+               OPTION("-w", "", "", BOOL_TYPE)};
 
 REGISTER_COMMAND(tsort,
                  /* cmd_name */ "tsort",
@@ -50,10 +51,8 @@ REGISTER_COMMAND(tsort,
     input.resize(bytesRead);
   }
 
-  if (input.empty()) {
-    safeErrorPrintLn("tsort: missing input");
-    return 1;
-  }
+  // [GNU] Empty input is not an error: tsort simply prints nothing and
+  // exits 0 (e.g. "tsort /dev/null").
 
   // [GNU] tsort reads whitespace-separated pairs; an odd token count is
   // an error (uutils #7077).
@@ -62,25 +61,32 @@ REGISTER_COMMAND(tsort,
   std::string tok;
   while (tok_ss >> tok) tokens.push_back(tok);
   if (tokens.size() % 2 != 0) {
-    safeErrorPrintLn(::winux::i18n::format(
-        "command.tsort.error.odd_tokens",
-        "tsort: input contains an odd number of tokens"));
+    safeErrorPrintLn(
+        ::winux::i18n::format("command.tsort.error.odd_tokens",
+                              "tsort: input contains an odd number of tokens"));
     return 1;
   }
 
   std::set<std::string> nodes;
   std::map<std::string, std::vector<std::string>> graph;
   std::set<std::pair<std::string, std::string>> seen_pairs;
-  const std::string input_name = ctx.positionals.empty()
-                                     ? "-"
-                                     : std::string(ctx.positionals[0]);
+  const std::string input_name =
+      ctx.positionals.empty() ? "-" : std::string(ctx.positionals[0]);
 
   for (size_t i = 0; i + 1 < tokens.size(); i += 2) {
     const std::string& node = tokens[i];
     const std::string& dep = tokens[i + 1];
-    // [GNU] Duplicate pairs are ignored with a warning on stderr.
+    // [GNU] record_relation() ignores a relation whose two members are
+    // identical, so a self-pair like "a a" registers the node but is not a
+    // loop (uutils #8743).
+    if (node == dep) {
+      nodes.insert(node);
+      continue;
+    }
+    // [GNU] Duplicate pairs are recorded silently (each adds a redundant
+    // edge that decrements exactly as often as it was counted); dropping
+    // the extra edge here is equivalent and produces no diagnostic.
     if (!seen_pairs.insert({node, dep}).second) {
-      safeErrorPrintLn("tsort: " + input_name + ": duplicate input pair");
       continue;
     }
     graph[node].push_back(dep);

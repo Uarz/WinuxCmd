@@ -1,4 +1,4 @@
-/*
+﻿/*
  *  Copyright (c) 2026 [caomengxuan666]
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -90,8 +90,8 @@ constexpr std::string_view kBuiltinIndex = R"json(
 {
   "schema": 1,
   "name": "official",
-  "version": "builtin-2026.09.13",
-  "updated": "2026-09-13",
+  "version": "builtin-2026.09.15",
+  "updated": "2026-09-15",
   "sources": [
     {
       "name": "official-github-raw",
@@ -2448,9 +2448,9 @@ auto install_package(const Options& opts, std::string_view package_name)
       opts.force);
   if (preflight) return *preflight;
 
-  auto downloaded = download_artifact(opts.root, pkg->value("name", ""),
-                                      *artifact, opts.verbose,
-                                      user_forced_proxy(opts));
+  auto downloaded =
+      download_artifact(opts.root, pkg->value("name", ""), *artifact,
+                        opts.verbose, user_forced_proxy(opts));
   if (!downloaded) return 1;
 
   fs::path extracted = staging_dir(opts.root) / pkg->value("name", "package");
@@ -3797,7 +3797,8 @@ auto print_usage() -> int {
       "downloads (env: HTTP_PROXY,\n"
       "                                        HTTPS_PROXY, WPM_HTTP_PROXY, "
       "WPM_HTTPS_PROXY, NO_PROXY)\n"
-      "      --from <manifest>                 install packages from a manifest "
+      "      --from <manifest>                 install packages from a "
+      "manifest "
       "file or URL\n"
       "                                        (TOML, JSON, or plain list)\n"
       "      --help                            display this help and exit\n"

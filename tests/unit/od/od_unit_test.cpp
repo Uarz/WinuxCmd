@@ -220,8 +220,11 @@ TEST(od, od_output_duplicates_long_alias_disables_squeezing) {
 }
 
 TEST(od, od_traditional_and_strings_options) {
+  // GNU 9.4: `od --traditional 2 --strings=5` skips 2 bytes (octal
+  // offset) then scans for NUL-terminated runs of >= 5 printable
+  // characters; "hello\0" at offset 2 prints as "0000002 hello".
   Pipeline p;
-  p.set_stdin("xxhello world\n");
+  p.set_stdin(std::string("xxhello\0world\n", 14));
   p.add(L"od.exe", {L"--traditional", L"2", L"--strings=5"});
 
   TEST_LOG_CMD_LIST("od.exe", L"--traditional", L"2", L"--strings=5");
@@ -234,5 +237,5 @@ TEST(od, od_traditional_and_strings_options) {
 
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_TRUE(r.stderr_text.empty());
-  EXPECT_NE(r.stdout_text.find("hello"), std::string::npos);
+  EXPECT_EQ_TEXT(r.stdout_text, "0000002 hello\n");
 }

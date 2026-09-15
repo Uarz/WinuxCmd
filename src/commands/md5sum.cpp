@@ -50,19 +50,19 @@ using cmd::meta::OptionType;
 auto constexpr MD5SUM_OPTIONS = std::array{
     // [DIFFERS]
     OPTION("-b", "--binary", "read in binary mode (default)", BOOL_TYPE),
-    // [GNU]
+    // [GNU] -c is a plain flag; check FILEs come from the operands.
     OPTION("-c", "--check", "read MD5 sums from the FILEs and check them",
-           STRING_TYPE),
+           BOOL_TYPE),
     // [GNU]
     OPTION("", "--ignore-missing",
            "don't fail or report status for missing files", BOOL_TYPE),
     // [DIFFERS]
     OPTION("-t", "--text", "read in text mode", BOOL_TYPE),
-    // [GNU]
-    OPTION("-q", "--quiet",
-           "don't print OK for each successfully verified file", BOOL_TYPE),
-    // [GNU]
-    OPTION("-s", "--status", "don't output anything, status code shows success",
+    // [GNU] long-only in coreutils (no -q short option).
+    OPTION("", "--quiet", "don't print OK for each successfully verified file",
+           BOOL_TYPE),
+    // [GNU] long-only in coreutils (no -s short option).
+    OPTION("", "--status", "don't output anything, status code shows success",
            BOOL_TYPE),
     // [GNU]
     OPTION("-w", "--warn", "warn about improperly formatted checksum lines",
@@ -90,24 +90,11 @@ struct Config {
   bool zero = false;
   bool strict = false;
   bool ignore_missing = false;
-  std::string check_file;
   SmallVector<std::string, 64> files;
 };
 
-struct CheckLine {
-  std::string expected_hash;
-  std::string filename;
-};
-
 auto input_open_error(std::string_view path) -> std::string {
-  std::error_code ec;
-  if (std::filesystem::is_directory(std::filesystem::u8path(path), ec) && !ec) {
-    return "cannot open '" + std::string(path) +
-           "' for reading: Is a directory";
-  }
-
-  return "cannot open '" + std::string(path) +
-         "' for reading: No such file or directory";
+  return std::string(path) + ": " + portable_digest::open_error_reason(path);
 }
 
 auto build_config(const CommandContext<MD5SUM_OPTIONS.size()>& ctx)
@@ -120,22 +107,71 @@ auto build_config(const CommandContext<MD5SUM_OPTIONS.size()>& ctx)
   cfg.binary_mode =
       ctx.get<bool>("--binary", false) || ctx.get<bool>("-b", false);
 #endif
-  auto check_opt = ctx.get<std::string>("--check", "");
   cfg.check_mode =
-      !check_opt.empty() || !ctx.get<std::string>("-c", "").empty();
-  cfg.quiet = ctx.get<bool>("--quiet", false) || ctx.get<bool>("-q", false);
-  cfg.status = ctx.get<bool>("--status", false) || ctx.get<bool>("-s", false);
-  cfg.warn = ctx.get<bool>("--warn", false) || ctx.get<bool>("-w", false);
+      ctx.get<bool>("--check", false) || ctx.get<bool>("-c", false);
   cfg.tag = ctx.get<bool>("--tag", false);
   cfg.zero = ctx.get<bool>("--zero", false) || ctx.get<bool>("-z", false);
   cfg.strict = ctx.get<bool>("--strict", false);
   cfg.ignore_missing = ctx.get<bool>("--ignore-missing", false);
 
-  if (cfg.check_mode) {
-    cfg.check_file = ctx.get<std::string>("--check", "");
-    if (cfg.check_file.empty()) {
-      cfg.check_file = ctx.get<std::string>("-c", "");
+  // [GNU] the last of --status/--warn/--quiet wins and resets the other two
+  // (getopt cases STATUS_OPTION/'w'/QUIET_OPTION in src/cksum.c).
+  for (const auto& occurrence : ctx.options.occurrences()) {
+    const auto& meta = (*ctx.metas)[occurrence.index];
+    if (meta.long_name == "--status" || meta.short_name == "--status") {
+      cfg.status = true;
+      cfg.warn = false;
+      cfg.quiet = false;
+    } else if (meta.long_name == "--warn" || meta.short_name == "-w") {
+      cfg.status = false;
+      cfg.warn = true;
+      cfg.quiet = false;
+    } else if (meta.long_name == "--quiet" || meta.short_name == "--quiet") {
+      cfg.status = false;
+      cfg.warn = false;
+      cfg.quiet = true;
     }
+  }
+
+  // [GNU] option-conflict checks, in src/cksum.c main() order.
+  const bool mode_seen = ctx.has("-b") || ctx.has("--binary") ||
+                         ctx.has("-t") || ctx.has("--text");
+  if (cfg.zero && cfg.check_mode) {
+    return std::unexpected(
+        "the --zero option is not supported when verifying checksums");
+  }
+  if (cfg.tag && cfg.check_mode) {
+    return std::unexpected(
+        "the --tag option is meaningless when verifying checksums");
+  }
+  if (mode_seen && cfg.check_mode) {
+    return std::unexpected(
+        "the --binary and --text options are meaningless when verifying "
+        "checksums");
+  }
+  if (cfg.ignore_missing && !cfg.check_mode) {
+    return std::unexpected(
+        "the --ignore-missing option is meaningful only when verifying "
+        "checksums");
+  }
+  if (cfg.status && !cfg.check_mode) {
+    return std::unexpected(
+        "the --status option is meaningful only when verifying checksums");
+  }
+  if (cfg.warn && !cfg.check_mode) {
+    return std::unexpected(
+        "the --warn option is meaningful only when verifying checksums");
+  }
+  if (cfg.quiet && !cfg.check_mode) {
+    return std::unexpected(
+        "the --quiet option is meaningful only when verifying checksums");
+  }
+  if (cfg.strict && !cfg.check_mode) {
+    return std::unexpected(
+        "the --strict option is meaningful only when verifying checksums");
+  }
+  if (cfg.tag && cfg.text_mode) {
+    return std::unexpected("--tag does not support --text mode");
   }
 
   for (auto arg : ctx.positionals) {
@@ -145,7 +181,8 @@ auto build_config(const CommandContext<MD5SUM_OPTIONS.size()>& ctx)
     }
   }
 
-  if (cfg.files.empty() && !cfg.check_mode) {
+  // [GNU] with no FILE operand both modes default to standard input.
+  if (cfg.files.empty()) {
     cfg.files.push_back("-");
   }
 
@@ -172,6 +209,12 @@ auto calculate_md5(const std::string& filename, bool text_mode = false)
 
   bool success = false;
   if (filename == "-" || filename.empty()) {
+    // [GNU] closed stdin (<&-) reports "-: Bad file descriptor" rather
+    // than hashing an empty stream.
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected(std::string(filename.empty() ? "-" : filename) +
+                             ": Bad file descriptor");
+    }
     // Read from stdin
     std::array<char, 8192> buffer;
     size_t bytes_read;
@@ -236,168 +279,23 @@ auto calculate_md5(const std::string& filename, bool text_mode = false)
   return result;
 }
 
-auto parse_check_line(const std::string& line) -> std::optional<CheckLine> {
-  if (line.empty()) {
-    return std::nullopt;
-  }
-
-  size_t eq_pos = line.find(" = ");
-  if (eq_pos != std::string::npos && line.rfind("MD5 (", 0) == 0) {
-    std::string filename = line.substr(5, eq_pos - 5);
-    if (!filename.empty() && filename.front() == '(') {
-      filename.erase(filename.begin());
-    }
-    if (!filename.empty() && filename.back() == ')') {
-      filename.pop_back();
-    }
-    std::string expected_hash = line.substr(eq_pos + 3);
-    if (expected_hash.size() == 32 && !filename.empty()) {
-      return CheckLine{expected_hash, filename};
-    }
-    return std::nullopt;
-  }
-
-  if (line.size() < 34) {
-    return std::nullopt;
-  }
-
-  std::string expected_hash = line.substr(0, 32);
-  for (char ch : expected_hash) {
-    if (!std::isxdigit(static_cast<unsigned char>(ch))) {
-      return std::nullopt;
-    }
-  }
-
-  if (line[32] != ' ' || (line[33] != ' ' && line[33] != '*')) {
-    return std::nullopt;
-  }
-
-  std::string filename = line.substr(34);
-  if (filename.empty()) {
-    return std::nullopt;
-  }
-
-  return CheckLine{expected_hash, filename};
-}
-
-auto format_malformed_line_count(int malformed) -> std::string {
-  if (malformed == 1) {
-    return "md5sum: WARNING: 1 line is improperly formatted\n";
-  }
-  return "md5sum: WARNING: " + std::to_string(malformed) +
-         " lines are improperly formatted\n";
-}
-
-auto format_unreadable_file_count(int unreadable) -> std::string {
-  if (unreadable == 1) {
-    return "md5sum: WARNING: 1 listed file could not be read\n";
-  }
-  return "md5sum: WARNING: " + std::to_string(unreadable) +
-         " listed files could not be read\n";
-}
-
-auto should_ignore_missing_file(const Config& cfg, std::string_view path)
-    -> bool {
-  if (!cfg.ignore_missing || path.empty() || path == "-") {
-    return false;
-  }
-
-  std::error_code ec;
-  return !std::filesystem::exists(std::filesystem::u8path(path), ec);
-}
-
 auto run(const Config& cfg) -> int {
   if (cfg.check_mode) {
-    std::istream* input = &std::cin;
-    std::ifstream file;
-    std::string input_name = "standard input";
-    if (!cfg.check_file.empty() && cfg.check_file != "-") {
-      file.open(native_path::normalize_api_operand(cfg.check_file));
-      if (!file) {
-        cp::report_custom_error(
-            L"md5sum", utf8_to_wstring(input_open_error(cfg.check_file)));
-        return 1;
-      }
-      input = &file;
-      input_name = cfg.check_file;
-    }
-
-    int mismatches = 0;
-    int malformed = 0;
-    int checked = 0;
-    int unreadable = 0;
-    std::string line;
-    size_t line_number = 0;
-    while (std::getline(*input, line)) {
-      ++line_number;
-      if (!line.empty() && line.back() == '\r') {
-        line.pop_back();
-      }
-      if (line.empty()) {
-        continue;
-      }
-
-      auto parsed = parse_check_line(line);
-      if (!parsed) {
-        ++malformed;
-        if (cfg.warn && !cfg.status) {
-          safeErrorPrint("md5sum: " + input_name + ": " +
-                         std::to_string(line_number) +
-                         ": improperly formatted checksum line\n");
-        }
-        continue;
-      }
-
-      ++checked;
-      if (should_ignore_missing_file(cfg, parsed->filename)) {
-        continue;
-      }
-
-      auto hash_result = calculate_md5(parsed->filename, cfg.text_mode);
-      if (!hash_result) {
-        if (!cfg.status) {
-          cp::report_error(hash_result, L"md5sum");
-        }
-        ++unreadable;
-        ++mismatches;
-        continue;
-      }
-
-      if (*hash_result == parsed->expected_hash) {
-        if (!cfg.quiet && !cfg.status) {
-          safePrint(parsed->filename + ": OK\n");
-        }
-      } else {
-        if (!cfg.status) {
-          safePrint(parsed->filename + ": FAILED\n");
-        }
-        ++mismatches;
-      }
-    }
-
-    if (checked == 0 && malformed > 0) {
-      if (!cfg.status) {
-        safeErrorPrint("md5sum: " + input_name +
-                       ": no properly formatted checksum lines found\n");
-      }
-      return 1;
-    }
-
-    if (malformed > 0 && cfg.warn && !cfg.status) {
-      safeErrorPrint(format_malformed_line_count(malformed));
-    }
-
-    if (unreadable > 0 && !cfg.status) {
-      safeErrorPrint(format_unreadable_file_count(unreadable));
-    }
-
-    if (cfg.strict && malformed > 0) {
-      return 1;
-    }
-    if (mismatches > 0) {
-      return 1;
-    }
-    return 0;
+    // [GNU] digest_check() over every check FILE operand ("-" = stdin).
+    portable_digest::SumCheckFlags flags{
+        .status_only = cfg.status,
+        .quiet = cfg.quiet,
+        .warn = cfg.warn,
+        .strict = cfg.strict,
+        .ignore_missing = cfg.ignore_missing,
+    };
+    auto hash_fn = [](const std::string& filename, size_t) {
+      return calculate_md5(filename, false);
+    };
+    return portable_digest::sum_check_main(
+        "md5sum", "MD5", 32, flags,
+        std::span<const std::string>(cfg.files.data(), cfg.files.size()),
+        hash_fn);
   }
 
   bool all_ok = true;
@@ -440,6 +338,7 @@ REGISTER_COMMAND(md5sum, "md5sum", "md5sum [OPTION]... [FILE]...",
   auto cfg_result = build_config(ctx);
   if (!cfg_result) {
     cp::report_error(cfg_result, L"md5sum");
+    safeErrorPrintLn("Try 'md5sum --help' for more information.");
     return 1;
   }
 

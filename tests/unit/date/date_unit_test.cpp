@@ -370,8 +370,7 @@ TEST(date, date_file_missing_reports_open_error) {
   TEST_LOG_EXIT_CODE(r);
   TEST_LOG("date -f missing stderr", r.stderr_text);
   EXPECT_EQ(r.exit_code, 1);
-  EXPECT_NE(r.stderr_text.find("No such file or directory"),
-            std::string::npos);
+  EXPECT_NE(r.stderr_text.find("No such file or directory"), std::string::npos);
   EXPECT_NE(r.stderr_text.find("no-such-file.txt"), std::string::npos);
 }
 
@@ -391,8 +390,7 @@ TEST(date, date_file_formats_each_line_and_continues_after_invalid) {
   // [GNU] batch mode reports the invalid line, keeps processing, and exits 1.
   EXPECT_EQ(r.exit_code, 1);
   EXPECT_EQ(r.stdout_text, "2024-01-02\n2025-06-07\n");
-  EXPECT_NE(r.stderr_text.find("invalid date 'not a date'"),
-            std::string::npos);
+  EXPECT_NE(r.stderr_text.find("invalid date 'not a date'"), std::string::npos);
 }
 
 TEST(date, date_file_valid_file_prints_every_line) {
@@ -438,8 +436,8 @@ TEST(date, date_case_flags_composites) {
 
   Pipeline p;
   p.set_cwd(tmp.wpath());
-  p.add(L"date.exe", {L"-u", L"--date", L"@0",
-                      L"+%c|%#c|%^c|%r|%#r|%^r|%x|%#x|%^x"});
+  p.add(L"date.exe",
+        {L"-u", L"--date", L"@0", L"+%c|%#c|%^c|%r|%#r|%^r|%x|%#x|%^x"});
 
   auto r = p.run();
   TEST_LOG_EXIT_CODE(r);
@@ -466,4 +464,49 @@ TEST(date, date_case_flags_dangling_percent) {
   TEST_LOG("date case flags dangling stdout", r.stdout_text);
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_EQ(r.stdout_text, "%^|100%|1|1\n");
+}
+
+// [GNU] %E/%O select the locale's alternative representation; with no
+// alternate digits/eras available they fall back to the base conversion
+// (issue #1088).
+TEST(date, date_eo_modifiers_fall_back_to_base_conversion) {
+  TempDir tmp;
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"date.exe",
+        {L"-u", L"--date", L"@0", L"+%EY|%Oy|%Od|%Om|%Ec|%OH|%OM|%OS"});
+
+  auto r = p.run();
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("date %E/%O stdout", r.stdout_text);
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ(r.stdout_text, "1970|70|01|01|Thu Jan  1 00:00:00 1970|00|00|00\n");
+}
+
+// [GNU] --uct and --rfc-822 are deprecated hidden aliases accepted for
+// back-compat: --uct == --utc, --rfc-822 == -R/--rfc-email (issue #1073).
+TEST(date, date_deprecated_uct_and_rfc822_aliases) {
+  TempDir tmp;
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"date.exe", {L"--uct", L"--date", L"@0", L"+%s"});
+
+  auto r = p.run();
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "0\n");
+
+  Pipeline p2;
+  p2.set_cwd(tmp.wpath());
+  p2.add(L"date.exe", {L"--rfc-822", L"--date", L"@0"});
+
+  Pipeline p3;
+  p3.set_cwd(tmp.wpath());
+  p3.add(L"date.exe", {L"-R", L"--date", L"@0"});
+
+  auto r2 = p2.run();
+  auto r3 = p3.run();
+  EXPECT_EQ(r2.exit_code, 0);
+  EXPECT_EQ_TEXT(r2.stdout_text, r3.stdout_text);
 }

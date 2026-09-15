@@ -277,13 +277,18 @@ int wmain(int argc, wchar_t* wargv[]) noexcept {
       return printHelp();
     }
 
-    // Check for top-level help flag/alias
-    if (args.size() == 1 && args[0] == "--help") {
+    // Check for top-level help flag/alias. Like GNU getopt_long, accept any
+    // unambiguous abbreviation (e.g. --hel, --he for --help).
+    if (args.size() == 1 && args[0].size() >= 3 &&
+        std::string_view("--help").starts_with(args[0])) {
       return printHelp();
     }
 
-    // Check for version flags
-    if (args.size() == 1 && (args[0] == "--version" || args[0] == "-v")) {
+    // Check for version flags (unambiguous --version abbreviations too)
+    if (args.size() == 1 &&
+        (args[0] == "-v" ||
+         (args[0].size() >= 3 &&
+          std::string_view("--version").starts_with(args[0])))) {
       safePrintLn(L"WinuxCmd " + utf8_to_wstring(WinuxCmd::VERSION_STRING));
       return 0;
     }
@@ -320,12 +325,23 @@ int wmain(int argc, wchar_t* wargv[]) noexcept {
 
                                                args.size() - 1);
 
-    // Check for --version in command arguments
+    // Check for --version in command arguments.  [GNU] Commands whose
+    // arguments are data (echo, yes, test, [, true, false, printf) do not
+    // honor "--version" in any position — e.g. `printf '%s\n' --version`
+    // prints "--version" — so the dispatcher's per-command rule applies
+    // to them instead of this scan.
+    static constexpr std::string_view kLiteralArgCommands[] = {
+        "echo", "yes", "test", "[", "true", "false", "printf"};
+    const bool literal_arg_command = std::ranges::any_of(
+        kLiteralArgCommands,
+        [cmd_name](std::string_view n) { return n == cmd_name; });
     bool has_version = false;
-    for (const auto& arg : cmd_args) {
-      if (arg == "--version") {
-        has_version = true;
-        break;
+    if (!literal_arg_command) {
+      for (const auto& arg : cmd_args) {
+        if (arg == "--version") {
+          has_version = true;
+          break;
+        }
       }
     }
 

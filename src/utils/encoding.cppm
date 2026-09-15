@@ -470,4 +470,249 @@ inline std::vector<uint8_t> base16_decode(std::string_view encoded) {
   return result;
 }
 
+// ===== GNU-compatible decoders =====
+//
+// These mirror GNU coreutils' decoders (lib/base64.c, lib/base32.c and the
+// per-encoding decoders in src/basenc.c):
+//   * '\n' bytes are skipped anywhere in the stream; every other non-alphabet
+//     byte stops decoding (or is dropped up front under --ignore-garbage).
+//   * Input is consumed in quantum units (4 characters for base64, 8 for
+//     base32). '=' padding is only legal at the tail positions of a unit, and
+//     a padded unit does not terminate the stream.
+//   * Every byte decoded before the first error is still emitted; the caller
+//     prints that prefix and then reports "invalid input" with a failure
+//     status.
+struct GnuDecodeResult {
+  std::string output;
+  bool ok = true;
+};
+
+namespace gnu_decode_detail {
+inline auto make_value_map(std::string_view alphabet) -> std::array<int, 256> {
+  std::array<int, 256> map;
+  map.fill(-1);
+  for (size_t i = 0; i < alphabet.size(); ++i) {
+    map[static_cast<unsigned char>(alphabet[i])] = static_cast<int>(i);
+  }
+  return map;
+}
+}  // namespace gnu_decode_detail
+
+// GNU decode_4(): a partial unit at end of input emits its decodable prefix
+// (2 chars -> 1 byte, 3 chars -> 2 bytes) and then fails.
+inline GnuDecodeResult base64_decode_gnu(std::string_view encoded,
+                                         std::string_view alphabet,
+                                         bool ignore_garbage) {
+  const auto map = gnu_decode_detail::make_value_map(alphabet);
+  GnuDecodeResult result;
+
+  auto decode_unit = [&](std::string_view unit) -> bool {
+    const size_t n = unit.size();
+    if (n < 2) return false;
+    const int v0 = map[static_cast<unsigned char>(unit[0])];
+    const int v1 = map[static_cast<unsigned char>(unit[1])];
+    if (v0 < 0 || v1 < 0) return false;
+    result.output.push_back(static_cast<char>((v0 << 2) | (v1 >> 4)));
+    if (n == 2) return false;
+    if (unit[2] == '=') {
+      if (n != 4 || unit[3] != '=') return false;
+      return true;
+    }
+    const int v2 = map[static_cast<unsigned char>(unit[2])];
+    if (v2 < 0) return false;
+    result.output.push_back(static_cast<char>(((v1 << 4) & 0xf0) | (v2 >> 2)));
+    if (n == 3) return false;
+    if (unit[3] == '=') return true;
+    const int v3 = map[static_cast<unsigned char>(unit[3])];
+    if (v3 < 0) return false;
+    result.output.push_back(static_cast<char>(((v2 << 6) & 0xc0) | v3));
+    return true;
+  };
+
+  std::array<char, 4> unit{};
+  size_t n = 0;
+  for (unsigned char c : encoded) {
+    if (c == '\n') continue;
+    if (ignore_garbage && map[c] < 0 && c != '=') continue;
+    unit[n++] = static_cast<char>(c);
+    if (n == unit.size()) {
+      if (!decode_unit(std::string_view(unit.data(), unit.size()))) {
+        result.ok = false;
+        return result;
+      }
+      n = 0;
+    }
+  }
+  if (n != 0) {
+    decode_unit(std::string_view(unit.data(), n));
+    result.ok = false;
+  }
+  return result;
+}
+
+// GNU decode_8(): only complete units of 8 characters decode; a trailing
+// partial unit fails without emitting any bytes.
+inline GnuDecodeResult base32_decode_gnu(std::string_view encoded,
+                                         std::string_view alphabet,
+                                         bool ignore_garbage) {
+  const auto map = gnu_decode_detail::make_value_map(alphabet);
+  GnuDecodeResult result;
+
+  auto decode_unit = [&](std::string_view unit) -> bool {
+    if (unit.size() < 8) return false;
+    auto at = [&](size_t i) {
+      return map[static_cast<unsigned char>(unit[i])];
+    };
+    auto pad_tail = [&](size_t first) {
+      for (size_t i = first; i < 8; ++i) {
+        if (unit[i] != '=') return false;
+      }
+      return true;
+    };
+
+    const int v0 = at(0), v1 = at(1);
+    if (v0 < 0 || v1 < 0) return false;
+    result.output.push_back(static_cast<char>((v0 << 3) | (v1 >> 2)));
+    if (unit[2] == '=') return pad_tail(3);
+    const int v2 = at(2), v3 = at(3);
+    if (v2 < 0 || v3 < 0) return false;
+    result.output.push_back(
+        static_cast<char>((v1 << 6) | (v2 << 1) | (v3 >> 4)));
+    if (unit[4] == '=') return pad_tail(5);
+    const int v4 = at(4);
+    if (v4 < 0) return false;
+    result.output.push_back(static_cast<char>((v3 << 4) | (v4 >> 1)));
+    if (unit[5] == '=') return pad_tail(6);
+    const int v5 = at(5), v6 = at(6);
+    if (v5 < 0 || v6 < 0) return false;
+    result.output.push_back(
+        static_cast<char>((v4 << 7) | (v5 << 2) | (v6 >> 3)));
+    if (unit[7] == '=') return true;
+    const int v7 = at(7);
+    if (v7 < 0) return false;
+    result.output.push_back(static_cast<char>((v6 << 5) | v7));
+    return true;
+  };
+
+  std::array<char, 8> unit{};
+  size_t n = 0;
+  for (unsigned char c : encoded) {
+    if (c == '\n') continue;
+    if (ignore_garbage && map[c] < 0 && c != '=') continue;
+    unit[n++] = static_cast<char>(c);
+    if (n == unit.size()) {
+      if (!decode_unit(std::string_view(unit.data(), unit.size()))) {
+        result.ok = false;
+        return result;
+      }
+      n = 0;
+    }
+  }
+  if (n != 0) result.ok = false;
+  return result;
+}
+
+// GNU base16 decode: uppercase hex only, '\n' skipped, bytes emitted as they
+// decode; a dangling nibble or a garbage byte fails.
+inline GnuDecodeResult base16_decode_gnu(std::string_view encoded,
+                                         bool ignore_garbage) {
+  auto hex_value = [](unsigned char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+
+  GnuDecodeResult result;
+  int high_nibble = -1;
+  for (unsigned char c : encoded) {
+    if (c == '\n') continue;
+    const int value = hex_value(c);
+    if (value < 0) {
+      if (ignore_garbage) continue;
+      result.ok = false;
+      return result;
+    }
+    if (high_nibble < 0) {
+      high_nibble = value;
+    } else {
+      result.output.push_back(static_cast<char>((high_nibble << 4) | value));
+      high_nibble = -1;
+    }
+  }
+  if (high_nibble >= 0) result.ok = false;
+  return result;
+}
+
+// GNU base2 decode: '\n' skipped, '0'/'1' accumulate into octets; a garbage
+// byte or a dangling partial octet fails.
+inline GnuDecodeResult base2_decode_gnu(std::string_view encoded,
+                                        bool least_significant_first,
+                                        bool ignore_garbage) {
+  GnuDecodeResult result;
+  uint8_t octet = 0;
+  int bit_pos = 0;
+  for (unsigned char c : encoded) {
+    if (c == '\n') continue;
+    if (c != '0' && c != '1') {
+      if (ignore_garbage) continue;
+      result.ok = false;
+      return result;
+    }
+    const auto bit = static_cast<uint8_t>(c == '1' ? 1 : 0);
+    if (least_significant_first) {
+      octet |= static_cast<uint8_t>(bit << bit_pos);
+      if (++bit_pos == 8) {
+        result.output.push_back(static_cast<char>(octet));
+        octet = 0;
+        bit_pos = 0;
+      }
+    } else {
+      if (bit_pos == 0) bit_pos = 8;
+      --bit_pos;
+      octet |= static_cast<uint8_t>(bit << bit_pos);
+      if (bit_pos == 0) {
+        result.output.push_back(static_cast<char>(octet));
+        octet = 0;
+      }
+    }
+  }
+  if (bit_pos != 0) result.ok = false;
+  return result;
+}
+
+// GNU z85 decode: '\n' skipped; each unit of 5 characters emits 4 bytes;
+// garbage, an overflowing unit, or a trailing partial unit fails.
+inline GnuDecodeResult z85_decode_gnu(std::string_view encoded,
+                                      std::string_view alphabet,
+                                      bool ignore_garbage) {
+  const auto map = gnu_decode_detail::make_value_map(alphabet);
+  GnuDecodeResult result;
+  std::array<int, 5> unit{};
+  size_t n = 0;
+  for (unsigned char c : encoded) {
+    if (c == '\n') continue;
+    const int value = (c >= 33 && c <= 125) ? map[c] : -1;
+    if (value < 0) {
+      if (ignore_garbage) continue;
+      result.ok = false;
+      return result;
+    }
+    unit[n++] = value;
+    if (n == unit.size()) {
+      uint64_t value64 = 0;
+      for (int v : unit) value64 = value64 * 85 + static_cast<uint32_t>(v);
+      if (value64 > std::numeric_limits<uint32_t>::max()) {
+        result.ok = false;
+        return result;
+      }
+      for (int shift = 24; shift >= 0; shift -= 8) {
+        result.output.push_back(static_cast<char>((value64 >> shift) & 0xff));
+      }
+      n = 0;
+    }
+  }
+  if (n != 0) result.ok = false;
+  return result;
+}
+
 }  // namespace encoding

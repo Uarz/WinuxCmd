@@ -296,9 +296,11 @@ auto format_help_text(std::string_view name, std::string_view synopsis,
               ? "common.option." +
                     std::string(opt.long_name == "--help" ? "help" : "version")
               : "command." + std::string(name) + ".option." +
-                    (opt.long_name.empty()
+                    (!opt.long_name.empty()
+                         ? std::string(opt.long_name.substr(2))
+                     : opt.short_name.size() > 1
                          ? std::string(opt.short_name.substr(1))
-                         : std::string(opt.long_name.substr(2)));
+                         : std::string("arg"));
       const auto translated_option =
           winux::i18n::translate(option_key, opt.description);
 

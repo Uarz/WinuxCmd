@@ -280,11 +280,13 @@ TEST(diff, diff_missing_input_reports_no_such_file) {
 
   auto r = p.run();
 
-  EXPECT_EQ(r.exit_code, 1);
+  // [GNU] An unreadable operand is "trouble": exit 2 with
+  // "diff: <path>: No such file or directory" (0=same, 1=differ, 2=trouble).
+  EXPECT_EQ(r.exit_code, 2);
   EXPECT_TRUE(r.stdout_text.empty());
-  EXPECT_TRUE(r.stderr_text.find(
-                  "diff: cannot open 'missing.txt' for reading: No such file "
-                  "or directory") != std::string::npos);
+  EXPECT_TRUE(
+      r.stderr_text.find("diff: missing.txt: No such file or directory") !=
+      std::string::npos);
 }
 
 TEST(diff, diff_directory_input_reports_is_a_directory) {
@@ -298,8 +300,32 @@ TEST(diff, diff_directory_input_reports_is_a_directory) {
 
   auto r = p.run();
 
-  EXPECT_EQ(r.exit_code, 1);
+  // [GNU] A directory operand is rewritten to "<dir>/<basename of peer>":
+  // "diff indir file2.txt" compares indir/file2.txt with file2.txt, so a
+  // missing member reports "diff: indir/file2.txt: No such file or
+  // directory" and exits 2.
+  EXPECT_EQ(r.exit_code, 2);
   EXPECT_TRUE(r.stdout_text.empty());
-  EXPECT_TRUE(r.stderr_text.find("diff: indir: Is a directory") !=
-              std::string::npos);
+  EXPECT_TRUE(
+      r.stderr_text.find("diff: indir/file2.txt: No such file or directory") !=
+      std::string::npos);
+}
+
+TEST(diff, diff_directory_operand_compares_member_file) {
+  TempDir tmp;
+  tmp.mkdir("indir");
+  tmp.write("indir/file2.txt", "inner\n");
+  tmp.write("file2.txt", "hello\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"diff.exe", {L"indir", L"file2.txt"});
+
+  auto r = p.run();
+
+  // [GNU] "diff dir file" compares dir/file with file: a differing member
+  // produces a normal diff body and exit 1.
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stdout_text.find("< inner") != std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("> hello") != std::string::npos);
 }

@@ -35,6 +35,8 @@
 #include <cstdio>
 
 #include "core/command_macros.h"
+#include "utils/gnu_float80.hpp"
+#include "utils/gnu_quotearg.hpp"
 import std;
 import core;
 import utils;
@@ -87,29 +89,11 @@ int hex_value(char c) {
   return -1;
 }
 
+// GNU printf %q is quotearg's shell_escape_quoting_style: arguments that
+// need no quoting stay bare, others get '...' with $'\ooo' escapes for
+// unprintable bytes (and the GNU reprocess quirk when '\'' is present).
 auto shell_quote(std::string_view value) -> std::string {
-  bool needs_quotes = false;
-  for (unsigned char ch : value) {
-    if (!(std::isalnum(ch) || ch == '_' || ch == '-' || ch == '.' ||
-          ch == '/')) {
-      needs_quotes = true;
-      break;
-    }
-  }
-  if (!needs_quotes) return std::string(value);
-
-  std::string quoted;
-  quoted.reserve(value.size() + 2);
-  quoted.push_back('\'');
-  for (char ch : value) {
-    if (ch == '\'') {
-      quoted += "'\\\\''";
-    } else {
-      quoted.push_back(ch);
-    }
-  }
-  quoted.push_back('\'');
-  return quoted;
+  return gnu_quotearg::shell_escape_quote(value);
 }
 
 bool is_octal_digit(char c) { return c >= '0' && c <= '7'; }
@@ -463,37 +447,35 @@ unsigned long long parse_unsigned_argument(
   return value;
 }
 
-double parse_float_argument(const std::vector<std::string_view>& args,
-                            size_t& arg_index, bool& had_error) {
-  if (arg_index >= args.size()) return 0.0;
+// GNU printf parses float arguments with strtold() and formats them as
+// long double (80-bit extended on x86-64).  MSVC's long double is a
+// 64-bit double, so the emulated type in utils/gnu_float80.hpp is used;
+// it is what makes e.g. '%.2e' 2.455 print 2.45e+00 like glibc.
+gnu_float80::Ext80 parse_float_argument(
+    const std::vector<std::string_view>& args, size_t& arg_index,
+    bool& had_error) {
+  if (arg_index >= args.size()) return {};
 
   std::string arg(args[arg_index++]);
   long long character_value = 0;
   if (consume_character_constant(arg, character_value, had_error)) {
-    return static_cast<double>(character_value);
+    return gnu_float80::from_i64(character_value);
   }
 
-  errno = 0;
-  char* end = nullptr;
-  double value = std::strtod(arg.c_str(), &end);
+  const char* end = nullptr;
+  bool range_err = false;
+  gnu_float80::Ext80 value = gnu_float80::parse(arg, end, range_err);
   if (end == arg.c_str()) {
     warn_numeric(arg, "expected a numeric value", had_error);
-    return 0.0;
+    return {};
   }
-  if (errno == ERANGE) {
+  if (range_err) {
     warn_numeric(arg, "Numerical result out of range", had_error);
   } else if (*end != '\0') {
     warn_numeric(arg, "value not completely converted", had_error);
   }
   return value;
 }
-
-// [GNU] Floating-point rounding note (WinuxCmd#984): the MSVC/UCRT printf
-// rounds "%.2e 2.455" against the double's exact binary value
-// (2.4550000000000000710... -> 2.46e+00), matching glibc (WSL GNU 9.4,
-// the differential-test oracle). Git Bash's coreutils links against
-// newlib, whose dtoa misrounds this case to 2.45e+00; that newlib artifact
-// is what the issue report captured. No pre-rounding is applied here.
 std::string render_directive(const FormatSpec& spec,
                              const std::vector<std::string_view>& args,
                              size_t& arg_index, bool& had_error,
@@ -517,6 +499,8 @@ std::string render_directive(const FormatSpec& spec,
       return format_string_bytes(std::move(escaped.text), spec);
     }
     case 'q': {
+      // GNU %q prints nothing at all when the argument is missing.
+      if (arg_index >= args.size()) return "";
       auto value = consume_string_argument(args, arg_index);
       return format_string_bytes(shell_quote(value), spec);
     }
@@ -544,10 +528,29 @@ std::string render_directive(const FormatSpec& spec,
     case 'g':
     case 'G':
     case 'a':
-    case 'A':
-      return format_with_snprintf(
-          normalized_format(spec, spec.conversion),
-          parse_float_argument(args, arg_index, had_error));
+    case 'A': {
+      gnu_float80::FormatOpts opts;
+      opts.conv = spec.conversion;
+      if (spec.has_precision) {
+        size_t p = parse_count(spec.precision, 0);
+        opts.precision =
+            p > static_cast<size_t>(std::numeric_limits<int>::max())
+                ? std::numeric_limits<int>::max()
+                : static_cast<int>(p);
+      }
+      size_t w = parse_count(spec.width, 0);
+      opts.width = w > static_cast<size_t>(std::numeric_limits<int>::max())
+                       ? std::numeric_limits<int>::max()
+                       : static_cast<int>(w);
+      opts.left = spec.left_adjust;
+      opts.plus = spec.flags.find('+') != std::string_view::npos;
+      opts.space = spec.flags.find(' ') != std::string_view::npos;
+      opts.alt = spec.flags.find('#') != std::string_view::npos;
+      opts.zero_pad =
+          !opts.left && spec.flags.find('0') != std::string_view::npos;
+      return gnu_float80::format(
+          parse_float_argument(args, arg_index, had_error), opts);
+    }
     default:
       return "%" + std::string(1, spec.conversion);
   }

@@ -33,7 +33,8 @@ TEST(dircolors, dircolors_print_database) {
   // Should output the default color database
   EXPECT_TRUE(r.stdout_text.find("Configuration file for dircolors") !=
               std::string::npos);
-  EXPECT_TRUE(r.stdout_text.find("di 01;34") != std::string::npos);
+  // [GNU] -p prints the built-in database with long-form keywords.
+  EXPECT_TRUE(r.stdout_text.find("DIR 01;34") != std::string::npos);
 }
 
 TEST(dircolors, dircolors_print_ls_colors) {

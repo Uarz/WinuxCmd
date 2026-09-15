@@ -410,3 +410,64 @@ TEST(readlink, readlink_symlink_target_if_available) {
   auto expected = normalize_path_text((tmp.path / "target.txt").string());
   EXPECT_EQ_TEXT(normalize_path_text(r.stdout_text), expected + "\n");
 }
+
+TEST(readlink, readlink_f_resolves_dangling_leaf_target) {
+  TempDir tmp;
+
+  std::filesystem::path link = tmp.path / "dang";
+  if (!create_symlink_or_skip(link, std::filesystem::path(L"z_absent_tgt"))) {
+    return;
+  }
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"readlink.exe", {L"-f", L"dang"});
+  auto r = p.run();
+
+  // [GNU] readlink -f resolves a dangling leaf link to its target's path,
+  // exit 0 (uutils#6688 follow-up).
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stdout_text.find("z_absent_tgt") != std::string::npos);
+}
+
+TEST(readlink, readlink_e_fails_on_dangling_leaf_target) {
+  TempDir tmp;
+
+  std::filesystem::path link = tmp.path / "dang";
+  if (!create_symlink_or_skip(link, std::filesystem::path(L"z_absent_tgt"))) {
+    return;
+  }
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"readlink.exe", {L"-e", L"dang"});
+  auto r = p.run();
+
+  // [GNU] readlink -e requires the resolved target to exist: exit 1.
+  EXPECT_EQ(r.exit_code, 1);
+}
+
+TEST(readlink, readlink_f_resolves_intermediate_symlink) {
+  TempDir tmp;
+  std::filesystem::create_directory(tmp.path / "real");
+  tmp.write("real/f.txt", "content");
+
+  std::filesystem::path link = tmp.path / "ldir";
+  std::wstring mklink = L"cmd /d /c mklink /d \"" + link.wstring() + L"\" \"" +
+                        (tmp.path / "real").wstring() + L"\" >nul";
+  if (_wsystem(mklink.c_str()) != 0) {
+    std::cout << "  SKIPPED (mklink /d failed)\n";
+    return;
+  }
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"readlink.exe", {L"-f", L"ldir/f.txt"});
+  auto r = p.run();
+
+  // [GNU] -f resolves every component: "ldir/f.txt" -> ".../real/f.txt".
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stdout_text.find("real") != std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("f.txt") != std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("ldir") == std::string::npos);
+}

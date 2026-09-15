@@ -74,6 +74,34 @@ std::string get_system_locale() {
   return "C";
 }
 
+// The locale name the environment selects, in the POSIX precedence order
+// (LC_ALL overrides LC_CTYPE overrides LANG). Empty when none is set.
+std::string effective_locale_name() {
+  for (const char* name : {"LC_ALL", "LC_CTYPE", "LANG"}) {
+    const char* value = std::getenv(name);
+    if (value != nullptr && *value != '\0') {
+      return value;
+    }
+  }
+  return {};
+}
+
+// [GNU] Codeset of the locale selected by the environment.
+//
+// GNU `locale charmap` answers from the POSIX locale database, so LC_ALL=C
+// yields ANSI_X3.4-1968 (pure ASCII) while LC_ALL=C.UTF-8 yields UTF-8. Windows
+// ships no such database, but the C/POSIX case is fully determined: it is
+// ASCII, and a WinuxCmd that ignored the environment answered "UTF-8" there -
+// a semantic difference from GNU, not a formatting one. Unknown and unset
+// locales keep the process codeset.
+std::string effective_codeset() {
+  const std::string locale = effective_locale_name();
+  if (locale == "C" || locale == "POSIX") {
+    return "ANSI_X3.4-1968";
+  }
+  return "UTF-8";
+}
+
 // Get all available locales
 std::vector<std::string> get_available_locales() {
   std::vector<std::string> locales;
@@ -194,9 +222,9 @@ REGISTER_COMMAND(locale,
       const auto keyword = std::string(ctx.positionals.front());
       const auto value = get_system_locale();
       if (keyword == "charmap") {
-        safePrintLn("charmap=UTF-8");
+        safePrintLn("charmap=" + effective_codeset());
       } else if (keyword == "codeset") {
-        safePrintLn("codeset=UTF-8");
+        safePrintLn("codeset=" + effective_codeset());
       } else if (keyword == "collate") {
         safePrintLn("collate=" + value);
       } else if (keyword == "ctype") {
@@ -237,8 +265,8 @@ REGISTER_COMMAND(locale,
           "LC_MESSAGES="
           " + get_system_locale() + "
           "");
-      safePrintLn("charmap=UTF-8");
-      safePrintLn("codeset=UTF-8");
+      safePrintLn("charmap=" + effective_codeset());
+      safePrintLn("codeset=" + effective_codeset());
     }
     return 0;
   }
@@ -247,7 +275,7 @@ REGISTER_COMMAND(locale,
     const auto keyword = std::string(ctx.positionals.front());
     const auto value = get_system_locale();
     if (keyword == "charmap") {
-      safePrintLn("UTF-8");
+      safePrintLn(effective_codeset());
       return 0;
     }
     if (keyword == "default_language") {
@@ -263,7 +291,7 @@ REGISTER_COMMAND(locale,
       return 0;
     }
     if (keyword == "codeset") {
-      safePrintLn("UTF-8");
+      safePrintLn(effective_codeset());
       return 0;
     }
     if (keyword == "yesexpr") {

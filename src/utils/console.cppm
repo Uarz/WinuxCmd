@@ -50,6 +50,7 @@ thread_local HANDLE g_cached_stderr = INVALID_HANDLE_VALUE;
 thread_local bool g_handles_valid = false;
 thread_local bool g_stdout_pipe_closed = false;
 thread_local bool g_stderr_pipe_closed = false;
+thread_local DWORD g_stdout_write_error = 0;
 thread_local bool g_stdout_is_console = false;
 thread_local bool g_stderr_is_console = false;
 thread_local bool g_console_checked = false;
@@ -87,6 +88,19 @@ HANDLE getStdErr() {
 
 bool isBrokenPipeError(DWORD err) {
   return err == ERROR_BROKEN_PIPE || err == ERROR_NO_DATA;
+}
+
+// Record a failed write to stdout. A broken pipe maps to GNU's SIGPIPE
+// death (the command exits quietly); any other failure — for example
+// ERROR_INVALID_HANDLE when the caller closed stdout (`>&-`) — is a fatal
+// "write error" the command is expected to report.
+void note_stdout_write_failure() {
+  const DWORD err = GetLastError();
+  if (isBrokenPipeError(err)) {
+    g_stdout_pipe_closed = true;
+  } else if (err != ERROR_SUCCESS) {
+    g_stdout_write_error = err;
+  }
 }
 
 bool env_var_present(const char* name) {
@@ -143,9 +157,31 @@ export bool is_stdout_pipe_closed() { return g_stdout_pipe_closed; }
 
 export bool is_stderr_pipe_closed() { return g_stderr_pipe_closed; }
 
+// True once a stdout write failed for a reason other than a closed pipe
+// (broken-pipe failures raise is_stdout_pipe_closed() instead). Commands
+// that stream output should treat this as fatal: GNU reports a "write
+// error" diagnostic and exits non-zero rather than silently dropping data.
+export bool is_stdout_write_failed() { return g_stdout_write_error != 0; }
+
+// The Win32 error code recorded by the first failed stdout write; 0 when
+// is_stdout_write_failed() is false.
+export DWORD stdout_write_error() { return g_stdout_write_error; }
+
+// Byte counter for `ls --dired`: GNU emits "//DIRED//" trailer lines with
+// the byte offsets of each filename in the output stream.  Counting is
+// opt-in (set_stdout_byte_counting) so the extra UTF-8 length computation
+// on the console path is only paid while a listing is running.
+thread_local uint64_t g_stdout_bytes_written = 0;
+thread_local bool g_count_stdout_bytes = false;
+
+export void set_stdout_byte_counting(bool on) { g_count_stdout_bytes = on; }
+
+export uint64_t stdout_bytes_written() { return g_stdout_bytes_written; }
+
 export void clear_pipe_closed_flags() {
   g_stdout_pipe_closed = false;
   g_stderr_pipe_closed = false;
+  g_stdout_write_error = 0;
 }
 
 bool isConsoleHandle(HANDLE h) {
@@ -429,31 +465,53 @@ class wchar_buffer {
 // Wide string overloads (zero conversion)
 // ----------------------------------------------------------------------------
 export void safePrint(std::wstring_view wsv) {
+  std::string utf8 = wstring_to_utf8(wsv);
+  // L"..." literals are cataloged by the same legacy-key scheme; narrow the
+  // text, look it up, and emit the translation when one exists.
+  const auto translated = winux::i18n::translate_legacy(utf8);
   HANDLE h = getStdOut();
   if (isStdoutConsole()) {
-    if (!detail::writeConsoleW(h, wsv.data(), wsv.size()) &&
+    if (translated != utf8) {
+      const std::wstring wide = utf8_to_wstring(translated);
+      if (!detail::writeConsoleW(h, wide.data(), wide.size()) &&
+          isBrokenPipeError(GetLastError())) {
+        g_stdout_pipe_closed = true;
+      }
+    } else if (!detail::writeConsoleW(h, wsv.data(), wsv.size()) &&
+               isBrokenPipeError(GetLastError())) {
+      g_stdout_pipe_closed = true;
+    }
+    if (g_count_stdout_bytes) {
+      g_stdout_bytes_written += translated.size();
+    }
+  } else {
+    if (!detail::writeFile(h, translated.data(), translated.size()) &&
         isBrokenPipeError(GetLastError())) {
       g_stdout_pipe_closed = true;
     }
-  } else {
-    std::string utf8 = wstring_to_utf8(wsv);
-    if (!detail::writeFile(h, utf8.data(), utf8.size()) &&
-        isBrokenPipeError(GetLastError())) {
-      g_stdout_pipe_closed = true;
+    if (g_count_stdout_bytes) {
+      g_stdout_bytes_written += translated.size();
     }
   }
 }
 
 export void safeErrorPrint(std::wstring_view wsv) {
+  std::string utf8 = wstring_to_utf8(wsv);
+  const auto translated = winux::i18n::translate_legacy(utf8);
   HANDLE h = getStdErr();
   if (isStderrConsole()) {
-    if (!detail::writeConsoleW(h, wsv.data(), wsv.size()) &&
-        isBrokenPipeError(GetLastError())) {
+    if (translated != utf8) {
+      const std::wstring wide = utf8_to_wstring(translated);
+      if (!detail::writeConsoleW(h, wide.data(), wide.size()) &&
+          isBrokenPipeError(GetLastError())) {
+        g_stderr_pipe_closed = true;
+      }
+    } else if (!detail::writeConsoleW(h, wsv.data(), wsv.size()) &&
+               isBrokenPipeError(GetLastError())) {
       g_stderr_pipe_closed = true;
     }
   } else {
-    std::string utf8 = wstring_to_utf8(wsv);
-    if (!detail::writeFile(h, utf8.data(), utf8.size()) &&
+    if (!detail::writeFile(h, translated.data(), translated.size()) &&
         isBrokenPipeError(GetLastError())) {
       g_stderr_pipe_closed = true;
     }
@@ -490,6 +548,9 @@ export void safePrint(std::string_view sv) {
         isBrokenPipeError(GetLastError())) {
       g_stdout_pipe_closed = true;
     }
+  }
+  if (g_count_stdout_bytes) {
+    g_stdout_bytes_written += sv.size();
   }
 }
 

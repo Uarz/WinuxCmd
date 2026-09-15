@@ -199,4 +199,144 @@ TEST(unexpand, unexpand_tab_stop_error_messages_match_gnu) {
   ascending.add(L"unexpand.exe", {L"-t", L"4,2"});
   EXPECT_EQ_TEXT(ascending.run().stderr_text,
                  "unexpand: tab sizes must be ascending\n");
+
+  Pipeline large;
+  large.add(L"unexpand.exe", {L"-t", L"99999999999999999999"});
+  auto large_result = large.run();
+  EXPECT_EQ(large_result.exit_code, 1);
+  EXPECT_EQ_TEXT(large_result.stderr_text,
+                 "unexpand: tab stop is too large '99999999999999999999'\n");
+}
+
+// Audit regression: an in-range huge tab interval must not break conversion
+// of ordinary input — 'a' is not a blank, so nothing is rewritten and no
+// giant tab column is ever reached.
+TEST(unexpand, unexpand_huge_tab_stop_handles_short_input) {
+  Pipeline p;
+  p.set_stdin("a\n");
+  p.add(L"unexpand.exe", {L"-t", L"999999999999"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "a\n");
+}
+
+// Leading blanks that never reach the huge tab stop pass through verbatim.
+TEST(unexpand, unexpand_huge_tab_stop_preserves_leading_blanks) {
+  Pipeline p;
+  p.set_stdin("   x\n");
+  p.add(L"unexpand.exe", {L"-t", L"999999999999"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "   x\n");
+}
+
+// [GNU] obsolescent -NUM options select tab stops without implying -a;
+// consecutive digit options accumulate one value, so "-4 -8" is stop 48
+// and "-48" matches it (#1082).
+TEST(unexpand, unexpand_obsolete_numeric_options) {
+  Pipeline stop_one;
+  stop_one.set_stdin("    x\n");
+  stop_one.add(L"unexpand.exe", {L"-1"});
+  auto stop_one_result = stop_one.run();
+  EXPECT_EQ(stop_one_result.exit_code, 0);
+  EXPECT_EQ_TEXT(stop_one_result.stdout_text, "\t\t\t\tx\n");
+
+  Pipeline stop_nine;
+  stop_nine.set_stdin("    x\n");
+  stop_nine.add(L"unexpand.exe", {L"-9"});
+  auto stop_nine_result = stop_nine.run();
+  EXPECT_EQ(stop_nine_result.exit_code, 0);
+  EXPECT_EQ_TEXT(stop_nine_result.stdout_text, "    x\n");
+
+  // The digit form does not imply -a, so mid-line blanks are untouched.
+  Pipeline leading_only;
+  leading_only.set_stdin("a        b\n");
+  leading_only.add(L"unexpand.exe", {L"-4"});
+  auto leading_only_result = leading_only.run();
+  EXPECT_EQ(leading_only_result.exit_code, 0);
+  EXPECT_EQ_TEXT(leading_only_result.stdout_text, "a        b\n");
+
+  Pipeline leading_stop;
+  leading_stop.set_stdin("         x\n");
+  leading_stop.add(L"unexpand.exe", {L"-4"});
+  auto leading_stop_result = leading_stop.run();
+  EXPECT_EQ(leading_stop_result.exit_code, 0);
+  EXPECT_EQ_TEXT(leading_stop_result.stdout_text, "\t\t x\n");
+}
+
+TEST(unexpand, unexpand_numeric_options_accumulate_one_stop) {
+  // [GNU] "-4 -8" accumulates the digits into tab stop 48, identical to
+  // "-48"; nine leading blanks never reach it.
+  Pipeline separate;
+  separate.set_stdin("         x\n");
+  separate.add(L"unexpand.exe", {L"-4", L"-8"});
+  auto separate_result = separate.run();
+  EXPECT_EQ(separate_result.exit_code, 0);
+  EXPECT_EQ_TEXT(separate_result.stdout_text, "         x\n");
+
+  Pipeline glued;
+  glued.set_stdin("         x\n");
+  glued.add(L"unexpand.exe", {L"-48"});
+  auto glued_result = glued.run();
+  EXPECT_EQ(glued_result.exit_code, 0);
+  EXPECT_EQ_TEXT(glued_result.stdout_text, "         x\n");
+}
+
+TEST(unexpand, unexpand_numeric_stops_mix_with_dash_t_in_gnu_order) {
+  // [GNU] a pending digit value flushes after the whole option list, so a
+  // -t spec lands first and both orderings fail as non-ascending.
+  Pipeline num_first;
+  num_first.add(L"unexpand.exe", {L"-4", L"-t", L"8"});
+  auto num_first_result = num_first.run();
+  EXPECT_EQ(num_first_result.exit_code, 1);
+  EXPECT_EQ_TEXT(num_first_result.stderr_text,
+                 "unexpand: tab sizes must be ascending\n");
+
+  Pipeline t_first;
+  t_first.add(L"unexpand.exe", {L"-t", L"8", L"-4"});
+  auto t_first_result = t_first.run();
+  EXPECT_EQ(t_first_result.exit_code, 1);
+  EXPECT_EQ_TEXT(t_first_result.stderr_text,
+                 "unexpand: tab sizes must be ascending\n");
+}
+
+// [GNU] mid-line blanks that land on or cross a tab stop convert when -a or
+// -t selects whole-line conversion, including a run crossing a stop by a
+// single column (#1012).
+TEST(unexpand, unexpand_converts_mid_line_blanks_crossing_tab_stops) {
+  Pipeline crossing;
+  crossing.set_stdin("abcdefg  x\n");
+  crossing.add(L"unexpand.exe", {L"-a"});
+  auto crossing_result = crossing.run();
+  EXPECT_EQ(crossing_result.exit_code, 0);
+  EXPECT_EQ_TEXT(crossing_result.stdout_text, "abcdefg\t x\n");
+
+  Pipeline implied_all;
+  implied_all.set_stdin("x  y\n");
+  implied_all.add(L"unexpand.exe", {L"-t", L"3"});
+  auto implied_all_result = implied_all.run();
+  EXPECT_EQ(implied_all_result.exit_code, 0);
+  EXPECT_EQ_TEXT(implied_all_result.stdout_text, "x\ty\n");
+
+  Pipeline custom_stops;
+  custom_stops.set_stdin("   x   y   z\n");
+  custom_stops.add(L"unexpand.exe", {L"-t", L"3"});
+  auto custom_stops_result = custom_stops.run();
+  EXPECT_EQ(custom_stops_result.exit_code, 0);
+  EXPECT_EQ_TEXT(custom_stops_result.stdout_text, "\tx\t y\t  z\n");
+}
+
+TEST(unexpand, unexpand_finite_tab_list_stops_converting_after_last) {
+  // [GNU] with a finite list there is no stop beyond the last one, so the
+  // remaining blanks stay verbatim.
+  Pipeline p;
+  p.set_stdin("         x\n");
+  p.add(L"unexpand.exe", {L"-t", L"3,6"});
+  auto r = p.run();
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "\t\t   x\n");
 }

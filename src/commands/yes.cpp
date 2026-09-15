@@ -32,6 +32,9 @@
 
 #include "core/command_macros.h"
 #include "pch/pch.h"
+// include other header after pch.h
+#include <fcntl.h>
+#include <io.h>
 
 import std;
 import core;
@@ -98,6 +101,12 @@ std::optional<size_t> test_repeat_limit() {
 }
 
 auto run(const Config& cfg) -> int {
+#ifdef _WIN32
+  // [GNU] yes writes raw bytes: keep stdout in binary mode so '\n' is not
+  // translated to CRLF and argument bytes pass through unmodified.
+  _setmode(_fileno(stdout), _O_BINARY);
+#endif
+
   if (auto limit = test_repeat_limit()) {
     std::string line = cfg.output + "\n";
     for (size_t i = 0; i < *limit; ++i) {

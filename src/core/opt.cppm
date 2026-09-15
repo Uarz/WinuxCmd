@@ -125,6 +125,10 @@ export struct OptionParsePolicy {
   // Stop option parsing after this many positional operands. A value of zero
   // keeps the traditional parser behavior.
   size_t stop_options_after_positionals = 0;
+  // [GNU] fmt accepts the obsolete "-WIDTH" width form only in argv[1]; a
+  // digit option anywhere else is diagnosed by fmt.c itself as
+  //   invalid option -- N; -WIDTH is recognized only when it is the first
+  bool obsolete_numeric_width_hint = false;
 };
 
 export ParseResultRuntime parse_command_runtime(
@@ -147,15 +151,40 @@ export ParseResultRuntime parse_command_runtime(
     return value;
   };
 
+  // [GNU] getopt diagnostics: short options use
+  //   "invalid option -- 'x'" / "option requires an argument -- 'x'"
+  // while long options use
+  //   "unrecognized option '--x'" / "option '--x' requires an argument".
   auto set_unrecognized_option = [&](std::string_view option) -> void {
     result.ok = false;
-    result.error_message = "unrecognized option '" + std::string(option) + "'";
+    if (policy.obsolete_numeric_width_hint && option.size() >= 2 &&
+        option[0] == '-' && option[1] != '-' &&
+        std::isdigit(static_cast<unsigned char>(option[1]))) {
+      // [GNU] fmt.c diagnoses a digit option outside argv[1] itself rather
+      // than via getopt, so the message carries no quotes and adds the hint.
+      result.error_message = "invalid option -- " +
+                             std::string(option.substr(1, 1)) +
+                             "; -WIDTH is recognized only when it is the first";
+      return;
+    }
+    if (!option.starts_with("--") && option.size() >= 2 && option[0] == '-') {
+      result.error_message =
+          "invalid option -- '" + std::string(option.substr(1, 1)) + "'";
+    } else {
+      result.error_message =
+          "unrecognized option '" + std::string(option) + "'";
+    }
   };
 
   auto set_missing_argument = [&](std::string_view option) -> void {
     result.ok = false;
-    result.error_message =
-        "option '" + std::string(option) + "' requires an argument";
+    if (!option.starts_with("--") && option.size() >= 2 && option[0] == '-') {
+      result.error_message = "option requires an argument -- '" +
+                             std::string(option.substr(1, 1)) + "'";
+    } else {
+      result.error_message =
+          "option '" + std::string(option) + "' requires an argument";
+    }
   };
 
   auto set_invalid_argument = [&](std::string_view option,
@@ -213,8 +242,33 @@ export ParseResultRuntime parse_command_runtime(
       }
 
       if (!meta) {
-        set_unrecognized_option(name);
-        return result;
+        // GNU getopt_long accepts an unambiguous abbreviation of a long
+        // option and reports every candidate when it is ambiguous.
+        std::vector<std::string_view> possibilities;
+        for (const auto& m : metas) {
+          if (m.long_name.size() > name.size() &&
+              m.long_name.starts_with(name)) {
+            possibilities.push_back(m.long_name);
+            if (!meta) meta = &m;
+          }
+        }
+        if (possibilities.size() != 1) {
+          meta = nullptr;
+          if (possibilities.empty()) {
+            set_unrecognized_option(name);
+          } else {
+            std::string msg = "option '" + std::string(name) +
+                              "' is ambiguous; possibilities:";
+            for (std::string_view p : possibilities) {
+              msg += " '";
+              msg.append(p);
+              msg += "'";
+            }
+            result.ok = false;
+            result.error_message = std::move(msg);
+          }
+          return result;
+        }
       }
 
       size_t idx = meta->index;

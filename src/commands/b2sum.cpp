@@ -50,17 +50,17 @@ auto constexpr B2SUM_OPTIONS = std::array{
     OPTION("-b", "--binary", "read in binary mode (default)", BOOL_TYPE),
     // [GNU]
     OPTION("-c", "--check", "read BLAKE2 sums from the FILEs and check them",
-           STRING_TYPE),
+           BOOL_TYPE),
     // [GNU]
     OPTION("", "--ignore-missing",
            "don't fail or report status for missing files", BOOL_TYPE),
     // [GNU]
     OPTION("-t", "--text", "read in text mode", BOOL_TYPE),
     // [GNU]
-    OPTION("-q", "--quiet",
-           "don't print OK for each successfully verified file", BOOL_TYPE),
+    OPTION("", "--quiet", "don't print OK for each successfully verified file",
+           BOOL_TYPE),
     // [GNU]
-    OPTION("-s", "--status", "don't output anything, status code shows success",
+    OPTION("", "--status", "don't output anything, status code shows success",
            BOOL_TYPE),
     // [GNU]
     OPTION("-w", "--warn", "warn about improperly formatted checksum lines",
@@ -89,13 +89,7 @@ struct Config {
   bool zero = false;
   bool strict = false;
   bool ignore_missing = false;
-  std::string check_file;
   SmallVector<std::string, 64> files;
-};
-
-struct CheckLine {
-  std::string expected_hash;
-  std::string filename;
 };
 
 auto build_config(const CommandContext<B2SUM_OPTIONS.size()>& ctx)
@@ -128,22 +122,72 @@ auto build_config(const CommandContext<B2SUM_OPTIONS.size()>& ctx)
     }
   }
 
-  auto check_opt = ctx.get<std::string>("--check", "");
-  if (check_opt.empty()) {
-    check_opt = ctx.get<std::string>("-c", "");
-  }
-  cfg.check_mode = !check_opt.empty();
-  if (cfg.check_mode) {
-    cfg.check_file = check_opt;
-  }
-
-  cfg.quiet = ctx.get<bool>("--quiet", false) || ctx.get<bool>("-q", false);
-  cfg.status = ctx.get<bool>("--status", false) || ctx.get<bool>("-s", false);
-  cfg.warn = ctx.get<bool>("--warn", false) || ctx.get<bool>("-w", false);
+  cfg.check_mode =
+      ctx.get<bool>("--check", false) || ctx.get<bool>("-c", false);
   cfg.tag = ctx.get<bool>("--tag", false);
   cfg.zero = ctx.get<bool>("--zero", false) || ctx.get<bool>("-z", false);
   cfg.strict = ctx.get<bool>("--strict", false);
   cfg.ignore_missing = ctx.get<bool>("--ignore-missing", false);
+
+  // [GNU] the last of --status/--warn/--quiet wins and resets the other two
+  // (getopt cases STATUS_OPTION/'w'/QUIET_OPTION in src/cksum.c).
+  for (const auto& occurrence : ctx.options.occurrences()) {
+    const auto& meta = (*ctx.metas)[occurrence.index];
+    if (meta.long_name == "--status") {
+      cfg.status = true;
+      cfg.warn = false;
+      cfg.quiet = false;
+    } else if (meta.long_name == "--warn") {
+      cfg.status = false;
+      cfg.warn = true;
+      cfg.quiet = false;
+    } else if (meta.long_name == "--quiet") {
+      cfg.status = false;
+      cfg.warn = false;
+      cfg.quiet = true;
+    }
+  }
+
+  // [GNU] option-conflict checks, in src/cksum.c main() order.
+  const bool mode_seen = ctx.has("-b") || ctx.has("--binary") ||
+                         ctx.has("-t") || ctx.has("--text");
+  if (cfg.zero && cfg.check_mode) {
+    return std::unexpected(
+        "the --zero option is not supported when verifying checksums");
+  }
+  if (cfg.tag && cfg.check_mode) {
+    return std::unexpected(
+        "the --tag option is meaningless when verifying checksums");
+  }
+  if (mode_seen && cfg.check_mode) {
+    return std::unexpected(
+        "the --binary and --text options are meaningless when verifying "
+        "checksums");
+  }
+  if (cfg.ignore_missing && !cfg.check_mode) {
+    return std::unexpected(
+        "the --ignore-missing option is meaningful only when verifying "
+        "checksums");
+  }
+  if (cfg.status && !cfg.check_mode) {
+    return std::unexpected(
+        "the --status option is meaningful only when verifying checksums");
+  }
+  if (cfg.warn && !cfg.check_mode) {
+    return std::unexpected(
+        "the --warn option is meaningful only when verifying checksums");
+  }
+  if (cfg.quiet && !cfg.check_mode) {
+    return std::unexpected(
+        "the --quiet option is meaningful only when verifying checksums");
+  }
+  if (cfg.strict && !cfg.check_mode) {
+    return std::unexpected(
+        "the --strict option is meaningful only when verifying checksums");
+  }
+  if (cfg.tag && cfg.text_mode) {
+    return std::unexpected("--tag does not support --text mode");
+  }
 
   for (auto arg : ctx.positionals) {
     std::string file_arg(arg);
@@ -152,7 +196,8 @@ auto build_config(const CommandContext<B2SUM_OPTIONS.size()>& ctx)
     }
   }
 
-  if (cfg.files.empty() && !cfg.check_mode) {
+  // [GNU] with no FILE operand both modes default to standard input.
+  if (cfg.files.empty()) {
     cfg.files.push_back("-");
   }
 
@@ -160,13 +205,7 @@ auto build_config(const CommandContext<B2SUM_OPTIONS.size()>& ctx)
 }
 
 auto input_open_error(const std::string& filename) -> std::string {
-  std::error_code ec;
-  if (std::filesystem::is_directory(std::filesystem::u8path(filename), ec) &&
-      !ec) {
-    return "cannot open '" + filename + "' for reading: Is a directory";
-  }
-  return "cannot open '" + filename +
-         "' for reading: No such file or directory";
+  return filename + ": " + portable_digest::open_error_reason(filename);
 }
 
 auto calculate_hash(const std::string& filename, bool text_mode = false,
@@ -175,191 +214,24 @@ auto calculate_hash(const std::string& filename, bool text_mode = false,
                                         filename, text_mode, digest_bytes);
 }
 
-auto parse_check_line(const std::string& line) -> std::optional<CheckLine> {
-  if (line.empty()) {
-    return std::nullopt;
-  }
-
-  size_t eq_pos = line.find(" = ");
-  if (eq_pos != std::string::npos &&
-      (line.rfind("BLAKE2 (", 0) == 0 || line.rfind("BLAKE2b (", 0) == 0 ||
-       line.rfind("BLAKE2b-", 0) == 0)) {
-    size_t paren = line.find(" (");
-    if (paren == std::string::npos || paren >= eq_pos) {
-      return std::nullopt;
-    }
-    std::string filename = line.substr(paren + 2, eq_pos - (paren + 2));
-    if (!filename.empty() && filename.front() == '(') {
-      filename.erase(filename.begin());
-    }
-    if (!filename.empty() && filename.back() == ')') {
-      filename.pop_back();
-    }
-    std::string expected_hash = line.substr(eq_pos + 3);
-    if (!filename.empty() && !expected_hash.empty() &&
-        expected_hash.size() <= 128 && expected_hash.size() % 2 == 0) {
-      for (char ch : expected_hash) {
-        if (!std::isxdigit(static_cast<unsigned char>(ch))) {
-          return std::nullopt;
-        }
-      }
-      return CheckLine{expected_hash, filename};
-    }
-    return std::nullopt;
-  }
-
-  size_t marker_pos = std::string::npos;
-  size_t sep_pos = line.find("  ");
-  if (sep_pos != std::string::npos) {
-    marker_pos = sep_pos;
-  } else {
-    sep_pos = line.find(" *");
-    if (sep_pos != std::string::npos) {
-      marker_pos = sep_pos;
-    }
-  }
-  if (marker_pos == std::string::npos || marker_pos == 0) {
-    return std::nullopt;
-  }
-
-  std::string expected_hash = line.substr(0, marker_pos);
-  if (expected_hash.empty() || expected_hash.size() > 128 ||
-      expected_hash.size() % 2 != 0) {
-    return std::nullopt;
-  }
-  for (char ch : expected_hash) {
-    if (!std::isxdigit(static_cast<unsigned char>(ch))) {
-      return std::nullopt;
-    }
-  }
-
-  std::string filename = line.substr(marker_pos + 2);
-  if (filename.empty()) {
-    return std::nullopt;
-  }
-
-  return CheckLine{expected_hash, filename};
-}
-
-auto format_malformed_line_count(int malformed) -> std::string {
-  if (malformed == 1) {
-    return "b2sum: WARNING: 1 line is improperly formatted\n";
-  }
-  return "b2sum: WARNING: " + std::to_string(malformed) +
-         " lines are improperly formatted\n";
-}
-
-auto format_unreadable_file_count(int unreadable) -> std::string {
-  if (unreadable == 1) {
-    return "b2sum: WARNING: 1 listed file could not be read\n";
-  }
-  return "b2sum: WARNING: " + std::to_string(unreadable) +
-         " listed files could not be read\n";
-}
-
-auto should_ignore_missing_file(const Config& cfg, std::string_view path)
-    -> bool {
-  if (!cfg.ignore_missing || path.empty() || path == "-") {
-    return false;
-  }
-
-  std::error_code ec;
-  return !std::filesystem::exists(std::filesystem::u8path(path), ec);
-}
-
 auto run(const Config& cfg) -> int {
   if (cfg.check_mode) {
-    std::istream* input = &std::cin;
-    std::ifstream file;
-    std::string input_name = "standard input";
-    if (!cfg.check_file.empty() && cfg.check_file != "-") {
-      file.open(native_path::normalize_api_operand(cfg.check_file));
-      if (!file) {
-        cp::report_custom_error(
-            L"b2sum", utf8_to_wstring(input_open_error(cfg.check_file)));
-        return 1;
-      }
-      input = &file;
-      input_name = cfg.check_file;
-    }
-
-    int mismatches = 0;
-    int malformed = 0;
-    int checked = 0;
-    int unreadable = 0;
-    std::string line;
-    size_t line_number = 0;
-    while (std::getline(*input, line)) {
-      ++line_number;
-      if (!line.empty() && line.back() == '\r') {
-        line.pop_back();
-      }
-      if (line.empty()) {
-        continue;
-      }
-
-      auto parsed = parse_check_line(line);
-      if (!parsed) {
-        ++malformed;
-        if (cfg.warn && !cfg.status) {
-          safeErrorPrint("b2sum: " + input_name + ": " +
-                         std::to_string(line_number) +
-                         ": improperly formatted checksum line\n");
-        }
-        continue;
-      }
-
-      ++checked;
-      if (should_ignore_missing_file(cfg, parsed->filename)) {
-        continue;
-      }
-
-      auto hash_result = calculate_hash(parsed->filename, cfg.text_mode,
-                                        parsed->expected_hash.size() / 2);
-      if (!hash_result) {
-        if (!cfg.status) {
-          cp::report_error(hash_result, L"b2sum");
-        }
-        ++unreadable;
-        ++mismatches;
-        continue;
-      }
-
-      if (*hash_result == parsed->expected_hash) {
-        if (!cfg.quiet && !cfg.status) {
-          safePrint(parsed->filename + ": OK\n");
-        }
-      } else {
-        if (!cfg.status) {
-          safePrint(parsed->filename + ": FAILED\n");
-        }
-        ++mismatches;
-      }
-    }
-
-    if (checked == 0 && malformed > 0) {
-      if (!cfg.status) {
-        safeErrorPrint("b2sum: " + input_name +
-                       ": no properly formatted checksum lines found\n");
-      }
-      return 1;
-    }
-
-    if (malformed > 0 && cfg.warn && !cfg.status) {
-      safeErrorPrint(format_malformed_line_count(malformed));
-    }
-
-    if (unreadable > 0 && !cfg.status) {
-      safeErrorPrint(format_unreadable_file_count(unreadable));
-    }
-
-    if (cfg.strict && malformed > 0) {
-      return 1;
-    }
-    if (mismatches > 0) {
-      return 1;
-    }
-    return 0;
+    // [GNU] digest_check() over every check FILE operand ("-" = stdin);
+    // digest length is auto-detected per line like GNU b2sum.
+    portable_digest::SumCheckFlags flags{
+        .status_only = cfg.status,
+        .quiet = cfg.quiet,
+        .warn = cfg.warn,
+        .strict = cfg.strict,
+        .ignore_missing = cfg.ignore_missing,
+    };
+    auto hash_fn = [](const std::string& filename, size_t digest_bytes) {
+      return calculate_hash(filename, false, digest_bytes);
+    };
+    return portable_digest::sum_check_main(
+        "b2sum", "BLAKE2b", 0, flags,
+        std::span<const std::string>(cfg.files.data(), cfg.files.size()),
+        hash_fn);
   }
 
   bool all_ok = true;
@@ -410,6 +282,7 @@ REGISTER_COMMAND(
   auto cfg_result = build_config(ctx);
   if (!cfg_result) {
     cp::report_error(cfg_result, L"b2sum");
+    safeErrorPrintLn("Try 'b2sum --help' for more information.");
     return 1;
   }
 

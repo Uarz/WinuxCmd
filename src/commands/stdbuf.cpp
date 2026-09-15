@@ -227,27 +227,59 @@ REGISTER_COMMAND(
     /* author */ "WinuxCmd",
     /* copyright */ "Copyright © 2026 WinuxCmd",
     /* options */ STDBUF_OPTIONS) {
-  if (ctx.positionals.empty()) {
-    safeErrorPrintLn("stdbuf: missing command");
-    safeErrorPrintLn("Try 'stdbuf --help' for more information.");
-    return kStdbufUsageErrorExitCode;
-  }
-
+  const bool input_given = ctx.has("-i") || ctx.has("--input");
+  const bool output_given = ctx.has("-o") || ctx.has("--output");
+  const bool error_given = ctx.has("-e") || ctx.has("--error");
   std::string input_mode = ctx.get<std::string>("-i", "");
+  if (input_mode.empty()) input_mode = ctx.get<std::string>("--input", "");
   std::string output_mode = ctx.get<std::string>("-o", "");
+  if (output_mode.empty()) output_mode = ctx.get<std::string>("--output", "");
   std::string error_mode = ctx.get<std::string>("-e", "");
+  if (error_mode.empty()) error_mode = ctx.get<std::string>("--error", "");
 
-  if (!validate_buffer_mode("standard input", input_mode)) {
-    safeErrorPrintLn("stdbuf: invalid mode for standard input: " + input_mode);
+  // [GNU] stdbuf.c: the buffering MODE operand is validated while parsing
+  // options, so an invalid mode is diagnosed even when COMMAND is missing.
+  // An explicitly empty MODE ("stdbuf -i ''") is invalid too.
+  auto invalid_mode = [](const std::string& mode) {
+    safeErrorPrintLn("stdbuf: " +
+                     winux::i18n::format("command.stdbuf.error.invalid_mode",
+                                         "invalid mode '{}'", mode));
+  };
+  if ((input_given && input_mode.empty()) ||
+      !validate_buffer_mode("standard input", input_mode)) {
+    invalid_mode(input_mode);
     return kStdbufUsageErrorExitCode;
   }
-  if (!validate_buffer_mode("standard output", output_mode)) {
-    safeErrorPrintLn("stdbuf: invalid mode for standard output: " +
-                     output_mode);
+  if ((output_given && output_mode.empty()) ||
+      !validate_buffer_mode("standard output", output_mode)) {
+    invalid_mode(output_mode);
     return kStdbufUsageErrorExitCode;
   }
-  if (!validate_buffer_mode("standard error", error_mode)) {
-    safeErrorPrintLn("stdbuf: invalid mode for standard error: " + error_mode);
+  if ((error_given && error_mode.empty()) ||
+      !validate_buffer_mode("standard error", error_mode)) {
+    invalid_mode(error_mode);
+    return kStdbufUsageErrorExitCode;
+  }
+
+  if (ctx.positionals.empty()) {
+    // [GNU] stdbuf.c: "missing operand" when COMMAND is absent.
+    safeErrorPrintLn("stdbuf: " +
+                     winux::i18n::translate("common.error.missing_operand",
+                                            "missing operand"));
+    safeErrorPrintLn(winux::i18n::format(
+        "common.try_help", "Try '{} --help' for more information.", "stdbuf"));
+    return kStdbufUsageErrorExitCode;
+  }
+
+  // [GNU] stdbuf.c refuses to run COMMAND when no -i/-o/-e buffering mode
+  // option was given at all (checked after the missing-command diagnostic).
+  if (!input_given && !output_given && !error_given) {
+    safeErrorPrintLn(
+        "stdbuf: " +
+        winux::i18n::format("command.stdbuf.error.mode_required",
+                            "you must specify a buffering mode option"));
+    safeErrorPrintLn(winux::i18n::format(
+        "common.try_help", "Try '{} --help' for more information.", "stdbuf"));
     return kStdbufUsageErrorExitCode;
   }
 

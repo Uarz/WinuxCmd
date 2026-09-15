@@ -155,12 +155,29 @@ REGISTER_COMMAND(
     }
 
     for (const auto& exp : expanded) {
-      std::wstring wfilename = utf8_to_wstring(exp);
-      HANDLE hFile =
-          CreateFileW(wfilename.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
-                      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+      // [GNU] "-" wipes standard output instead of a named file
+      // (shred.c: wipefd(STDOUT_FILENO, ...), uutils #12288). It is only
+      // valid when stdout is a regular file; pipes/consoles fail with
+      // "invalid file type".
+      HANDLE hFile = INVALID_HANDLE_VALUE;
+      bool is_stdout = exp == "-";
+      std::wstring wfilename;
+      if (is_stdout) {
+        hFile = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (hFile == nullptr || hFile == INVALID_HANDLE_VALUE ||
+            GetFileType(hFile) != FILE_TYPE_DISK) {
+          safeErrorPrintLn("shred: -: invalid file type");
+          exit_code = 1;
+          continue;
+        }
+      } else {
+        wfilename = utf8_to_wstring(exp);
+        hFile =
+            CreateFileW(wfilename.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
+                        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+      }
 
-      if (hFile == INVALID_HANDLE_VALUE && force) {
+      if (hFile == INVALID_HANDLE_VALUE && force && !is_stdout) {
         // If --force, try removing the read-only attribute and retry
         DWORD attrs = GetFileAttributesW(wfilename.c_str());
         if (attrs != INVALID_FILE_ATTRIBUTES &&
@@ -195,9 +212,11 @@ REGISTER_COMMAND(
       }
 
       if (size == 0) {
-        CloseHandle(hFile);
-        if (remove) {
-          DeleteFileW(wfilename.c_str());
+        if (!is_stdout) {
+          CloseHandle(hFile);
+          if (remove) {
+            DeleteFileW(wfilename.c_str());
+          }
         }
         continue;
       }
@@ -221,7 +240,7 @@ REGISTER_COMMAND(
           if (crypt_ok) {
             if (!CryptGenRandom(hProv, count,
                                 reinterpret_cast<BYTE*>(buffer.data()))) {
-              CloseHandle(hFile);
+              if (!is_stdout) CloseHandle(hFile);
               exit_code = 1;
               break;
             }
@@ -276,10 +295,12 @@ REGISTER_COMMAND(
         }
       }
 
-      CloseHandle(hFile);
+      if (!is_stdout) {
+        CloseHandle(hFile);
+      }
 
-      // Remove file if requested
-      if (remove) {
+      // Remove file if requested (never removes stdout for "-")
+      if (remove && !is_stdout) {
         if (remove_how == "wipe" || remove_how == "wipesync") {
           // Obfuscate the file name before deletion (wipe/wipesync mode).
           // On Windows, rename the file to a random name before unlinking.

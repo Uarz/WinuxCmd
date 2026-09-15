@@ -121,7 +121,13 @@ struct Config {
 auto read_all(std::istream& in) -> std::string { return read_text_stream(in); }
 
 auto read_source(std::string_view path) -> cp::Result<std::string> {
-  if (path == "-") return read_all(std::cin);
+  if (path == "-") {
+    // [GNU] closed stdin (<&-) is a read error, not an empty stream.
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected("error reading '-': Bad file descriptor");
+    }
+    return read_all(std::cin);
+  }
 
   auto content = file_io::read_all_file(path);
   if (!content) {
@@ -305,7 +311,7 @@ auto run(const Config& cfg) -> int {
     auto input_operand = native_path::make_api_path_operand(cfg.input);
     if (input_operand.had_trailing_separator &&
         native_path::attributes_are_regular_file(
-            native_path::attributes_w(input_operand.extended))) {
+            native_path::operand_target_attributes_w(input_operand))) {
       cp::report_custom_error(L"uniq",
                               utf8_to_wstring(cfg.input + ": Not a directory"));
       return 1;
@@ -321,6 +327,10 @@ auto run(const Config& cfg) -> int {
       return 1;
     }
     input = &input_file;
+  } else if (file_io::stdin_is_bad()) {
+    // [GNU] closed stdin (<&-) errors "uniq: error reading '-'".
+    cp::report_custom_error(L"uniq", L"error reading '-': Bad file descriptor");
+    return 1;
   }
 
   std::ostream* out = &std::cout;
@@ -344,11 +354,13 @@ auto run(const Config& cfg) -> int {
   auto emit_group = [&](const std::vector<std::string>& records) {
     const size_t count = records.size();
     if (should_emit(count, cfg)) {
-      if (cfg.group_mode == GroupMode::separate && first_emitted_group) {
-        emit_group_separator(*out, cfg);
-      }
+      // [GNU] uniq.c: a separator precedes the group for prepend/both, and
+      // (once a group has been printed) also for append/separate, so groups
+      // are separated by exactly one blank line even under --group=both.
       if (cfg.group_mode == GroupMode::prepend ||
-          cfg.group_mode == GroupMode::both) {
+          cfg.group_mode == GroupMode::both ||
+          (first_emitted_group && (cfg.group_mode == GroupMode::append ||
+                                   cfg.group_mode == GroupMode::separate))) {
         emit_group_separator(*out, cfg);
       }
 
@@ -369,10 +381,6 @@ auto run(const Config& cfg) -> int {
         }
       }
 
-      if (cfg.group_mode == GroupMode::append ||
-          cfg.group_mode == GroupMode::both) {
-        emit_group_separator(*out, cfg);
-      }
       first_emitted_group = true;
     }
   };
@@ -394,6 +402,12 @@ auto run(const Config& cfg) -> int {
     return 1;
   }
   if (!group.empty()) emit_group(group);
+
+  // [GNU] append/both end the output with a single trailing separator.
+  if (first_emitted_group && (cfg.group_mode == GroupMode::append ||
+                              cfg.group_mode == GroupMode::both)) {
+    emit_group_separator(*out, cfg);
+  }
 
   out->flush();
   if (stdout_mode != -1) _setmode(_fileno(stdout), stdout_mode);

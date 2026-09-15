@@ -239,6 +239,10 @@ auto read_lines(const std::string& filename, char delimiter = '\n')
   const bool trim_crlf = delimiter == '\n';
 
   if (filename == "-") {
+    // [GNU] closed stdin (<&-) errors "paste: -: Bad file descriptor".
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected("-: Bad file descriptor");
+    }
     // Read from stdin
     std::string content;
     {

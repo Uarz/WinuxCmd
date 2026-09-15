@@ -90,45 +90,72 @@ TEST(fmt, fmt_split_only_does_not_refill) {
   EXPECT_EQ_TEXT(r.stdout_text, "alpha\nbeta\ngamma\ndelta\n");
 }
 
+TEST(fmt, fmt_wrap_matches_gnu_dp_cost_model) {
+  // GNU 8.32/9.4: fmt -w 10
+  //   one two\nthree\nfour five\nsix seven  (uutils#10095)
+  auto r = run_command(fmt_exe(), {L"-w", L"10"},
+                       "one two three four five six seven\n");
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text,
+                 "one two\n"
+                 "three\n"
+                 "four five\n"
+                 "six seven\n");
+}
+
 TEST(fmt, fmt_prefix_only_formats_matching_lines) {
+  // GNU 9.4: fmt -p '>' -w 12 splits each prefixed paragraph with the
+  // DP cost model; non-matching lines pass through verbatim.
   auto r = run_command(fmt_exe(), {L"-p", L">", L"-w", L"12"},
                        "> alpha beta gamma\nplain * line\n> delta epsilon\n");
 
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_EQ_TEXT(r.stdout_text,
-                 "> alpha beta\n"
+                 "> alpha\n"
+                 "> beta\n"
                  "> gamma\n"
                  "plain * line\n"
-                 "> delta epsilon\n");
+                 "> delta\n"
+                 "> epsilon\n");
 }
 
-TEST(fmt, fmt_prefix_single_matching_line_is_left_verbatim) {
+TEST(fmt, fmt_prefix_single_matching_line_is_formatted) {
+  // GNU formats a single-line prefix paragraph like any other.
   auto r =
       run_command(fmt_exe(), {L"-p", L">", L"-w", L"12"}, "> delta epsilon\n");
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_EQ_TEXT(r.stdout_text, "> delta epsilon\n");
+  EXPECT_EQ_TEXT(r.stdout_text, "> delta\n> epsilon\n");
 }
 
 TEST(fmt, fmt_prefix_attachment_change_starts_new_paragraph) {
+  // GNU 9.4: ">alpha" (prefix attached) and "> delta" (prefix + space)
+  // have different prefix indents, so they form separate paragraphs.
   auto r = run_command(fmt_exe(), {L"-p", L">", L"-w", L"12"},
                        ">alpha beta gamma\n> delta epsilon\n");
 
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_EQ_TEXT(r.stdout_text,
-                 ">alpha beta\n"
-                 ">gamma\n"
-                 "> delta epsilon\n");
+                 ">alpha\n"
+                 ">beta gamma\n"
+                 "> delta\n"
+                 "> epsilon\n");
 }
 
 TEST(fmt, fmt_exact_prefix_does_not_match_after_indentation) {
+  // [EXT] -x: with exact prefix matching the indented "  > ..." line does
+  // not match and passes through verbatim; "> delta epsilon" matches at
+  // column 0 and is reformatted like any other prefixed paragraph (GNU
+  // reformats lone matching lines too).
   auto r = run_command(fmt_exe(), {L"-p", L">", L"-x", L"-w", L"12"},
                        "  > alpha beta gamma\n> delta epsilon\n");
 
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_EQ_TEXT(r.stdout_text,
                  "  > alpha beta gamma\n"
-                 "> delta epsilon\n");
+                 "> delta\n"
+                 "> epsilon\n");
 }
 
 TEST(fmt, fmt_skip_prefix_leaves_matching_lines_verbatim) {
@@ -168,8 +195,8 @@ TEST(fmt, fmt_preserve_headers_detects_and_reflows_header_lines) {
   EXPECT_EQ_TEXT(r.stdout_text,
                  "Subject: alpha beta\n"
                  "  gamma delta\n"
-                 "Body words here keep\n"
-                 "wrapping maybe\n");
+                 "Body words here\n"
+                 "keep wrapping maybe\n");
 }
 
 TEST(fmt, fmt_preserve_headers_merges_continuation_lines) {
@@ -187,14 +214,30 @@ TEST(fmt, fmt_preserve_headers_merges_continuation_lines) {
                  "  three four five\n"
                  "  six continued\n"
                  "  words here again\n"
-                 "Body words here keep\n"
-                 "wrapping maybe\n");
+                 "Body words here\n"
+                 "keep wrapping maybe\n");
 }
 
-TEST(fmt, fmt_uniform_spacing_adds_two_spaces_after_sentences) {
+TEST(fmt, fmt_uniform_spacing_normalizes_to_input_sentence_marks) {
+  // GNU: -u gives one space between words and two after sentence ends,
+  // but "Hi." is only sentence-final when followed by two spaces or a
+  // newline in the input; here it is followed by one space.
   Pipeline p;
   p.set_stdin("Hi. There now.\n");
   p.add(fmt_exe(), {L"-u", L"-w", L"30"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "Hi. There now.\n");
+}
+
+TEST(fmt, fmt_default_spacing_preserves_double_space_sentence_break) {
+  // GNU: without -u intra-line spacing is preserved; a ".  " word is
+  // sentence-final and keeps two spaces in the output.
+  Pipeline p;
+  p.set_stdin("Hi.  There now.\n");
+  p.add(fmt_exe(), {L"-w", L"30"});
 
   auto r = p.run();
 

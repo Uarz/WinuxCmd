@@ -94,8 +94,13 @@ auto constexpr SORT_OPTIONS = std::array{
     // [GNU] --files0-from: read input from the file specified
     OPTION("", "--files0-from", "read input from the file specified",
            STRING_TYPE),
-    // [GNU] -c, --check
-    OPTION("-c", "--check", "check whether input is sorted"),
+    // [GNU] -c takes no argument (a glued "-cquiet" is an invalid option);
+    // --check accepts the optional =diagnose-first|quiet|silent argument.
+    OPTION("-c", "", "check whether input is sorted; diagnose-first"),
+    OPTION("", "--check",
+           "check whether input is sorted; accepts =diagnose-first|quiet|"
+           "silent",
+           OPTIONAL_STRING_TYPE),
     // [GNU] -C, --check-silent
     OPTION("-C", "--check-silent", "check whether input is sorted quietly"),
     // [GNU] --debug
@@ -197,8 +202,9 @@ struct Config {
 auto read_all(std::istream& in) -> std::string { return read_text_stream(in); }
 
 auto describe_input_open_failure(std::string_view path) -> std::string {
-  std::wstring wpath = utf8_to_wstring(std::string(path));
-  DWORD attrs = GetFileAttributesW(wpath.c_str());
+  // Probe through the extended API path so >MAX_PATH operands and DOS
+  // device names resolve like the open itself (#1061).
+  DWORD attrs = native_path::attributes_w(utf8_to_wstring(std::string(path)));
   if (attrs == INVALID_FILE_ATTRIBUTES) {
     return "No such file or directory";
   }
@@ -209,7 +215,14 @@ auto describe_input_open_failure(std::string_view path) -> std::string {
 }
 
 auto read_source(std::string_view path) -> cp::Result<std::string> {
-  if (path == "-") return read_all(std::cin);
+  // [GNU] A closed standard input (<&-) is a stat/read error, not EOF
+  // (#973). GNU reports "sort: stat failed: -: Bad file descriptor".
+  if (path == "-") {
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected("stat failed: -: Bad file descriptor");
+    }
+    return read_all(std::cin);
+  }
 
   auto in = file_io::open_binary_file(path);
   if (!in.is_open()) {
@@ -251,6 +264,9 @@ auto read_simple_lexical_source(std::string_view path)
 
 auto read_binary_source(std::string_view path) -> cp::Result<std::string> {
   if (path == "-") {
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected("stat failed: -: Bad file descriptor");
+    }
     return std::string{std::istreambuf_iterator<char>{std::cin},
                        std::istreambuf_iterator<char>{}};
   }
@@ -269,9 +285,12 @@ auto read_files0_from(const std::string& path)
   std::istream* input = nullptr;
   std::ifstream file;
   if (path == "-") {
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected("stat failed: -: Bad file descriptor");
+    }
     input = &std::cin;
   } else {
-    file.open(path, std::ios::binary);
+    file = file_io::open_binary_file(path);
     if (!file.is_open()) {
       return std::unexpected("cannot open file list '" + path + "'");
     }
@@ -450,7 +469,8 @@ struct ParsedKeyPosition {
 
 auto parse_key_position(std::string_view text)
     -> cp::Result<ParsedKeyPosition> {
-  if (text.empty()) return std::unexpected("invalid key spec");
+  if (text.empty())
+    return std::unexpected("invalid key spec '" + std::string(text) + "'");
 
   ParsedKeyPosition pos;
   size_t i = 0;
@@ -459,25 +479,24 @@ auto parse_key_position(std::string_view text)
     ++i;
   }
   if (i == 0) {
-    return std::unexpected("invalid key spec");
+    return std::unexpected("invalid key spec '" + std::string(text) + "'");
   }
 
   auto field_text = text.substr(0, i);
   // [GNU] overflowing field/char numbers are accepted and clamp (the field is
   // beyond every line, so the key is empty; uutils #7185).
   unsigned long long field_big = 0;
-  auto [ptr, ec] = std::from_chars(field_text.data(),
-                                   field_text.data() + field_text.size(),
-                                   field_big);
+  auto [ptr, ec] = std::from_chars(
+      field_text.data(), field_text.data() + field_text.size(), field_big);
   if ((ec != std::errc() && ec != std::errc::result_out_of_range) ||
       ptr != field_text.data() + field_text.size()) {
-    return std::unexpected("invalid key spec");
+    return std::unexpected("invalid key spec '" + std::string(text) + "'");
   }
   pos.field = ec == std::errc::result_out_of_range
                   ? std::numeric_limits<size_t>::max()
                   : static_cast<size_t>(field_big);
   if (pos.field == 0) {
-    return std::unexpected("invalid key spec");
+    return std::unexpected("invalid key spec '" + std::string(text) + "'");
   }
 
   if (i < text.size() && text[i] == '.') {
@@ -488,7 +507,7 @@ auto parse_key_position(std::string_view text)
       ++i;
     }
     if (i == char_start) {
-      return std::unexpected("invalid key spec");
+      return std::unexpected("invalid key spec '" + std::string(text) + "'");
     }
     size_t value = 0;
     auto char_text = text.substr(char_start, i - char_start);
@@ -499,14 +518,14 @@ auto parse_key_position(std::string_view text)
       value = std::numeric_limits<size_t>::max();
     } else if (char_ec != std::errc() ||
                char_ptr != char_text.data() + char_text.size()) {
-      return std::unexpected("invalid key spec");
+      return std::unexpected("invalid key spec '" + std::string(text) + "'");
     }
     pos.character = value;
   }
 
   for (size_t j = i; j < text.size(); ++j) {
     if (!is_key_modifier(text[j])) {
-      return std::unexpected("invalid key spec");
+      return std::unexpected("invalid key spec '" + std::string(text) + "'");
     }
   }
   pos.modifiers = text.substr(i);
@@ -514,7 +533,8 @@ auto parse_key_position(std::string_view text)
 }
 
 auto parse_key_spec(std::string_view text) -> cp::Result<KeySpec> {
-  if (text.empty()) return std::unexpected("invalid key spec");
+  if (text.empty())
+    return std::unexpected("invalid key spec '" + std::string(text) + "'");
 
   KeySpec key;
 
@@ -522,7 +542,7 @@ auto parse_key_spec(std::string_view text) -> cp::Result<KeySpec> {
   auto first = parse_key_position(text.substr(0, comma));
   if (!first) return std::unexpected(first.error());
   if (first->character.has_value() && *first->character == 0) {
-    return std::unexpected("invalid key spec");
+    return std::unexpected("invalid key spec '" + std::string(text) + "'");
   }
 
   key.start_field = first->field;
@@ -1257,16 +1277,32 @@ auto parse_parallel_hint(std::string_view text) -> bool {
   return value > 0;
 }
 
-auto parse_batch_size_hint(std::string_view text) -> bool {
-  if (text.empty()) return false;
+// [GNU] --batch-size is bounded by the number of files that can be open at
+// once: RLIMIT_NOFILE - 3 (stdin/stdout/stderr). Windows has no rlimit; the
+// MSYS2/Cygwin builds of GNU sort report a 3200 fd budget (OPEN_MAX), so the
+// same cap keeps the diagnostics identical on this platform.
+inline constexpr unsigned int MAX_BATCH_SIZE_HINT = 3200 - 3;
 
-  unsigned int value = 0;
+// Returns an empty string when the hint is valid, otherwise the GNU-style
+// diagnostic to print.
+auto validate_batch_size_hint(std::string_view text) -> std::string {
+  uintmax_t value = 0;
   auto [ptr, ec] =
       std::from_chars(text.data(), text.data() + text.size(), value);
-  if (ec != std::errc() || ptr != text.data() + text.size()) {
-    return false;
+  if (text.empty() || ec != std::errc() || ptr != text.data() + text.size()) {
+    return "invalid --batch-size argument '" + std::string(text) + "'";
   }
-  return value >= 2;
+  if (value < 2) {
+    return "invalid --batch-size argument '" + std::string(text) +
+           "'\nsort: minimum --batch-size argument is '2'";
+  }
+  if (value > MAX_BATCH_SIZE_HINT) {
+    return "--batch-size argument '" + std::string(text) +
+           "' too large\nsort: maximum --batch-size argument with current "
+           "rlimit is " +
+           std::to_string(MAX_BATCH_SIZE_HINT);
+  }
+  return {};
 }
 
 auto validate_compress_program_hint(std::string_view text) -> bool {
@@ -1301,15 +1337,71 @@ auto build_config(const CommandContext<SORT_OPTIONS.size()>& ctx)
   cfg.stable = ctx.get<bool>("--stable", false) || ctx.get<bool>("-s", false);
   cfg.unique = ctx.get<bool>("--unique", false) || ctx.get<bool>("-u", false);
   cfg.debug = ctx.get<bool>("--debug", false);
-  if (ctx.get<bool>("--check", false) || ctx.get<bool>("-c", false)) {
-    cfg.mode = OperationMode::Check;
+  // [GNU] -c and --check select the diagnose-first check mode, while -C,
+  // --check-silent and --check=quiet/silent select the quiet mode. Mixing
+  // the two modes is rejected at parse time ("options '-cC' are
+  // incompatible"). --check values follow argmatch rules: unique prefixes
+  // of {quiet, silent, diagnose-first} are accepted, an explicitly empty
+  // "--check=" is an ambiguity, and anything else is an invalid argument.
+  bool want_check = false;
+  bool want_check_quiet = false;
+  bool check_inline_empty = false;
+  for (std::string_view raw : ctx.raw_args) {
+    if (raw == "--") break;
+    if (raw == "--check=") check_inline_empty = true;
   }
-  if (ctx.get<bool>("-C", false) || ctx.get<bool>("--check-silent", false)) {
-    // [GNU] -c and -C are mutually exclusive (GNU: options '-cC' are
-    // incompatible).
-    if (cfg.mode == OperationMode::Check) {
-      return std::unexpected("options '-cC' are incompatible");
+  for (const auto& occurrence : ctx.options.occurrences()) {
+    if (!ctx.metas || occurrence.index >= SORT_OPTIONS.size()) continue;
+    const auto& meta = (*ctx.metas)[occurrence.index];
+    if (option_matches(meta, "-C", "--check-silent")) {
+      want_check_quiet = true;
+      continue;
     }
+    if (meta.short_name == "-c" && meta.long_name.empty()) {
+      want_check = true;
+      continue;
+    }
+    if (meta.long_name != "--check") continue;
+
+    const auto* value = std::get_if<std::string>(&occurrence.value);
+    const std::string text = value != nullptr ? *value : std::string();
+    if (text.empty()) {
+      if (check_inline_empty) {
+        // Printed specially by the command entry point.
+        return std::unexpected("ambiguous argument '' for '--check'");
+      }
+      want_check = true;
+      continue;
+    }
+    static constexpr std::array<std::string_view, 3> kCheckArgs{
+        "quiet", "silent", "diagnose-first"};
+    std::string_view matched;
+    size_t match_count = 0;
+    for (const auto candidate : kCheckArgs) {
+      if (candidate.starts_with(text)) {
+        matched = candidate;
+        ++match_count;
+      }
+    }
+    if (match_count > 1) {
+      return std::unexpected("ambiguous argument '" + text + "' for '--check'");
+    }
+    if (match_count == 0) {
+      // Printed specially by the command entry point.
+      return std::unexpected("invalid argument '" + text + "' for '--check'");
+    }
+    if (matched == "diagnose-first") {
+      want_check = true;
+    } else {
+      want_check_quiet = true;
+    }
+  }
+  if (want_check && want_check_quiet) {
+    return std::unexpected("options '-cC' are incompatible");
+  }
+  if (want_check) {
+    cfg.mode = OperationMode::Check;
+  } else if (want_check_quiet) {
     cfg.mode = OperationMode::CheckQuiet;
   }
   cfg.delimiter =
@@ -1325,10 +1417,17 @@ auto build_config(const CommandContext<SORT_OPTIONS.size()>& ctx)
   cfg.output_file = ctx.get<std::string>("--output", "");
   if (cfg.output_file.empty()) cfg.output_file = ctx.get<std::string>("-o", "");
   if (cfg.mode != OperationMode::Sort && !cfg.output_file.empty()) {
-    return std::unexpected("options '-co' are incompatible");
+    // [GNU] quotes the effective check option letter: "-co" for -c/--check
+    // and "-Co" for -C/--check-silent/--check=quiet|silent.
+    return std::unexpected(
+        std::string("options '-") +
+        (cfg.mode == OperationMode::CheckQuiet ? "Co" : "co") +
+        "' are incompatible");
   }
   if (cfg.debug && cfg.mode != OperationMode::Sort) {
-    return std::unexpected("options '-c --debug' are incompatible");
+    return std::unexpected(std::string("options '-") +
+                           (cfg.mode == OperationMode::CheckQuiet ? "C" : "c") +
+                           " --debug' are incompatible");
   }
   if (cfg.debug && !cfg.output_file.empty()) {
     return std::unexpected("options '-o --debug' are incompatible");
@@ -1357,8 +1456,9 @@ auto build_config(const CommandContext<SORT_OPTIONS.size()>& ctx)
                            "'");
   }
 
-  if (ctx.has("--batch-size") && !parse_batch_size_hint(cfg.batch_size_hint)) {
-    return std::unexpected("invalid batch size");
+  if (ctx.has("--batch-size")) {
+    auto batch_error = validate_batch_size_hint(cfg.batch_size_hint);
+    if (!batch_error.empty()) return std::unexpected(batch_error);
   }
 
   if (ctx.has("--compress-program") &&
@@ -1430,8 +1530,10 @@ auto build_config(const CommandContext<SORT_OPTIONS.size()>& ctx)
   }
 
   if (cfg.mode != OperationMode::Sort && cfg.files.size() > 1) {
+    // [GNU] reports the extra operand as "not allowed with -c" for every
+    // check-mode variant, including -C and --check=quiet.
     return std::unexpected("extra operand '" + cfg.files[1] +
-                           "' not allowed with check mode");
+                           "' not allowed with -c");
   }
 
   return cfg;
@@ -1709,7 +1811,8 @@ auto external_sort(const Config& cfg) -> cp::Result<int> {
       cfg.temporary_directory_hint.empty()
           ? std::filesystem::temp_directory_path()
           // Wide form: the narrow path ctor decodes via the system ACP (#88).
-          : std::filesystem::path(utf8_to_wstring(cfg.temporary_directory_hint));
+          : std::filesystem::path(
+                utf8_to_wstring(cfg.temporary_directory_hint));
   auto make_run = [&](std::vector<std::string>& records) -> cp::Result<bool> {
     if (records.empty()) return true;
     auto before = [&](const std::string& a, const std::string& b) {
@@ -1788,7 +1891,8 @@ auto external_sort(const Config& cfg) -> cp::Result<int> {
   }
 
   for (auto& path : temporary_paths) {
-    ExternalRun run{path, file_io::open_binary_file(wstring_to_utf8(path.wstring()))};
+    ExternalRun run{path,
+                    file_io::open_binary_file(wstring_to_utf8(path.wstring()))};
     if (!run.input.is_open())
       return std::unexpected("cannot open temporary file");
     run.has_current =
@@ -1929,6 +2033,21 @@ REGISTER_COMMAND(sort, "sort", "sort [OPTION]... [FILE]...",
 
   auto cfg = build_config(ctx);
   if (!cfg) {
+    // [GNU] argmatch-style diagnostic for a bad --check=ARG: the rejected
+    // value, the valid-arguments list and the help hint. GNU sort exits 1
+    // here (usage(EXIT_FAILURE)), unlike the exit 2 used for other usage
+    // errors.
+    const std::string& err = cfg.error();
+    if ((err.starts_with("invalid argument '") ||
+         err.starts_with("ambiguous argument '")) &&
+        err.ends_with("' for '--check'")) {
+      safeErrorPrintLn("sort: " + err);
+      safeErrorPrintLn("Valid arguments are:");
+      safeErrorPrintLn("  - 'quiet', 'silent'");
+      safeErrorPrintLn("  - 'diagnose-first'");
+      safeErrorPrintLn("Try 'sort --help' for more information.");
+      return 1;
+    }
     cp::report_error(cfg, L"sort");
     return 2;
   }

@@ -284,3 +284,34 @@ TEST(comm, comm_extra_operand_reports_help_hint) {
       r.stderr_text,
       "comm: extra operand 'c'\nTry 'comm --help' for more information.\n");
 }
+
+TEST(comm, comm_check_order_keeps_output_before_disorder) {
+  // [GNU] comm.c: with --check-order the merge up to the disordered line is
+  // printed, then the offending file is reported without emitting the line.
+  TempDir tmp;
+  tmp.write("file1.txt", "a\nb\nc\n");
+  tmp.write("file2.txt", "a\nc\nb\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"comm.exe", {L"--check-order", L"file1.txt", L"file2.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_EQ_TEXT(r.stdout_text, "\t\ta\nb\n\t\tc\n");
+  EXPECT_EQ_TEXT(r.stderr_text, "comm: file 2 is not in sorted order\n");
+}
+
+TEST(comm, comm_missing_operand_after_reports_operand) {
+  // [GNU] comm.c: "missing operand after %s" quotes the last operand.
+  Pipeline p;
+  p.add(L"comm.exe", {L"file1.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stdout_text.empty());
+  EXPECT_EQ_TEXT(
+      r.stderr_text,
+      "comm: missing operand after 'file1.txt'\nTry 'comm --help' for more "
+      "information.\n");
+}

@@ -135,7 +135,7 @@ TEST(split, split_number_mode_reassembles_without_overlap) {
 
   EXPECT_EQ(r.exit_code, 0);
   std::string rebuilt;
-  for (const char *suffix : {"aa", "ab", "ac", "ad"}) {
+  for (const char* suffix : {"aa", "ab", "ac", "ad"}) {
     rebuilt += tmp.read(std::string("part") + suffix);
   }
   EXPECT_EQ(rebuilt, input);
@@ -312,10 +312,9 @@ TEST(split, split_invalid_size_messages_quote_argument) {
 
   // GNU strtoint_die quotes the rejected argument for every size option.
   const wchar_t* flag_sets[][2] = {
-      {L"-l", L"0"},        {L"-l", L"x"},        {L"-l", L"2fb"},
-      {L"-b", L"0"},        {L"-b", L"abc"},      {L"-C", L"0"},
-      {L"-n", L"0"},        {L"-n", L"x"},        {L"-n", L"1/0"},
-      {L"-n", L"0/3"},      {L"-n", L"a/3"},      {L"-n", L"1/2/3"},
+      {L"-l", L"0"},   {L"-l", L"x"},   {L"-l", L"2fb"}, {L"-b", L"0"},
+      {L"-b", L"abc"}, {L"-C", L"0"},   {L"-n", L"0"},   {L"-n", L"x"},
+      {L"-n", L"1/0"}, {L"-n", L"0/3"}, {L"-n", L"a/3"}, {L"-n", L"1/2/3"},
   };
   const char* expected[] = {
       "split: invalid number of lines: '0'\n",
@@ -437,5 +436,60 @@ TEST(split, split_directory_input_reports_is_a_directory) {
   EXPECT_EQ(r.exit_code, 1);
   EXPECT_TRUE(r.stderr_text.find(
                   "split: cannot open 'indir' for reading: Is a directory") !=
+              std::string::npos);
+}
+
+// [GNU] obsolete "-NUMBER" is accepted as "-l NUMBER" (issue #1081).
+TEST(split, split_obsolete_dash_number_lines) {
+  TempDir tmp;
+  tmp.write("input.txt", "l1\nl2\nl3\nl4\nl5\nl6\nl7\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"split.exe", {L"-3", L"input.txt", L"part"});
+
+  auto r = p.run();
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(tmp.read("partaa"), "l1\nl2\nl3\n");
+  EXPECT_EQ_TEXT(tmp.read("partab"), "l4\nl5\nl6\n");
+  EXPECT_EQ_TEXT(tmp.read("partac"), "l7\n");
+}
+
+// [GNU] hidden ---io-blksize=SIZE is accepted and its size is validated
+// (issue #1081).
+TEST(split, split_hidden_io_blksize_accepted_and_validated) {
+  TempDir tmp;
+  tmp.write("input.txt", "l1\nl2\nl3\nl4\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"split.exe",
+        {L"---io-blksize=4096", L"-l", L"2", L"input.txt", L"part"});
+
+  auto r = p.run();
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(tmp.read("partaa"), "l1\nl2\n");
+
+  Pipeline bad;
+  bad.set_cwd(tmp.wpath());
+  bad.add(L"split.exe", {L"---io-blksize=bad", L"input.txt", L"q"});
+  auto rb = bad.run();
+  EXPECT_EQ(rb.exit_code, 1);
+  EXPECT_TRUE(rb.stderr_text.find("invalid IO block size") !=
+              std::string::npos);
+}
+
+// [GNU] obsolete -NUMBER conflicts with an explicit split mode like -l.
+TEST(split, split_obsolete_dash_number_conflicts_with_lines) {
+  TempDir tmp;
+  tmp.write("input.txt", "l1\nl2\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"split.exe", {L"-3", L"-l", L"5", L"input.txt"});
+
+  auto r = p.run();
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stderr_text.find("cannot split in more than one way") !=
               std::string::npos);
 }

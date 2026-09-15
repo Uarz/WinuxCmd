@@ -39,6 +39,7 @@ import core;
 import utils;
 import container;
 
+using cmd::meta::option_matches;
 using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
@@ -54,7 +55,9 @@ auto constexpr UNEXPAND_OPTIONS = std::array{
            BOOL_TYPE),
     // [EXT] option
     OPTION("-U", "--no-utf8",
-           "interpret input file as 8-bit ASCII rather than UTF-8", BOOL_TYPE)};
+           "interpret input file as 8-bit ASCII rather than UTF-8", BOOL_TYPE),
+    // [GNU] obsolescent -NUM is an alias for --tabs=NUM
+    OPTION("-NUM", "", "same as --tabs=NUM", INT_TYPE)};
 
 namespace unexpand_pipeline {
 namespace cp = core::pipeline;
@@ -75,13 +78,36 @@ struct Config {
   SmallVector<std::string, 64> files;
 };
 
-auto parse_tab_stops(const std::string& spec) -> cp::Result<Config::TabStops> {
-  Config::TabStops tab_stops;
+// [GNU] expand-common.c add_tab_stop(): appends a single stop, validating
+// nonzero size and strict ascending order against every previously added
+// stop.
+auto add_tab_stop(std::uintmax_t stop, Config::TabStops& tab_stops)
+    -> cp::Result<void> {
+  if (stop == 0) {
+    return std::unexpected("tab size cannot be 0");
+  }
+  if (stop > std::numeric_limits<size_t>::max()) {
+    return std::unexpected("tab stop is too large '" + std::to_string(stop) +
+                           "'");
+  }
+  if (!tab_stops.stops.empty() && stop <= tab_stops.stops.back()) {
+    return std::unexpected("tab sizes must be ascending");
+  }
+  tab_stops.stops.push_back(static_cast<size_t>(stop));
+  return {};
+}
+
+// [GNU] expand-common.c parse_tab_stops(): parses one -t/--tabs SPEC and
+// appends its stops to TAB_STOPS. REPEAT_SPECIFIED is set when the spec
+// uses the '/' (every multiple) or '+' (relative to last stop) repeat
+// form, which must be the last item of the spec.
+auto parse_tab_stops(std::string_view spec, Config::TabStops& tab_stops,
+                     bool& repeat_specified) -> cp::Result<void> {
   if (spec.empty()) {
-    return tab_stops;
+    return {};
   }
 
-  std::string normalized = spec;
+  std::string normalized(spec);
   for (char& c : normalized) {
     if (c == ',') c = ' ';
   }
@@ -93,13 +119,12 @@ auto parse_tab_stops(const std::string& spec) -> cp::Result<Config::TabStops> {
   }
 
   // Mirrors GNU expand-common.c: parse errors quote the offending part of
-  // the token; zero/ascending validation runs after the whole list parses.
+  // the token; zero/ascending validation runs as each stop is added.
   auto invalid_chars_error = [](const std::string_view quoted) {
     return "tab size contains invalid character(s): '" + std::string(quoted) +
            "'";
   };
 
-  bool repeat_specified = false;
   for (size_t i = 0; i < tokens.size(); ++i) {
     const std::string& token = tokens[i];
     const bool repeat = token[0] == '/' || token[0] == '+';
@@ -115,7 +140,7 @@ auto parse_tab_stops(const std::string& spec) -> cp::Result<Config::TabStops> {
       return std::unexpected(invalid_chars_error(value.substr(digits_end)));
     }
 
-    size_t parsed = 0;
+    std::uintmax_t parsed = 0;
     const auto [ptr, ec] =
         std::from_chars(value.data(), value.data() + digits_end, parsed);
     if (ec == std::errc::result_out_of_range) {
@@ -133,7 +158,7 @@ auto parse_tab_stops(const std::string& spec) -> cp::Result<Config::TabStops> {
       if (parsed == 0) {
         return std::unexpected("tab size cannot be 0");
       }
-      tab_stops.interval = parsed;
+      tab_stops.interval = static_cast<size_t>(parsed);
       tab_stops.repeat_mode = token[0] == '/'
                                   ? Config::TabStops::RepeatMode::every_multiple
                                   : Config::TabStops::RepeatMode::after_last;
@@ -141,53 +166,48 @@ auto parse_tab_stops(const std::string& spec) -> cp::Result<Config::TabStops> {
       continue;
     }
 
-    tab_stops.stops.push_back(parsed);
-  }
-
-  // GNU validates nonzero and ascending order after parsing everything.
-  size_t prev_stop = 0;
-  for (const size_t stop : tab_stops.stops) {
-    if (stop == 0) {
-      return std::unexpected("tab size cannot be 0");
+    if (auto added = add_tab_stop(parsed, tab_stops); !added) {
+      return added;
     }
-    if (stop <= prev_stop) {
-      return std::unexpected("tab sizes must be ascending");
-    }
-    prev_stop = stop;
   }
 
-  if (tab_stops.stops.size() == 1 && !repeat_specified &&
-      tab_stops.repeat_mode == Config::TabStops::RepeatMode::every_multiple) {
-    tab_stops.interval = tab_stops.stops.front();
-    tab_stops.stops.clear();
-  } else if (tab_stops.stops.size() > 1 &&
-             tab_stops.repeat_mode ==
-                 Config::TabStops::RepeatMode::every_multiple) {
-    tab_stops.repeat_mode = Config::TabStops::RepeatMode::none;
-  }
-
-  return tab_stops;
+  return {};
 }
 
-auto next_tab_stop(size_t column, const Config::TabStops& tab_stops) -> size_t {
+// [GNU] expand-common.c get_next_tab_column(): the next tab stop strictly
+// greater than COLUMN. With a finite stop list (no /N or +N repeat) there is
+// no stop beyond the last one; LAST_TAB is set and GNU switches conversion
+// off for the rest of the line.
+auto get_next_tab_column(size_t column, const Config::TabStops& tab_stops,
+                         bool& last_tab) -> size_t {
+  const size_t max = std::numeric_limits<size_t>::max();
   for (size_t stop : tab_stops.stops) {
     if (stop > column) return stop;
   }
 
+  // Smallest multiple of INTERVAL strictly greater than COL, saturated at
+  // SIZE_MAX rather than wrapping so a huge in-range interval never yields
+  // a tab column behind the current position.
+  auto next_multiple = [max](size_t col, size_t interval) -> size_t {
+    const size_t delta = interval - col % interval;  // in [1, interval]
+    return col > max - delta ? max : col + delta;
+  };
+
   switch (tab_stops.repeat_mode) {
     case Config::TabStops::RepeatMode::every_multiple:
-      return ((column / tab_stops.interval) + 1) * tab_stops.interval;
+      return next_multiple(column, tab_stops.interval);
     case Config::TabStops::RepeatMode::after_last: {
       size_t anchor = tab_stops.stops.empty() ? 0 : tab_stops.stops.back();
       if (column < anchor) return anchor;
-      return anchor + (((column - anchor) / tab_stops.interval) + 1) *
-                          tab_stops.interval;
+      const size_t rel = next_multiple(column - anchor, tab_stops.interval);
+      return rel > max - anchor ? max : anchor + rel;
     }
     case Config::TabStops::RepeatMode::none:
-      return column + 1;
+      break;
   }
 
-  return column + 1;
+  last_tab = true;
+  return column;
 }
 
 auto build_config(const CommandContext<UNEXPAND_OPTIONS.size()>& ctx)
@@ -198,17 +218,73 @@ auto build_config(const CommandContext<UNEXPAND_OPTIONS.size()>& ctx)
       ctx.get<bool>("--first-only", false) || ctx.get<bool>("-f", false);
   cfg.no_utf8 = ctx.get<bool>("--no-utf8", false) || ctx.get<bool>("-U", false);
 
-  auto tabs_opt = ctx.get<std::string>("--tabs", "");
-  if (tabs_opt.empty()) {
-    tabs_opt = ctx.get<std::string>("-t", "");
+  // [GNU] unexpand.c parses options with getopt optstring
+  // ",0123456789at:": consecutive digit options accumulate one number
+  // (DECIMAL_DIGIT_ACCUMULATE), so "-4 -8" selects a single tab stop of 48,
+  // not {4,8}; a ',' option flushes the pending value but cannot be
+  // expressed through the generic -NUM option, and the pending value is
+  // flushed once all options are parsed. A -t/--tabs spec adds its stops
+  // before a pending digit value is flushed, so "-4 -t 8" and "-t 8 -4"
+  // both fail with "tab sizes must be ascending". -t/--tabs also selects
+  // whole-line conversion like -a; the digit form alone does not.
+  Config::TabStops tab_stops;
+  bool repeat_specified = false;
+  bool tab_spec_seen = false;
+  bool have_tabval = false;
+  std::uintmax_t tabval = 0;
+  for (const auto& occurrence : ctx.options.occurrences()) {
+    if (!ctx.metas || occurrence.index >= UNEXPAND_OPTIONS.size()) continue;
+    const auto& meta = (*ctx.metas)[occurrence.index];
+    if (option_matches(meta, "-t", "--tabs")) {
+      tab_spec_seen = true;
+      // [GNU] case 't': convert_entire_line = true.
+      cfg.all_spaces = true;
+      if (const auto* value = std::get_if<std::string>(&occurrence.value)) {
+        if (auto parsed = parse_tab_stops(*value, tab_stops, repeat_specified);
+            !parsed) {
+          return std::unexpected(parsed.error());
+        }
+      }
+    } else if (meta.short_name == "-NUM") {
+      if (const auto* value = std::get_if<int>(&occurrence.value)) {
+        if (!have_tabval) {
+          tabval = 0;
+          have_tabval = true;
+        }
+        // The -NUM option yields one decimal string per occurrence; appending
+        // its digits is equivalent to GNU's per-digit accumulation.
+        for (const char ch : std::to_string(*value)) {
+          const auto digit = static_cast<unsigned>(ch - '0');
+          if (tabval >
+              (std::numeric_limits<std::uintmax_t>::max() - digit) / 10) {
+            return std::unexpected("tab stop value is too large");
+          }
+          tabval = tabval * 10 + digit;
+        }
+      }
+    }
   }
-
-  if (!tabs_opt.empty()) {
-    auto tab_stops = parse_tab_stops(tabs_opt);
-    if (!tab_stops) return std::unexpected(tab_stops.error());
-    cfg.tab_stops = *tab_stops;
-    cfg.all_spaces = true;
+  if (have_tabval) {
+    if (auto added = add_tab_stop(tabval, tab_stops); !added) {
+      return std::unexpected(added.error());
+    }
   }
+  if (tab_spec_seen || have_tabval) {
+    // [GNU] finalize_tab_stops(): a single stop without an explicit repeat
+    // becomes the repeating interval; a repeat mark applies to otherwise
+    // finite lists only through its own mode.
+    if (tab_stops.stops.size() == 1 && !repeat_specified &&
+        tab_stops.repeat_mode == Config::TabStops::RepeatMode::every_multiple) {
+      tab_stops.interval = tab_stops.stops.front();
+      tab_stops.stops.clear();
+    } else if (tab_stops.stops.size() > 1 &&
+               tab_stops.repeat_mode ==
+                   Config::TabStops::RepeatMode::every_multiple) {
+      tab_stops.repeat_mode = Config::TabStops::RepeatMode::none;
+    }
+    cfg.tab_stops = tab_stops;
+  }
+  // [GNU] --first-only cancels whole-line conversion.
   if (cfg.first_only) {
     cfg.all_spaces = false;
   }
@@ -234,80 +310,85 @@ auto build_config(const CommandContext<UNEXPAND_OPTIONS.size()>& ctx)
   return cfg;
 }
 
-auto append_unexpanded_blanks(std::string& result, std::string_view blanks,
-                              size_t start_column, size_t end_column,
-                              const Config::TabStops& tab_stops,
-                              bool allow_single_char_tab) {
-  if (blanks.size() < 2 && blanks.find('\t') == std::string_view::npos) {
-    result.append(blanks);
-    return;
-  }
-
-  size_t column = start_column;
-  std::string replacement;
-  while (column < end_column) {
-    size_t next_stop = next_tab_stop(column, tab_stops);
-    if (next_stop > end_column || next_stop == column) break;
-    if (allow_single_char_tab || next_stop - column > 1) {
-      replacement += '\t';
-      column = next_stop;
-    } else {
-      break;
-    }
-  }
-  replacement.append(end_column - column, ' ');
-
-  if (replacement.size() < blanks.size()) {
-    result += replacement;
-  } else {
-    result.append(blanks);
-  }
-}
-
 // Convert spaces and tabs to the shortest equivalent tab/space sequence.
+// This is a direct port of the GNU unexpand.c conversion loop: blanks are
+// accumulated in PENDING_BLANK until a non-blank arrives or a blank lands
+// exactly on a tab stop (which collapses the pending run into one or two
+// tabs). A pending run whose first blank ended exactly on a tab stop gets
+// its first character replaced by '\t' when it is longer than one blank —
+// that is the case where a mid-line run crosses a tab stop by a single
+// column and GNU still emits a tab.
 auto unexpand_line(const std::string& line, const Config::TabStops& tab_stops,
                    bool all_spaces) -> std::string {
   std::string result;
   result.reserve(line.size());
+
+  // If true, perform translations.
+  bool convert = true;
+  // Column of the next input character.
   size_t column = 0;
-  bool before_non_blank = true;
+  // If true, the first pending blank came just before a tab stop.
+  bool one_blank_before_tab_stop = false;
+  // If true, the previous input character was a blank. Initially true, since
+  // initial strings of blanks are treated as if the line was preceded by a
+  // blank.
+  bool prev_blank = true;
+  // Pending blank characters.
+  std::string pending_blank;
 
-  for (size_t pos = 0; pos < line.size();) {
+  for (size_t pos = 0; pos < line.size(); ++pos) {
     char c = line[pos];
-    if (c == ' ' || c == '\t') {
-      size_t blank_start = pos;
-      size_t start_column = column;
-      while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
-        if (line[pos] == '\t') {
-          column = next_tab_stop(column, tab_stops);
-        } else {
-          ++column;
+    if (convert) {
+      const bool blank = c == ' ' || c == '\t';
+      if (blank) {
+        bool last_tab = false;
+        const size_t next_tab_column =
+            get_next_tab_column(column, tab_stops, last_tab);
+        if (last_tab) convert = false;
+        if (convert) {
+          if (c == '\t') {
+            column = next_tab_column;
+            if (!pending_blank.empty()) pending_blank[0] = '\t';
+          } else {
+            // Saturate: a column at SIZE_MAX must not wrap to 0.
+            if (column != std::numeric_limits<size_t>::max()) ++column;
+            if (!(prev_blank && column == next_tab_column)) {
+              // It is not yet known whether the pending blanks will be
+              // replaced by tabs.
+              if (column == next_tab_column) one_blank_before_tab_stop = true;
+              pending_blank += c;
+              prev_blank = true;
+              continue;
+            }
+            // Replace the pending blanks by a tab or two. GNU writes
+            // pending_blank[0] unconditionally; when nothing is pending the
+            // single character that just reached a tab stop is converted.
+            if (pending_blank.empty()) pending_blank += ' ';
+            pending_blank[0] = c = '\t';
+          }
+          // Discard pending blanks, unless it was a single blank just before
+          // the previous tab stop.
+          pending_blank.resize(one_blank_before_tab_stop ? 1 : 0);
         }
-        ++pos;
-      }
-
-      std::string_view blanks(line.data() + blank_start, pos - blank_start);
-      if (all_spaces || before_non_blank) {
-        append_unexpanded_blanks(result, blanks, start_column, column,
-                                 tab_stops, before_non_blank);
+      } else if (c == '\b') {
+        // Go back one column; the next tab stop is recomputed anyway.
+        if (column > 0) --column;
       } else {
-        result.append(blanks);
+        if (column != std::numeric_limits<size_t>::max()) ++column;
       }
-      continue;
-    }
 
-    result += c;
-    ++pos;
-    if (c == '\n') {
-      column = 0;
-      before_non_blank = true;
-    } else if (c == '\b') {
-      if (column > 0) --column;
-      before_non_blank = false;
-    } else {
-      ++column;
-      before_non_blank = false;
+      if (!pending_blank.empty()) {
+        if (pending_blank.size() > 1 && one_blank_before_tab_stop) {
+          pending_blank[0] = '\t';
+        }
+        result += pending_blank;
+        pending_blank.clear();
+        one_blank_before_tab_stop = false;
+      }
+      prev_blank = blank;
+      convert = convert && (all_spaces || blank);
     }
+    result += c;
   }
 
   return result;

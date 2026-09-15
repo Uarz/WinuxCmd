@@ -64,12 +64,13 @@ REGISTER_COMMAND(
     "true(1)", "WinuxCmd", "Copyright © 2026 WinuxCmd", FALSE_OPTIONS) {
   // [GNU] false --help prints a usage summary and exits successfully.
   if (ctx.has("--help")) {
-    safePrint("Usage: false [ignored command line arguments]\n"
-              "  or:  false OPTION\n"
-              "Exit with a status code indicating failure.\n"
-              "\n"
-              "      --help     display this help and exit\n"
-              "      --version  output version information and exit\n");
+    safePrint(
+        "Usage: false [ignored command line arguments]\n"
+        "  or:  false OPTION\n"
+        "Exit with a status code indicating failure.\n"
+        "\n"
+        "      --help     display this help and exit\n"
+        "      --version  output version information and exit\n");
     return 0;
   }
   // Do nothing, just return 1 (failure)

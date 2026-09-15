@@ -834,15 +834,14 @@ auto run(const Config& cfg) -> int {
   // from [LO, HI] without enumerating the range (uutils #11167).
   if (deferred_range) {
     const auto [lo, hi] = *deferred_range;
-    const uint64_t population =
-        static_cast<uint64_t>(hi - lo) + 1;
-    const size_t count = static_cast<size_t>(
-        std::min<uint64_t>(*cfg.head_count, population));
+    const uint64_t population = static_cast<uint64_t>(hi - lo) + 1;
+    const size_t count =
+        static_cast<size_t>(std::min<uint64_t>(*cfg.head_count, population));
     std::unordered_set<int64_t> picked;
     std::uniform_int_distribution<uint64_t> sample_dist(0, population - 1);
     while (picked.size() < count) {
-      picked.insert(static_cast<int64_t>(
-          lo + static_cast<int64_t>(sample_dist(g))));
+      picked.insert(
+          static_cast<int64_t>(lo + static_cast<int64_t>(sample_dist(g))));
     }
     for (const auto& value : picked) {
       append_output_record(output, std::to_string(value), cfg.zero_terminated);

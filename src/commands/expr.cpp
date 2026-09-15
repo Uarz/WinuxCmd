@@ -30,6 +30,7 @@
 
 #include "core/command_macros.h"
 #include "pch/pch.h"
+#include "utils/bigint.hpp"
 import std;
 import core;
 import utils;
@@ -51,14 +52,18 @@ struct Value {
   enum class Kind { Integer, String };
 
   Kind kind = Kind::String;
-  long long integer = 0;
+  winux::bignum::Int integer{};
   std::string text;
 
-  static auto make_integer(long long value) -> Value {
+  static auto make_integer(winux::bignum::Int value) -> Value {
     Value v;
     v.kind = Kind::Integer;
-    v.integer = value;
+    v.integer = std::move(value);
     return v;
+  }
+
+  static auto make_integer(long long value) -> Value {
+    return make_integer(winux::bignum::Int{value});
   }
 
   static auto make_string(std::string_view value) -> Value {
@@ -69,7 +74,7 @@ struct Value {
   }
 
   [[nodiscard]] auto as_string() const -> std::string {
-    if (kind == Kind::Integer) return std::to_string(integer);
+    if (kind == Kind::Integer) return integer.to_decimal();
     return text;
   }
 };
@@ -85,27 +90,32 @@ struct Value {
 }
 
 [[nodiscard]] auto parse_integer(std::string_view text)
-    -> std::optional<long long> {
+    -> std::optional<winux::bignum::Int> {
   if (!looks_like_integer(text)) return std::nullopt;
-  long long value = 0;
-  auto first = text.data();
-  auto last = text.data() + text.size();
-  auto [ptr, ec] = std::from_chars(first, last, value, 10);
-  if (ec != std::errc{} || ptr != last) return std::nullopt;
-  return value;
+  return winux::bignum::Int::from_decimal(text);
 }
 
-auto coerce_integer(const Value& value) -> long long {
+auto coerce_integer(const Value& value) -> winux::bignum::Int {
   if (value.kind == Value::Kind::Integer) return value.integer;
   auto parsed = parse_integer(value.text);
   if (!parsed) {
-    throw ExprError{"non-integer argument"};
+    throw ExprError{winux::i18n::translate(
+        "command.expr.error.non_integer_argument", "non-integer argument")};
   }
   return *parsed;
 }
 
+// Saturating conversion for keyword operands that still need a machine
+// integer (substr POS/LENGTH).
+auto coerce_i64(const Value& value) -> std::optional<long long> {
+  if (value.kind == Value::Kind::Integer) return value.integer.to_i64();
+  auto parsed = parse_integer(value.text);
+  if (!parsed) return std::nullopt;
+  return parsed->to_i64();
+}
+
 [[nodiscard]] auto is_null(const Value& value) -> bool {
-  if (value.kind == Value::Kind::Integer) return value.integer == 0;
+  if (value.kind == Value::Kind::Integer) return value.integer.is_zero();
 
   std::string_view s = value.text;
   return s.empty();
@@ -182,60 +192,12 @@ auto coerce_integer(const Value& value) -> long long {
   return pos == std::wstring::npos ? 0 : static_cast<long long>(pos + 1);
 }
 
-auto checked_add(long long lhs, long long rhs) -> long long {
-  if ((rhs > 0 && lhs > std::numeric_limits<long long>::max() - rhs) ||
-      (rhs < 0 && lhs < std::numeric_limits<long long>::min() - rhs)) {
-    throw ExprError{"integer overflow"};
-  }
-  return lhs + rhs;
-}
-
-auto checked_sub(long long lhs, long long rhs) -> long long {
-  if ((rhs < 0 && lhs > std::numeric_limits<long long>::max() + rhs) ||
-      (rhs > 0 && lhs < std::numeric_limits<long long>::min() + rhs)) {
-    throw ExprError{"integer overflow"};
-  }
-  return lhs - rhs;
-}
-
-auto checked_mul(long long lhs, long long rhs) -> long long {
-  if (lhs == 0 || rhs == 0) return 0;
-  if ((lhs == -1 && rhs == std::numeric_limits<long long>::min()) ||
-      (rhs == -1 && lhs == std::numeric_limits<long long>::min())) {
-    throw ExprError{"integer overflow"};
-  }
-  if (lhs > 0) {
-    if (rhs > 0) {
-      if (lhs > std::numeric_limits<long long>::max() / rhs) {
-        throw ExprError{"integer overflow"};
-      }
-    } else if (rhs < std::numeric_limits<long long>::min() / lhs) {
-      throw ExprError{"integer overflow"};
-    }
-  } else {
-    if (rhs > 0) {
-      if (lhs < std::numeric_limits<long long>::min() / rhs) {
-        throw ExprError{"integer overflow"};
-      }
-    } else if (lhs < std::numeric_limits<long long>::max() / rhs) {
-      throw ExprError{"integer overflow"};
-    }
-  }
-  return lhs * rhs;
-}
-
-auto checked_div(long long lhs, long long rhs) -> long long {
-  if (rhs == 0) throw ExprError{"division by zero"};
-  if (lhs == std::numeric_limits<long long>::min() && rhs == -1) {
-    throw ExprError{"integer overflow"};
-  }
-  return lhs / rhs;
-}
-
-auto checked_mod(long long lhs, long long rhs) -> long long {
-  if (rhs == 0) throw ExprError{"division by zero"};
-  if (lhs == std::numeric_limits<long long>::min() && rhs == -1) return 0;
-  return lhs % rhs;
+// [GNU] expr uses arbitrary-precision integers (GMP): + - * cannot
+// overflow, and / % truncate toward zero.  Division by zero is the only
+// arithmetic error.
+[[noreturn]] auto throw_division_by_zero() -> void {
+  throw ExprError{winux::i18n::translate("command.expr.error.division_by_zero",
+                                         "division by zero")};
 }
 
 auto do_colon(const Value& lhs, const Value& rhs) -> Value {
@@ -403,10 +365,9 @@ class Parser {
 
       Value rhs = eval_mul(evaluate);
       if (!evaluate) continue;
-      long long left = coerce_integer(lhs);
-      long long right = coerce_integer(rhs);
-      lhs = Value::make_integer(op == Add::Plus ? checked_add(left, right)
-                                                : checked_sub(left, right));
+      auto left = coerce_integer(lhs);
+      auto right = coerce_integer(rhs);
+      lhs = Value::make_integer(op == Add::Plus ? left + right : left - right);
     }
   }
 
@@ -427,17 +388,19 @@ class Parser {
 
       Value rhs = eval_colon(evaluate);
       if (!evaluate) continue;
-      long long left = coerce_integer(lhs);
-      long long right = coerce_integer(rhs);
+      auto left = coerce_integer(lhs);
+      auto right = coerce_integer(rhs);
       switch (op) {
         case Mul::Multiply:
-          lhs = Value::make_integer(checked_mul(left, right));
+          lhs = Value::make_integer(left * right);
           break;
         case Mul::Divide:
-          lhs = Value::make_integer(checked_div(left, right));
+          if (right.is_zero()) throw_division_by_zero();
+          lhs = Value::make_integer(left / right);
           break;
         case Mul::Mod:
-          lhs = Value::make_integer(checked_mod(left, right));
+          if (right.is_zero()) throw_division_by_zero();
+          lhs = Value::make_integer(left % right);
           break;
         case Mul::None:
           break;
@@ -486,12 +449,8 @@ class Parser {
       Value source = eval_keyword(evaluate);
       Value pos = eval_keyword(evaluate);
       Value len = eval_keyword(evaluate);
-      auto pos_int = pos.kind == Value::Kind::Integer
-                         ? std::optional<long long>{pos.integer}
-                         : parse_integer(pos.text);
-      auto len_int = len.kind == Value::Kind::Integer
-                         ? std::optional<long long>{len.integer}
-                         : parse_integer(len.text);
+      auto pos_int = coerce_i64(pos);
+      auto len_int = coerce_i64(len);
       if (!pos_int || !len_int) return Value::make_string("");
       return Value::make_string(
           utf8_logical_substr(source.as_string(), *pos_int, *len_int));
@@ -550,8 +509,8 @@ REGISTER_COMMAND(
     "\n"
     "Regex matching uses WinuxCmd's POSIX basic regex module and is anchored "
     "at "
-    "the start of STRING. Numeric arithmetic currently uses signed 64-bit "
-    "integers rather than GNU expr's arbitrary precision integers.",
+    "the start of STRING. Numeric arithmetic uses arbitrary-precision "
+    "integers like GNU expr.",
     "  expr 2 + 3 \\* 4\n"
     "  expr \\( 2 + 3 \\) \\* 4\n"
     "  expr abc123 : '[a-z]*\\\\([0-9]*\\\\)'\n"

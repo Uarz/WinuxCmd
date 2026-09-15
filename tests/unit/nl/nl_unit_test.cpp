@@ -213,3 +213,55 @@ TEST(nl, nl_directory_input_reports_is_a_directory) {
                   "nl: cannot open 'indir' for reading: Is a directory") !=
               std::string::npos);
 }
+
+// [GNU] nl 9.4 accepts a zero line increment (-i 0, -i +0,
+// --line-increment=0) and repeats the line number; only non-numeric text is
+// rejected with status 1 (#1011).
+TEST(nl, nl_zero_line_increment_repeats_line_number) {
+  TempDir tmp;
+  tmp.write("in.txt", "a\nb\n");
+
+  for (const wchar_t* opt : {L"0", L"+0", L"00"}) {
+    Pipeline p;
+    p.set_cwd(tmp.wpath());
+    p.add(L"nl.exe", {L"-i", opt, L"in.txt"});
+    auto r = p.run();
+
+    EXPECT_EQ(r.exit_code, 0);
+    EXPECT_EQ_TEXT(r.stdout_text, "     1\ta\n     1\tb\n");
+  }
+
+  Pipeline long_opt;
+  long_opt.set_cwd(tmp.wpath());
+  long_opt.add(L"nl.exe", {L"--line-increment=0", L"in.txt"});
+  auto long_result = long_opt.run();
+  EXPECT_EQ(long_result.exit_code, 0);
+  EXPECT_EQ_TEXT(long_result.stdout_text, "     1\ta\n     1\tb\n");
+}
+
+TEST(nl, nl_negative_line_increment_decrements) {
+  TempDir tmp;
+  tmp.write("in.txt", "a\nb\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"nl.exe", {L"-i", L"-2", L"in.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "     1\ta\n    -1\tb\n");
+}
+
+TEST(nl, nl_invalid_line_increment_exits_1) {
+  TempDir tmp;
+  tmp.write("in.txt", "a\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"nl.exe", {L"-i", L"1x", L"in.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stderr_text.find("invalid line number increment: '1x'") !=
+              std::string::npos);
+}

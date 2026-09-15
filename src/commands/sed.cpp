@@ -955,6 +955,13 @@ auto split_script_commands(std::string_view text)
         i = j;
         continue;
       }
+      // [GNU] A ';' may follow '}' and start the next command on the same
+      // line (e.g. "1{p};2{d}"). Leave the ';' for the main loop to consume
+      // as an ordinary command separator.
+      if (text[j] == ';') {
+        i = j - 1;
+        return {};
+      }
       if (text[j] == '\n') {
         i = j;
         return {};
@@ -1188,15 +1195,12 @@ auto parse_script_text(std::string_view script, portable_regex::Syntax syntax,
   return out;
 }
 
-auto read_script_file(const std::string& path, portable_regex::Syntax syntax,
-                      ParseContext& parse_context)
-    -> cp::Result<std::vector<Script>> {
+auto read_script_file(const std::string& path) -> cp::Result<std::string> {
   std::ifstream in(path, std::ios::binary);
   if (!in.is_open())
     return std::unexpected("cannot open script file '" + path + "'");
-  std::string script(std::istreambuf_iterator<char>{in},
+  return std::string(std::istreambuf_iterator<char>{in},
                      std::istreambuf_iterator<char>{});
-  return parse_script_text(script, syntax, parse_context);
 }
 
 auto address_uses_gnu_extension(const Script::Address& addr) -> bool {
@@ -1336,24 +1340,34 @@ auto build_config(const CommandContext<SED_OPTIONS.size()>& ctx)
 
   auto script_options =
       ctx.string_occurrences({"--expression", "-e", "--file", "-f"});
-  for (const auto& occurrence : script_options) {
-    if (occurrence.long_name == "--expression" ||
-        occurrence.short_name == "-e") {
-      auto s =
-          parse_script_text(occurrence.value, cfg.regex_syntax, parse_context);
-      if (!s) return std::unexpected(s.error());
-      scripts.insert(scripts.end(), s->begin(), s->end());
-    } else if (occurrence.long_name == "--file" ||
-               occurrence.short_name == "-f") {
-      auto fscripts =
-          read_script_file(occurrence.value, cfg.regex_syntax, parse_context);
-      if (!fscripts) return std::unexpected(fscripts.error());
-      scripts.insert(scripts.end(), fscripts->begin(), fscripts->end());
+  if (!script_options.empty()) {
+    // [GNU] Every -e expression and -f file is concatenated (separated by
+    // newlines) into a single script before it is compiled, so brace groups,
+    // a/i/c text bodies, labels and comments may span option boundaries:
+    //   sed -e '1{' -e 'p' -e '}'
+    std::string script_text;
+    for (const auto& occurrence : script_options) {
+      if (occurrence.long_name == "--expression" ||
+          occurrence.short_name == "-e") {
+        script_text += occurrence.value;
+        script_text += '\n';
+      } else if (occurrence.long_name == "--file" ||
+                 occurrence.short_name == "-f") {
+        auto file_text = read_script_file(occurrence.value);
+        if (!file_text) return std::unexpected(file_text.error());
+        script_text += *file_text;
+        script_text += '\n';
+      }
     }
+    auto s = parse_script_text(script_text, cfg.regex_syntax, parse_context);
+    if (!s) return std::unexpected(s.error());
+    scripts.insert(scripts.end(), s->begin(), s->end());
   }
 
   size_t consumed_positional = 0;
-  if (scripts.empty()) {
+  // When -e/-f supplied the script (even an empty one, as in "sed -e '' FILE"),
+  // the first positional operand is an input file, not a script.
+  if (script_options.empty()) {
     if (ctx.positionals.empty()) return std::unexpected("script required");
     auto s =
         parse_script_text(ctx.positionals[0], cfg.regex_syntax, parse_context);
@@ -2200,8 +2214,8 @@ auto preserve_in_place_backup(const std::filesystem::path& original,
                               const std::string& suffix) -> bool {
   if (suffix.empty()) return true;
 
-  auto backup = make_in_place_backup_path(
-      wstring_to_utf8(original.wstring()), suffix);
+  auto backup =
+      make_in_place_backup_path(wstring_to_utf8(original.wstring()), suffix);
   std::error_code ec;
   std::filesystem::copy_file(
       original, backup, std::filesystem::copy_options::overwrite_existing, ec);
@@ -2313,6 +2327,13 @@ auto process_files(const Config& cfg) -> int {
     std::ifstream file;
     std::istream* in = nullptr;
     if (f == "-") {
+      // [GNU] closed stdin (<&-) reports a read error instead of
+      // dereferencing a bad stream (MSYS sed itself segfaults here).
+      if (file_io::stdin_is_bad()) {
+        safeErrorPrint("sed: can't read -: Bad file descriptor\n");
+        any_error = true;
+        continue;
+      }
       in = &std::cin;
     } else {
       file.open(f, std::ios::binary);

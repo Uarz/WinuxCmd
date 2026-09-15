@@ -185,11 +185,16 @@ auto output_reversed_records(const std::vector<std::string>& records) -> void {
 }
 
 auto run(const Config& cfg) -> int {
+  // [GNU] tac.c: an unreadable operand is diagnosed but does not stop the
+  // remaining files; the exit status only turns nonzero once every operand
+  // has been processed.
+  bool any_error = false;
   for (const auto& file : cfg.files) {
     auto content = read_source(file);
     if (!content) {
       cp::report_error(content, L"tac");
-      return 1;
+      any_error = true;
+      continue;
     }
 
     cp::Result<std::vector<std::string>> records =
@@ -198,12 +203,13 @@ auto run(const Config& cfg) -> int {
                         *content, cfg.separator, cfg.before)};
     if (!records) {
       cp::report_error(records, L"tac");
-      return 1;
+      any_error = true;
+      continue;
     }
     output_reversed_records(*records);
   }
 
-  return 0;
+  return any_error ? 1 : 0;
 }
 
 }  // namespace tac_pipeline

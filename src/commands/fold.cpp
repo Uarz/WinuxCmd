@@ -46,7 +46,7 @@ using cmd::meta::OptionType;
 auto constexpr FOLD_OPTIONS = std::array{
     // [GNU]
     OPTION("-b", "--bytes", "count bytes rather than columns", BOOL_TYPE),
-    // [EXT] -c/--characters: not in GNU fold, WinuxCmd extension
+    // [GNU] -c/--characters (added in coreutils 9.5)
     OPTION("-c", "--characters", "count characters rather than columns",
            BOOL_TYPE),
     // [GNU]
@@ -83,8 +83,8 @@ auto parse_width(std::string_view value) -> cp::Result<int> {
     return std::unexpected("Numerical result out of range");
   }
   if (ec != std::errc() || ptr != value.data() + value.size() || parsed < 0) {
-    return std::unexpected("invalid number of columns: '" +
-                           std::string(value) + "'");
+    return std::unexpected("invalid number of columns: '" + std::string(value) +
+                           "'");
   }
   return static_cast<int>(parsed);
 }
@@ -320,6 +320,12 @@ auto run(const Config& cfg) -> int {
   for (const auto& file : cfg.files) {
     std::string content;
     if (file == "-") {
+      // [GNU] closed stdin (<&-) errors "fold: -: Bad file descriptor".
+      if (file_io::stdin_is_bad()) {
+        cp::Result<int> result = std::unexpected("-: Bad file descriptor");
+        cp::report_error(result, L"fold");
+        return 1;
+      }
       content.assign(std::istreambuf_iterator<char>(std::cin),
                      std::istreambuf_iterator<char>());
     } else {

@@ -55,13 +55,20 @@ static bool component_contains_wildcard(std::wstring_view segment) {
          segment.find(L'[') != std::wstring_view::npos;
 }
 
-static auto to_lower_asciiish(std::wstring_view s) -> std::wstring {
-  std::wstring result;
-  result.reserve(static_cast<size_t>(s.size()));
-  for (wchar_t c : s) {
-    result.push_back(std::towlower(c));
-  }
-  return result;
+/**
+ * @brief POSIX leading-dot rule for one pattern component
+ * @param segment A single path component of the pattern
+ * @param filename A candidate filename in the scanned directory
+ * @return true when the candidate must be skipped
+ *
+ * GNU/POSIX globbing never lets '*', '?' or a bracket expression match a
+ * leading '.' in a path component; only a literal '.' at the start of the
+ * pattern component can match it (so "[.]x" does NOT match ".x").
+ */
+static bool leading_dot_blocks_match(std::wstring_view segment,
+                                     std::wstring_view filename) {
+  return !filename.empty() && filename.front() == L'.' &&
+         (segment.empty() || segment.front() != L'.');
 }
 
 /**
@@ -218,8 +225,10 @@ static auto expand_path_components(std::wstring_view pattern)
       for (const auto &entry :
            std::filesystem::directory_iterator(dir, iter_ec)) {
         std::wstring filename = entry.path().filename().wstring();
-        if (wildcard_match_impl(to_lower_asciiish(segment),
-                                to_lower_asciiish(filename))) {
+        if (leading_dot_blocks_match(segment, filename)) continue;
+        // GNU glob matching is case-sensitive even on case-insensitive
+        // filesystems.
+        if (wildcard_match_impl(segment, filename)) {
           if (base.empty()) {
             next.push_back(std::filesystem::path(filename));
           } else {
@@ -338,27 +347,34 @@ export GlobResult glob_expand(std::wstring_view pattern) {
     }
   } else {
     // Use FindFirstFileW for * and ? patterns (faster)
+    std::wstring pattern_str(pattern);
     WIN32_FIND_DATAW find_data;
-    HANDLE hFind = FindFirstFileW(pattern.data(), &find_data);
+    HANDLE hFind = FindFirstFileW(pattern_str.c_str(), &find_data);
 
     if (hFind != INVALID_HANDLE_VALUE) {
-      // Extract directory part from pattern
-      std::wstring pattern_str(pattern);
+      // Extract directory part and final component from the pattern.
       size_t last_sep = pattern_str.find_last_of(L"\\/");
       std::wstring dir;
+      std::wstring_view leaf(pattern_str);
       if (last_sep != std::wstring::npos) {
         dir = pattern_str.substr(0, last_sep + 1);
+        leaf = leaf.substr(last_sep + 1);
       }
 
       do {
         std::wstring filename = find_data.cFileName;
         // Skip . and .. entries
-        if (filename != L"." && filename != L"..") {
-          if (!dir.empty()) {
-            result.files.push_back(dir + filename);
-          } else {
-            result.files.push_back(filename);
-          }
+        if (filename == L"." || filename == L"..") continue;
+        // FindFirstFileW applies DOS wildcard semantics: it is
+        // case-insensitive, lets '*'/'?' match a leading '.', and also
+        // matches 8.3 short names (e.g. "*1" hits "DOT~1"). Re-check every
+        // candidate with the POSIX matcher so only true matches survive.
+        if (wildcard_impl::leading_dot_blocks_match(leaf, filename)) continue;
+        if (!wildcard_impl::wildcard_match_impl(leaf, filename)) continue;
+        if (!dir.empty()) {
+          result.files.push_back(dir + filename);
+        } else {
+          result.files.push_back(filename);
         }
       } while (FindNextFileW(hFind, &find_data) != 0);
       FindClose(hFind);

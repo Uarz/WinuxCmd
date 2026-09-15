@@ -29,6 +29,10 @@ using cmd::meta::OptionType;
 // [GNU] --skip-functions: do not read shell functions
 auto constexpr WHICH_OPTIONS = std::array{
     OPTION("-a", "--all", "print all matching pathnames of each argument"),
+    // [GNU] -i: read aliases from stdin (same as --read-alias); hidden
+    OPTION("-i", "", "", BOOL_TYPE),
+    // [GNU] -v: print version (declared so --version interception applies)
+    OPTION("-v", "--version", "print version information"),
     OPTION("-s", "--silent", "suppress all normal output"),
     OPTION("", "--quiet", "suppress all normal output"),
     OPTION("", "--skip-dot", "skip directories in PATH that start with a dot"),
@@ -408,8 +412,10 @@ auto build_config(const CommandContext<WHICH_OPTIONS.size()>& ctx)
   cfg.skip_tilde = ctx.get<bool>("--skip-tilde", false);
   cfg.show_dot = ctx.get<bool>("--show-dot", false);
   cfg.show_tilde = ctx.get<bool>("--show-tilde", false);
-  cfg.tty_only = ctx.get<bool>("--tty-only", false);              // [DIFFERS]
-  cfg.read_alias = ctx.get<bool>("--read-alias", false);          // [DIFFERS]
+  cfg.tty_only = ctx.get<bool>("--tty-only", false);  // [DIFFERS]
+  // [GNU] -i is the short form of --read-alias (#1071).
+  cfg.read_alias =
+      ctx.get<bool>("--read-alias", false) || ctx.get<bool>("-i", false);
   cfg.skip_alias = ctx.get<bool>("--skip-alias", false);          // [DIFFERS]
   cfg.read_functions = ctx.get<bool>("--read-functions", false);  // [DIFFERS]
   cfg.skip_functions = ctx.get<bool>("--skip-functions", false);  // [DIFFERS]

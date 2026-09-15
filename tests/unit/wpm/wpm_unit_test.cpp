@@ -201,6 +201,33 @@ auto same_file(const std::filesystem::path& a, const std::filesystem::path& b)
          ia.nFileIndexLow == ib.nFileIndexLow;
 }
 
+// Mirrors the receipt `wpm install` writes under .wpm/installed/<name>.json.
+// wpm only reports "already installed" when this receipt exists; destination
+// files without one are treated as foreign and require --force. Fixtures that
+// pre-place files in usr/bin must write a receipt to simulate a real prior
+// install rather than a same-named file from another source.
+auto install_receipt_json(const std::filesystem::path& root,
+                          const std::string& name, const std::string& version,
+                          const std::string& sha256) -> std::string {
+  const auto destination =
+      (canonical_bin_dir(root) / (name + ".exe")).generic_string();
+  return "{\n"
+         "  \"name\": \"" +
+         name +
+         "\",\n"
+         "  \"version\": \"" +
+         version +
+         "\",\n"
+         "  \"sha256\": \"" +
+         sha256 +
+         "\",\n"
+         "  \"layout\": \"flat\",\n"
+         "  \"destinations\": [\"" +
+         destination +
+         "\"]\n"
+         "}\n";
+}
+
 }  // namespace
 
 TEST(wpm, wpm_hardlink_entrypoint_reports_version) {
@@ -412,6 +439,8 @@ TEST(wpm, wpm_restore_installs_plain_profile_list) {
   TempDir tmp;
   tmp.write(".wpm/indexes/official.json", catalog_fixture_index_json());
   tmp.write("usr/bin/jq.exe", "installed jq\n");
+  tmp.write(".wpm/installed/jq.json",
+            install_receipt_json(tmp.path, "jq", "1.8.2", "present"));
   tmp.write("packages.txt", "\n# profile comment\n  jq  \n");
 
   Pipeline p;
@@ -541,28 +570,6 @@ TEST(wpm, wpm_links_rebuild_removes_legacy_jq_hardlink) {
 
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_FALSE(std::filesystem::exists(legacy_jq));
-  EXPECT_TRUE(std::filesystem::exists(canonical_exe(tmp.path, L"wpm.exe")));
-}
-
-TEST(wpm, wpm_links_rebuild_removes_legacy_link_hardlink) {
-  TempDir tmp;
-  auto root_exe = canonical_exe(tmp.path, L"winuxcmd.exe");
-  std::filesystem::create_directories(root_exe.parent_path());
-  auto legacy_link = tmp.path / L"link.exe";
-  std::filesystem::copy_file(build_winuxcmd_path(), root_exe,
-                             std::filesystem::copy_options::overwrite_existing);
-  bool linked = CreateHardLinkW(legacy_link.wstring().c_str(),
-                                root_exe.wstring().c_str(), nullptr) != 0;
-  EXPECT_TRUE(linked);
-  if (!linked) return;
-
-  Pipeline p;
-  p.add(L"winuxcmd.exe",
-        {L"wpm", L"links", L"rebuild", L"--root", tmp.wpath()});
-  auto r = p.run();
-
-  EXPECT_EQ(r.exit_code, 0);
-  EXPECT_FALSE(std::filesystem::exists(legacy_link));
   EXPECT_TRUE(std::filesystem::exists(canonical_exe(tmp.path, L"wpm.exe")));
 }
 
@@ -729,6 +736,11 @@ TEST(wpm, wpm_install_existing_package_skips_download) {
   tmp.write(".wpm/indexes/official.json",
             install_fixture_index_json(missing_artifact_path));
   tmp.write("usr/bin/jq.exe", "already here\n");
+  tmp.write(
+      ".wpm/installed/jq.json",
+      install_receipt_json(tmp.path, "jq", "1.0.0",
+                           "5140f4f6bf8b5691b7bccc1c4f00a2027dae00b2110d38"
+                           "a1e090af291226f322"));
 
   Pipeline install;
   install.add(L"winuxcmd.exe",

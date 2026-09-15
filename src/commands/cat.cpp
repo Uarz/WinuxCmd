@@ -35,6 +35,7 @@
 #include "pch/pch.h"
 // include other header after pch.h
 #include <cerrno>
+
 #include "core/command_macros.h"
 import std;
 import core;
@@ -349,8 +350,29 @@ REGISTER_COMMAND(cat, "cat",
       return true;
     }
 
+    // [GNU] /dev/stdin-family operands read the real fd 0 (#1056). A closed
+    // stdin makes the /proc/self/fd symlink dangle under GNU, so the failure
+    // is ENOENT — not EBADF like the "-" operand.
+    if (native_path::pseudo_device_std_fd(path) == std::optional<int>(0)) {
+      if (file_io::stdin_is_bad()) {
+        safeErrorPrint("cat: ");
+        safeErrorPrint(path);
+        safeErrorPrint(": No such file or directory\n");
+        return false;
+      }
+      process_stream(std::cin, ctx, state);
+      if (std::cin.bad()) {
+        safeErrorPrint("cat: error reading '");
+        safeErrorPrint(path);
+        safeErrorPrint("'\n");
+        return false;
+      }
+      return true;
+    }
+
     auto operand = native_path::make_api_path_operand(path);
-    const DWORD operand_attrs = native_path::attributes_w(operand.extended);
+    const DWORD operand_attrs =
+        native_path::operand_target_attributes_w(operand);
     if (operand.had_trailing_separator &&
         native_path::attributes_are_regular_file(operand_attrs)) {
       safeErrorPrint("cat: ");
@@ -358,13 +380,17 @@ REGISTER_COMMAND(cat, "cat",
       safeErrorPrintLn(": Not a directory");
       return false;
     }
-    std::ifstream file(std::filesystem::path(operand.extended),
-                       std::ios::binary);
+    // A WinuxCmd fifo marker (#1038) bridges to a named pipe read.
+    std::ifstream file =
+        native_path::is_winux_fifo_w(operand.normalized)
+            ? file_io::open_binary_file(path)
+            : std::ifstream(std::filesystem::path(operand.extended),
+                            std::ios::binary);
     if (!file) {
       safeErrorPrint("cat: ");
       safeErrorPrint(path);
       safeErrorPrint(": ");
-      const DWORD attrs = native_path::attributes_w(operand.extended);
+      const DWORD attrs = native_path::operand_target_attributes_w(operand);
       if (operand.had_trailing_separator &&
           native_path::attributes_are_regular_file(attrs)) {
         safeErrorPrint("Not a directory");

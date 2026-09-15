@@ -160,6 +160,168 @@ auto format_missing_reference_error(const std::string &path, DWORD error)
 }
 
 /**
+ * @brief GNU-style "cannot access" diagnostic with the errno-style reason
+ * appended (issue 327: previously the reason was missing).
+ */
+auto format_access_error(const std::string &path, DWORD error) -> std::string {
+  const char *reason;
+  switch (error) {
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+    case ERROR_INVALID_NAME:
+      reason = "No such file or directory";
+      break;
+    case ERROR_ACCESS_DENIED:
+    case ERROR_SHARING_VIOLATION:
+    case ERROR_WRITE_PROTECT:
+      reason = "Permission denied";
+      break;
+    case ERROR_FILENAME_EXCED_RANGE:
+      reason = "File name too long";
+      break;
+    case ERROR_DIRECTORY:
+      reason = "Not a directory";
+      break;
+    default:
+      reason = "Input/output error";
+      break;
+  }
+  return "cannot access '" + path + "': " + reason;
+}
+
+/** @brief English Win32 error text for diagnostics. */
+auto win32_error_text(DWORD error) -> std::wstring {
+  LPWSTR raw = nullptr;
+  const DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                      FORMAT_MESSAGE_FROM_SYSTEM |
+                      FORMAT_MESSAGE_IGNORE_INSERTS;
+  DWORD len = FormatMessageW(flags, nullptr, error,
+                             MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US),
+                             reinterpret_cast<LPWSTR>(&raw), 0, nullptr);
+  if (len == 0 || raw == nullptr) {
+    len = FormatMessageW(flags, nullptr, error,
+                         MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+                         reinterpret_cast<LPWSTR>(&raw), 0, nullptr);
+  }
+  if (len == 0 || raw == nullptr) return L"unknown error";
+  std::wstring message(raw, len);
+  LocalFree(raw);
+  while (!message.empty() &&
+         (message.back() == L'\r' || message.back() == L'\n' ||
+          message.back() == L' ' || message.back() == L'\t')) {
+    message.pop_back();
+  }
+  return message;
+}
+
+/**
+ * @brief Synthetic Unix mode for a Windows file, matching the
+ * MSYS-visible mapping: FILE_ATTRIBUTE_READONLY clears all write bits and
+ * executable extensions set x bits.  Used only for GNU-style -v/-c
+ * diagnostics.
+ */
+auto synthetic_mode(const std::string &path, DWORD attrs) -> unsigned int {
+  const bool is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+  // GNU sees umask-022 defaults (0644/0755) on POSIX filesystems; the
+  // MSYS layer presents the same view for ordinary Windows files.
+  unsigned int mode = is_dir ? 0755u : 0644u;
+  const auto dot = path.find_last_of('.');
+  const auto sep = path.find_last_of("\\/");
+  if (dot != std::string::npos && (sep == std::string::npos || dot > sep)) {
+    std::string ext = path.substr(dot + 1);
+    for (auto &c : ext) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (ext == "exe" || ext == "bat" || ext == "cmd" || ext == "com" ||
+        ext == "ps1") {
+      mode |= 0111u;
+    }
+  }
+  if (attrs & FILE_ATTRIBUTE_READONLY) mode &= ~0222u;
+  return mode;
+}
+
+/**
+ * @brief Format a mode the way GNU -v prints it: "0644 (rw-r--r--)".
+ */
+auto format_mode_verbose(unsigned int mode, bool is_dir) -> std::string {
+  char oct[8];
+  std::snprintf(oct, sizeof(oct), "%04o", mode & 07777u);
+  char perms[11];
+  perms[0] = is_dir ? 'd' : '-';
+  constexpr std::string_view rwx = "rwxrwxrwx";
+  for (int i = 0; i < 9; ++i) {
+    perms[i + 1] = (mode & (0400u >> i)) ? rwx[i] : '-';
+  }
+  perms[10] = '\0';
+  return std::string(oct) + " (" + perms + ")";
+}
+
+/**
+ * @brief Apply a parsed symbolic clause to a mode for -v/-c display only.
+ * (The on-disk effect is limited to the owner-write bit on Windows.)
+ */
+auto apply_clause_for_display(unsigned int mode,
+                              const SymbolicModeClause &clause, bool is_dir)
+    -> unsigned int {
+  unsigned int who_mask = 0;
+  for (char w : clause.who) {
+    if (w == 'a' || w == 'u') who_mask |= 0700u;
+    if (w == 'a' || w == 'g') who_mask |= 0070u;
+    if (w == 'a' || w == 'o') who_mask |= 0007u;
+  }
+  unsigned int perm_bits = 0;
+  for (char p : clause.perms) {
+    if (p == 'r') {
+      perm_bits |= 0444u;
+    } else if (p == 'w') {
+      perm_bits |= 0222u;
+    } else if (p == 'x') {
+      perm_bits |= 0111u;
+    } else if (p == 'X' && (is_dir || (mode & 0111u))) {
+      perm_bits |= 0111u;
+    }
+    // 's' and 't' have no Windows attribute counterpart.
+  }
+  perm_bits &= who_mask;
+  switch (clause.op) {
+    case '+':
+      return mode | perm_bits;
+    case '-':
+      return mode & ~perm_bits;
+    case '=':
+      return (mode & ~who_mask) | perm_bits;
+    default:
+      return mode;
+  }
+}
+
+/**
+ * @brief Print GNU-style -v/-c output for one operand.
+ */
+auto report_mode_change(const std::string &path, unsigned int old_mode,
+                        unsigned int new_mode, bool changed, bool verbose,
+                        bool changes, bool is_dir) -> void {
+  if (changed) {
+    if (verbose || changes) {
+      safePrint("mode of '");
+      safePrint(path);
+      safePrint("' changed from ");
+      safePrint(format_mode_verbose(old_mode, is_dir));
+      safePrint(" to ");
+      safePrint(format_mode_verbose(new_mode, is_dir));
+      safePrint("\n");
+    }
+  } else if (verbose) {
+    safePrint("mode of '");
+    safePrint(path);
+    safePrint("' retained as ");
+    safePrint(format_mode_verbose(old_mode, is_dir));
+    safePrint("\n");
+  }
+}
+
+/**
  * @brief Parse symbolic mode (e.g., "u+rwx", "go-w", "a=rx")
  * @param mode_str Mode string to parse
  * @return Tuple of (who, op, perms) or error message
@@ -250,11 +412,12 @@ auto numeric_to_permissions(int mode) -> std::string {
 auto apply_symbolic_mode(const std::string &path, const std::string &who,
                          char op, const std::string &perms)
     -> cp::Result<bool> {
-  std::wstring wpath = utf8_to_wstring(path);
+  const auto operand = native_path::make_api_path_operand(path);
+  const std::wstring &wpath = operand.extended;
 
   WIN32_FILE_ATTRIBUTE_DATA attr_data;
   if (!GetFileAttributesExW(wpath.c_str(), GetFileExInfoStandard, &attr_data)) {
-    return std::unexpected("cannot access '" + path + "'");
+    return std::unexpected(format_access_error(path, GetLastError()));
   }
 
   DWORD attrs = attr_data.dwFileAttributes;
@@ -290,7 +453,8 @@ auto apply_symbolic_mode(const std::string &path, const std::string &who,
   bool changed = (attrs != new_attrs);
 
   if (changed && !SetFileAttributesW(wpath.c_str(), new_attrs)) {
-    return std::unexpected("failed to set attributes for '" + path + "'");
+    return std::unexpected("cannot change permissions of '" + path + "': " +
+                           wstring_to_utf8(win32_error_text(GetLastError())));
   }
 
   return changed;
@@ -303,11 +467,12 @@ auto apply_symbolic_mode(const std::string &path, const std::string &who,
  * @return Result with success status
  */
 auto apply_numeric_mode(const std::string &path, int mode) -> cp::Result<bool> {
-  std::wstring wpath = utf8_to_wstring(path);
+  const auto operand = native_path::make_api_path_operand(path);
+  const std::wstring &wpath = operand.extended;
 
   WIN32_FILE_ATTRIBUTE_DATA attr_data;
   if (!GetFileAttributesExW(wpath.c_str(), GetFileExInfoStandard, &attr_data)) {
-    return std::unexpected("cannot access '" + path + "'");
+    return std::unexpected(format_access_error(path, GetLastError()));
   }
 
   DWORD attrs = attr_data.dwFileAttributes;
@@ -329,7 +494,8 @@ auto apply_numeric_mode(const std::string &path, int mode) -> cp::Result<bool> {
   bool changed = (attrs != new_attrs);
 
   if (changed && !SetFileAttributesW(wpath.c_str(), new_attrs)) {
-    return std::unexpected("failed to set attributes for '" + path + "'");
+    return std::unexpected("cannot change permissions of '" + path + "': " +
+                           wstring_to_utf8(win32_error_text(GetLastError())));
   }
 
   return changed;
@@ -337,11 +503,12 @@ auto apply_numeric_mode(const std::string &path, int mode) -> cp::Result<bool> {
 
 auto apply_reference_mode(const std::string &path, DWORD reference_attrs)
     -> cp::Result<bool> {
-  std::wstring wpath = utf8_to_wstring(path);
+  const auto operand = native_path::make_api_path_operand(path);
+  const std::wstring &wpath = operand.extended;
 
   WIN32_FILE_ATTRIBUTE_DATA attr_data;
   if (!GetFileAttributesExW(wpath.c_str(), GetFileExInfoStandard, &attr_data)) {
-    return std::unexpected("cannot access '" + path + "'");
+    return std::unexpected(format_access_error(path, GetLastError()));
   }
 
   DWORD attrs = attr_data.dwFileAttributes;
@@ -354,7 +521,8 @@ auto apply_reference_mode(const std::string &path, DWORD reference_attrs)
 
   bool changed = (attrs != new_attrs);
   if (changed && !SetFileAttributesW(wpath.c_str(), new_attrs)) {
-    return std::unexpected("failed to set attributes for '" + path + "'");
+    return std::unexpected("cannot change permissions of '" + path + "': " +
+                           wstring_to_utf8(win32_error_text(GetLastError())));
   }
 
   return changed;
@@ -441,6 +609,18 @@ auto process_file(const std::string &path, std::string_view mode_str,
     return std::unexpected(mode_result.error());
   }
 
+  // [GNU] -v/-c need the pre-change mode for "changed from A to B" /
+  // "retained as A" diagnostics (issue 987).
+  const auto operand = native_path::make_api_path_operand(path);
+  WIN32_FILE_ATTRIBUTE_DATA before{};
+  const bool had_before =
+      GetFileAttributesExW(operand.extended.c_str(), GetFileExInfoStandard,
+                           &before) != 0;
+  const bool is_dir =
+      had_before && (before.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+  const unsigned int old_mode =
+      had_before ? synthetic_mode(path, before.dwFileAttributes) : 0;
+
   bool changed = false;
 
   if (mode_result.value().is_numeric) {
@@ -470,13 +650,21 @@ auto process_file(const std::string &path, std::string_view mode_str,
     }
   }
 
-  // Report change
-  if (changed && (verbose || changes)) {
-    safePrint("mode of '");
-    safePrint(path);
-    safePrint("' changed to ");
-    safePrint(mode_str);
-    safePrint("\n");
+  // [GNU] chmod reports the mode transition, not just whether the
+  // FILE_ATTRIBUTE_READONLY bit moved: "changed" is displayed whenever
+  // the resulting mode differs from the synthetic old mode (issue 987).
+  if (verbose || changes) {
+    unsigned int new_mode = old_mode;
+    if (mode_result.value().is_numeric) {
+      new_mode =
+          static_cast<unsigned int>(mode_result.value().numeric_mode) & 07777u;
+    } else {
+      for (const auto &clause : mode_result.value().symbolic_clauses) {
+        new_mode = apply_clause_for_display(new_mode, clause, is_dir);
+      }
+    }
+    report_mode_change(path, old_mode, new_mode, old_mode != new_mode, verbose,
+                       changes, is_dir);
   }
 
   return changed;
@@ -493,6 +681,17 @@ auto process_file_reference(const std::string &path, DWORD reference_attrs,
                 ctx.get<bool>("--silent", false) ||
                 ctx.get<bool>("--quiet", false);
 
+  const auto operand = native_path::make_api_path_operand(path);
+  WIN32_FILE_ATTRIBUTE_DATA before{};
+  const bool had_before =
+      GetFileAttributesExW(operand.extended.c_str(), GetFileExInfoStandard,
+                           &before) != 0;
+  const bool is_dir =
+      had_before && (before.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+  const unsigned int old_mode =
+      had_before ? synthetic_mode(path, before.dwFileAttributes) : 0;
+  const unsigned int new_mode = synthetic_mode(path, reference_attrs);
+
   auto result = apply_reference_mode(path, reference_attrs);
   if (!result) {
     if (!silent) {
@@ -504,10 +703,9 @@ auto process_file_reference(const std::string &path, DWORD reference_attrs,
   }
 
   bool changed = result.value();
-  if (changed && (verbose || changes)) {
-    safePrint("mode of '");
-    safePrint(path);
-    safePrint("' changed\n");
+  if (verbose || changes) {
+    report_mode_change(path, old_mode, new_mode, old_mode != new_mode, verbose,
+                       changes, is_dir);
   }
 
   return changed;
@@ -523,15 +721,16 @@ auto process_file_reference(const std::string &path, DWORD reference_attrs,
 auto process_recursive(const std::string &path, std::string_view mode_str,
                        const CommandContext<CHMOD_OPTIONS.size()> &ctx)
     -> cp::Result<void> {
-  std::wstring wpath = utf8_to_wstring(path);
+  const auto operand = native_path::make_api_path_operand(path);
+  const std::wstring &wpath = operand.extended;
 
   WIN32_FILE_ATTRIBUTE_DATA attr_data;
   if (!GetFileAttributesExW(wpath.c_str(), GetFileExInfoStandard, &attr_data)) {
     if (!ctx.get<bool>("-f", false) && !ctx.get<bool>("--silent", false) &&
         !ctx.get<bool>("--quiet", false)) {
-      safeErrorPrint("chmod: cannot access '");
-      safeErrorPrint(path);
-      safeErrorPrint("'\n");
+      safeErrorPrint("chmod: ");
+      safeErrorPrint(format_access_error(path, GetLastError()));
+      safeErrorPrint("\n");
     }
     return std::unexpected("cannot access path");
   }
@@ -539,14 +738,10 @@ auto process_recursive(const std::string &path, std::string_view mode_str,
   bool is_directory =
       (attr_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 
-  // Process the current path
+  // Process the current path.  process_file reports its own errors;
+  // do not echo them again here (issue 327: GNU prints each diagnostic once).
   auto result = process_file(path, mode_str, ctx);
-  if (!result && !ctx.get<bool>("-f", false) &&
-      !ctx.get<bool>("--silent", false) && !ctx.get<bool>("--quiet", false)) {
-    safeErrorPrint("chmod: ");
-    safeErrorPrint(result.error());
-    safeErrorPrint("\n");
-  }
+  (void)result;
 
   // If it's a directory, process its contents
   if (is_directory) {
@@ -565,15 +760,8 @@ auto process_recursive(const std::string &path, std::string_view mode_str,
 
         std::string subpath = path + "\\" + wstring_to_utf8(filename);
 
-        // Recursively process
-        auto sub_result = process_recursive(subpath, mode_str, ctx);
-        if (!sub_result && !ctx.get<bool>("-f", false) &&
-            !ctx.get<bool>("--silent", false) &&
-            !ctx.get<bool>("--quiet", false)) {
-          safeErrorPrint("chmod: ");
-          safeErrorPrint(sub_result.error());
-          safeErrorPrint("\n");
-        }
+        // Recursively process.  The child reports its own diagnostics.
+        (void)process_recursive(subpath, mode_str, ctx);
       } while (FindNextFileW(hFind, &find_data) != 0);
 
       FindClose(hFind);
@@ -586,15 +774,16 @@ auto process_recursive(const std::string &path, std::string_view mode_str,
 auto process_recursive_reference(
     const std::string &path, DWORD reference_attrs,
     const CommandContext<CHMOD_OPTIONS.size()> &ctx) -> cp::Result<void> {
-  std::wstring wpath = utf8_to_wstring(path);
+  const auto operand = native_path::make_api_path_operand(path);
+  const std::wstring &wpath = operand.extended;
 
   WIN32_FILE_ATTRIBUTE_DATA attr_data;
   if (!GetFileAttributesExW(wpath.c_str(), GetFileExInfoStandard, &attr_data)) {
     if (!ctx.get<bool>("-f", false) && !ctx.get<bool>("--silent", false) &&
         !ctx.get<bool>("--quiet", false)) {
-      safeErrorPrint("chmod: cannot access '");
-      safeErrorPrint(path);
-      safeErrorPrint("'\n");
+      safeErrorPrint("chmod: ");
+      safeErrorPrint(format_access_error(path, GetLastError()));
+      safeErrorPrint("\n");
     }
     return std::unexpected("cannot access path");
   }
@@ -602,13 +791,8 @@ auto process_recursive_reference(
   bool is_directory =
       (attr_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 
-  auto result = process_file_reference(path, reference_attrs, ctx);
-  if (!result && !ctx.get<bool>("-f", false) &&
-      !ctx.get<bool>("--silent", false) && !ctx.get<bool>("--quiet", false)) {
-    safeErrorPrint("chmod: ");
-    safeErrorPrint(result.error());
-    safeErrorPrint("\n");
-  }
+  // process_file_reference reports its own errors; do not repeat them.
+  (void)process_file_reference(path, reference_attrs, ctx);
 
   if (is_directory) {
     std::wstring search_path = wpath + L"\\*";
@@ -623,15 +807,7 @@ auto process_recursive_reference(
         }
 
         std::string subpath = path + "\\" + wstring_to_utf8(filename);
-        auto sub_result =
-            process_recursive_reference(subpath, reference_attrs, ctx);
-        if (!sub_result && !ctx.get<bool>("-f", false) &&
-            !ctx.get<bool>("--silent", false) &&
-            !ctx.get<bool>("--quiet", false)) {
-          safeErrorPrint("chmod: ");
-          safeErrorPrint(sub_result.error());
-          safeErrorPrint("\n");
-        }
+        (void)process_recursive_reference(subpath, reference_attrs, ctx);
       } while (FindNextFileW(hFind, &find_data) != 0);
 
       FindClose(hFind);

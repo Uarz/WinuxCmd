@@ -164,9 +164,25 @@ auto run(const Config& cfg) -> int {
     return 1;
   }
 
-  safeErrorPrint("mknod: cannot create special file '");
+  if (cfg.type == NodeType::Fifo) {
+    const DWORD created =
+        native_path::create_winux_fifo_w(utf8_to_wstring(cfg.name));
+    if (created != ERROR_SUCCESS) {
+      safeErrorPrint("mknod: '");
+      safeErrorPrint(cfg.name);
+      safeErrorPrint("': ");
+      safeErrorPrint(win32_posix_error_text(
+          created, {.file_exists = true, .invalid_name_as_missing = true}));
+      safeErrorPrint("\n");
+      return 1;
+    }
+    return 0;
+  }
+
+  // Block/character device nodes have no Windows equivalent.
+  safeErrorPrint("mknod: '");
   safeErrorPrint(cfg.name);
-  safeErrorPrint("': special files are not supported on Windows\n");
+  safeErrorPrint("': Operation not permitted\n");
   return 1;
 }
 
@@ -176,10 +192,9 @@ REGISTER_COMMAND(
     mknod, "mknod", "mknod [OPTION]... NAME TYPE [MAJOR MINOR]",
     "Create the special file NAME of the given TYPE.\n"
     "\n"
-    "WinuxCmd accepts the GNU-compatible command line surface for mknod, but\n"
-    "Windows does not provide POSIX special files or device nodes equivalent\n"
-    "to `mknod`. This command therefore acts as a compatibility placeholder\n"
-    "and reports that special files are not supported on Windows.",
+    "Type 'p' creates a FIFO: on Windows this is an on-disk marker file\n"
+    "that WinuxCmd commands bridge to a named pipe. Block and character\n"
+    "device nodes have no Windows equivalent and report an error.",
     "  mknod mypipe p\n"
     "  mknod ttyS0 c 4 64\n"
     "  mknod sda b 8 0",

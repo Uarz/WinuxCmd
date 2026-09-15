@@ -2193,7 +2193,11 @@ auto configure_sizes(const CommandContext<LS_OPTIONS.size()> &ctx)
 
     if (meta.long_name == "--block-size") {
       auto value = std::get_if<std::string>(&occurrence.value);
-      if (!value) return std::unexpected("invalid block size");
+      auto bad = [&]() {
+        return std::unexpected("invalid --block-size argument '" +
+                               (value ? *value : std::string()) + "'");
+      };
+      if (!value) return bad();
 
       if (*value == "human-readable") {
         cfg.file_mode = SizeMode::Human;
@@ -2207,7 +2211,7 @@ auto configure_sizes(const CommandContext<LS_OPTIONS.size()> &ctx)
       }
 
       auto parsed = parse_block_size(*value);
-      if (!parsed) return std::unexpected("invalid block size");
+      if (!parsed) return bad();
       cfg.file_mode = SizeMode::Blocks;
       cfg.file_block_size = *parsed;
       cfg.block_mode = SizeMode::Blocks;

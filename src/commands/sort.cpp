@@ -469,7 +469,7 @@ struct ParsedKeyPosition {
 
 auto parse_key_position(std::string_view text)
     -> cp::Result<ParsedKeyPosition> {
-  if (text.empty()) return std::unexpected("invalid key spec");
+  if (text.empty()) return std::unexpected("invalid key spec '" + std::string(text) + "'");
 
   ParsedKeyPosition pos;
   size_t i = 0;
@@ -478,7 +478,7 @@ auto parse_key_position(std::string_view text)
     ++i;
   }
   if (i == 0) {
-    return std::unexpected("invalid key spec");
+    return std::unexpected("invalid key spec '" + std::string(text) + "'");
   }
 
   auto field_text = text.substr(0, i);
@@ -489,13 +489,13 @@ auto parse_key_position(std::string_view text)
       field_text.data(), field_text.data() + field_text.size(), field_big);
   if ((ec != std::errc() && ec != std::errc::result_out_of_range) ||
       ptr != field_text.data() + field_text.size()) {
-    return std::unexpected("invalid key spec");
+    return std::unexpected("invalid key spec '" + std::string(text) + "'");
   }
   pos.field = ec == std::errc::result_out_of_range
                   ? std::numeric_limits<size_t>::max()
                   : static_cast<size_t>(field_big);
   if (pos.field == 0) {
-    return std::unexpected("invalid key spec");
+    return std::unexpected("invalid key spec '" + std::string(text) + "'");
   }
 
   if (i < text.size() && text[i] == '.') {
@@ -506,7 +506,7 @@ auto parse_key_position(std::string_view text)
       ++i;
     }
     if (i == char_start) {
-      return std::unexpected("invalid key spec");
+      return std::unexpected("invalid key spec '" + std::string(text) + "'");
     }
     size_t value = 0;
     auto char_text = text.substr(char_start, i - char_start);
@@ -517,14 +517,14 @@ auto parse_key_position(std::string_view text)
       value = std::numeric_limits<size_t>::max();
     } else if (char_ec != std::errc() ||
                char_ptr != char_text.data() + char_text.size()) {
-      return std::unexpected("invalid key spec");
+      return std::unexpected("invalid key spec '" + std::string(text) + "'");
     }
     pos.character = value;
   }
 
   for (size_t j = i; j < text.size(); ++j) {
     if (!is_key_modifier(text[j])) {
-      return std::unexpected("invalid key spec");
+      return std::unexpected("invalid key spec '" + std::string(text) + "'");
     }
   }
   pos.modifiers = text.substr(i);
@@ -532,7 +532,7 @@ auto parse_key_position(std::string_view text)
 }
 
 auto parse_key_spec(std::string_view text) -> cp::Result<KeySpec> {
-  if (text.empty()) return std::unexpected("invalid key spec");
+  if (text.empty()) return std::unexpected("invalid key spec '" + std::string(text) + "'");
 
   KeySpec key;
 
@@ -540,7 +540,7 @@ auto parse_key_spec(std::string_view text) -> cp::Result<KeySpec> {
   auto first = parse_key_position(text.substr(0, comma));
   if (!first) return std::unexpected(first.error());
   if (first->character.has_value() && *first->character == 0) {
-    return std::unexpected("invalid key spec");
+    return std::unexpected("invalid key spec '" + std::string(text) + "'");
   }
 
   key.start_field = first->field;

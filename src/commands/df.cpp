@@ -682,8 +682,25 @@ auto configure_output(const CommandContext<DF_OPTIONS.size()>& ctx)
 
     if (meta.short_name == "-B" || meta.long_name == "--block-size") {
       auto value = std::get_if<std::string>(&occurrence.value);
+      // [GNU] The diagnostic names the option spelling the user typed
+      // ("invalid --block-size argument 'x'" vs "invalid -B argument 'x'").
+      std::string opt_name = "--block-size";
+      for (std::string_view a : ctx.raw_args) {
+        if (a == "--block-size" ||
+            (a.size() > 12 && a.starts_with("--block-size="))) {
+          opt_name = "--block-size";
+        } else if (a.size() >= 2 && a[0] == '-' && a[1] != '-' &&
+                   a.find('B') != std::string_view::npos) {
+          opt_name = "-B";
+        }
+      }
+      auto bad = [&]() {
+        return std::unexpected(std::string("invalid ") + opt_name +
+                               " argument '" +
+                               (value ? *value : std::string()) + "'");
+      };
       if (!value) {
-        return std::unexpected("invalid block size");
+        return bad();
       }
       if (*value == "human-readable") {
         output.human = true;
@@ -702,7 +719,7 @@ auto configure_output(const CommandContext<DF_OPTIONS.size()>& ctx)
 
       auto parsed = parse_block_size(*value, &output.display_suffix);
       if (!parsed) {
-        return std::unexpected("invalid block size");
+        return bad();
       }
       output.human = false;
       output.si = false;

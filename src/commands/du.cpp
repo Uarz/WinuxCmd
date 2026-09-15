@@ -643,8 +643,14 @@ auto configure_output(const CommandContext<DU_OPTIONS.size()>& ctx)
 
     if (meta.short_name == "-B" || meta.long_name == "--block-size") {
       auto value = std::get_if<std::string>(&occurrence.value);
+      const char* opt_name = meta.short_name == "-B" ? "-B" : "--block-size";
+      auto bad = [&]() {
+        return std::unexpected(std::string("invalid ") + opt_name +
+                               " argument '" +
+                               (value ? *value : std::string()) + "'");
+      };
       if (!value) {
-        return std::unexpected("invalid block size");
+        return bad();
       }
       if (*value == "human-readable") {
         output.human = true;
@@ -663,7 +669,7 @@ auto configure_output(const CommandContext<DU_OPTIONS.size()>& ctx)
 
       auto parsed = parse_block_size(*value, &output.display_suffix);
       if (!parsed) {
-        return std::unexpected("invalid block size");
+        return bad();
       }
       output.human = false;
       output.si = false;

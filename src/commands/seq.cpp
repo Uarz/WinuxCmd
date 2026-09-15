@@ -221,13 +221,13 @@ auto is_floating_conversion(char ch) -> bool {
 
 auto validate_format(std::string_view format) -> cp::Result<bool> {
   int conversions = 0;
+  const std::string fmt(format);
 
   for (size_t i = 0; i < format.size(); ++i) {
     if (format[i] != '%') continue;
     ++i;
     if (i >= format.size()) {
-      return error_result<bool>(
-          "format must contain exactly one floating-point conversion");
+      return error_result<bool>("format '" + fmt + "' ends in %");
     }
     if (format[i] == '%') continue;
 
@@ -250,20 +250,24 @@ auto validate_format(std::string_view format) -> cp::Result<bool> {
     }
 
     if (i >= format.size() || !is_floating_conversion(format[i])) {
-      return error_result<bool>(
-          "format must contain exactly one floating-point conversion");
+      // GNU names the offending conversion: "format 'x' has unknown %d
+      // directive".  A dangling specifier reports like the bare '%' case.
+      if (i >= format.size()) {
+        return error_result<bool>("format '" + fmt + "' ends in %");
+      }
+      return error_result<bool>("format '" + fmt + "' has unknown %" +
+                                std::string(1, format[i]) + " directive");
     }
 
     ++conversions;
     if (conversions > 1) {
-      return error_result<bool>(
-          "format must contain exactly one floating-point conversion");
+      return error_result<bool>("format '" + fmt +
+                                "' has too many % directives");
     }
   }
 
   if (conversions != 1) {
-    return error_result<bool>(
-        "format must contain exactly one floating-point conversion");
+    return error_result<bool>("format '" + fmt + "' has no % directive");
   }
 
   return true;

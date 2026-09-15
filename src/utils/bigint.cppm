@@ -31,7 +31,7 @@
 // The header also provides Miller-Rabin primality testing and
 // Pollard-Brent rho factorization for `factor`.
 
-#pragma once
+module;
 
 #include <algorithm>
 #include <bit>
@@ -46,7 +46,10 @@
 #include <utility>
 #include <vector>
 
-namespace winux::bignum {
+export module utils:bigint;
+import std;
+
+export namespace winux::bignum {
 
 // Unsigned arbitrary-precision integer: little-endian 64-bit limbs,
 // normalized so that zero is the empty vector.

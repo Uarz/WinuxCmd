@@ -40,9 +40,10 @@
 
 module;
 
+// GMF: global-namespace C names (size_t/uint32_t) that `import std`
+// does not provide.
+#include <cstddef>
 #include <cstdint>
-#include <string>
-#include <string_view>
 
 export module utils:gnu_quotearg;
 import std;

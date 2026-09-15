@@ -36,16 +36,13 @@
 //
 module;
 
-#include <algorithm>
-#include <bit>
+// GMF: global-namespace C names (size_t/uintN_t, isspace/memcpy/snprintf)
+// that `import std` does not provide.
 #include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <limits>
-#include <string>
-#include <string_view>
-#include <vector>
 
 export module utils:gnu_float80;
 import std;

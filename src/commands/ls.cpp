@@ -3160,7 +3160,7 @@ auto list_directory_recursive(const std::string &path,
   // including a single command-line directory operand.
   if (print_current_header) {
     const std::string display_path = make_generic_display_path(path);
-    safePrintLn(std::wstring(display_path.begin(), display_path.end()) + L":");
+    safePrintLn(utf8_to_wstring(display_path) + L":");
   }
 
   // List current directory
@@ -3233,8 +3233,7 @@ auto list_directory_recursive(const std::string &path,
 }
 
 auto print_ls_error(const std::string &message) -> void {
-  safeErrorPrintLn(std::wstring(L"ls: ") +
-                   std::wstring(message.begin(), message.end()));
+  safeErrorPrintLn(std::wstring(L"ls: ") + utf8_to_wstring(message));
 }
 
 auto directory_only_requested(const CommandContext<LS_OPTIONS.size()> &ctx)
@@ -3294,7 +3293,7 @@ auto expand_path_operands(const std::vector<std::string> &paths)
       expanded_paths.push_back(path);
     } else {
       safeErrorPrintLn(std::wstring(L"ls: cannot access '") +
-                       std::wstring(path.begin(), path.end()) +
+                       utf8_to_wstring(path) +
                        L"': No such file or directory");
       success = false;
     }
@@ -3402,7 +3401,7 @@ auto process_paths(const std::vector<std::string> &paths,
         }
       } else {
         if (multiple_operands) {
-          safePrintLn(std::wstring(path.begin(), path.end()) + L":");
+          safePrintLn(utf8_to_wstring(path) + L":");
         }
 
         auto result = list_directory(path, ctx);

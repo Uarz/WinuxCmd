@@ -142,8 +142,7 @@ REGISTER_COMMAND(man,
   auto man_page = CommandRegistry::getManPage(cmd_name);
 
   if (man_page.empty()) {
-    safePrintLn(L"man: no manual entry for " +
-                std::wstring(cmd_name.begin(), cmd_name.end()));
+    safePrintLn(L"man: no manual entry for " + utf8_to_wstring(cmd_name));
     safePrintLn(L"Try 'man --list' to see available commands.");
     return 1;
   }

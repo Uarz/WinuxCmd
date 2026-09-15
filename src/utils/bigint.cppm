@@ -33,18 +33,13 @@
 
 module;
 
-#include <algorithm>
-#include <bit>
+// GMF: global-namespace C names (size_t/uint64_t) and intrinsics that
+// `import std` does not provide.
+#include <cstddef>
 #include <cstdint>
-#include <limits>
 #if defined(_M_X64)
 #include <intrin.h>
 #endif
-#include <optional>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
 
 export module utils:bigint;
 import std;

@@ -190,8 +190,7 @@ TEST(numfmt, numfmt_rejects_fractional_from_unit) {
 
   EXPECT_EQ(r.exit_code, 1);
   EXPECT_TRUE(r.stdout_text.empty());
-  EXPECT_NE(r.stderr_text.find("invalid unit size: '1.5'"),
-            std::string::npos);
+  EXPECT_NE(r.stderr_text.find("invalid unit size: '1.5'"), std::string::npos);
 }
 
 // [GNU] scaled values are rounded at the requested precision only after

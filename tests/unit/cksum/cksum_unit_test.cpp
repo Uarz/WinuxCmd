@@ -126,9 +126,9 @@ TEST(cksum, cksum_continues_past_unreadable_files) {
   auto r = p.run();
 
   EXPECT_NE(r.exit_code, 0);
-  EXPECT_TRUE(r.stderr_text.find(
-                  "cksum: missing.txt: No such file or directory") !=
-              std::string::npos);
+  EXPECT_TRUE(
+      r.stderr_text.find("cksum: missing.txt: No such file or directory") !=
+      std::string::npos);
   EXPECT_TRUE(r.stdout_text.find("good.txt") != std::string::npos);
 }
 
@@ -142,9 +142,9 @@ TEST(cksum, cksum_missing_input_reports_no_such_file) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 1);
-  EXPECT_TRUE(r.stderr_text.find(
-                  "cksum: missing.txt: No such file or directory") !=
-              std::string::npos);
+  EXPECT_TRUE(
+      r.stderr_text.find("cksum: missing.txt: No such file or directory") !=
+      std::string::npos);
 }
 
 TEST(cksum, cksum_directory_input_reports_is_a_directory) {
@@ -265,9 +265,9 @@ TEST(cksum, cksum_check_reports_unreadable_listed_files) {
   auto r = p.run();
 
   EXPECT_NE(r.exit_code, 0);
-  EXPECT_TRUE(r.stderr_text.find(
-                  "cksum: missing.txt: No such file or directory") !=
-              std::string::npos);
+  EXPECT_TRUE(
+      r.stderr_text.find("cksum: missing.txt: No such file or directory") !=
+      std::string::npos);
   EXPECT_TRUE(
       r.stderr_text.find("cksum: WARNING: 1 listed file could not be read") !=
       std::string::npos);

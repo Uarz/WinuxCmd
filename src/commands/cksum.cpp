@@ -796,8 +796,7 @@ auto check_one_file(const std::string& checkfile_name, const Config& cfg,
 
     properly_formatted_lines = true;
 
-    const std::string& target =
-        legacy ? legacy->filename : parsed->filename;
+    const std::string& target = legacy ? legacy->filename : parsed->filename;
 
     bool missing = false;
     if (cfg.ignore_missing && target != "-") {
@@ -834,9 +833,8 @@ auto check_one_file(const std::string& checkfile_name, const Config& cfg,
     }
     if (!read_ok) {
       ++n_open_or_read_failures;
-      safeErrorPrintLn(
-          "cksum: " + portable_digest::detail::sum_quotef(target) + ": " +
-          portable_digest::open_error_reason(target));
+      safeErrorPrintLn("cksum: " + portable_digest::detail::sum_quotef(target) +
+                       ": " + portable_digest::open_error_reason(target));
       if (!cfg.status) {
         safePrintLn(portable_digest::detail::sum_quotef(target) +
                     ": FAILED open or read");
@@ -879,8 +877,8 @@ auto check_one_file(const std::string& checkfile_name, const Config& cfg,
     }
     if (n_mismatched_checksums != 0) {
       safeErrorPrintLn(
-          "cksum: WARNING: " + std::to_string(n_mismatched_checksums) +
-          " of " + std::to_string(n_computed_checksums) +
+          "cksum: WARNING: " + std::to_string(n_mismatched_checksums) + " of " +
+          std::to_string(n_computed_checksums) +
           " computed checksums did NOT match");
     }
   }

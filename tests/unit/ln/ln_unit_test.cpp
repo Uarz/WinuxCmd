@@ -303,7 +303,6 @@ TEST(ln, ln_multiple_sources_require_directory_target) {
   EXPECT_EQ(r.exit_code, 1);
   EXPECT_TRUE(r.stdout_text.empty());
   // GNU 9.4 ln.c: errno-style "target 'x': Not a directory".
-  EXPECT_EQ_TEXT(r.stderr_text,
-                 "ln: target 'not-dir.txt': Not a directory\n");
+  EXPECT_EQ_TEXT(r.stderr_text, "ln: target 'not-dir.txt': Not a directory\n");
   EXPECT_FALSE(std::filesystem::exists(tmp.path / "not-dir.txt~"));
 }

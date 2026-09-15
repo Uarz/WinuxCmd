@@ -202,8 +202,8 @@ TEST(truncate, truncate_missing_reference_cannot_stat) {
 
   Pipeline p;
   p.set_cwd(tmp.wpath());
-  p.add(L"truncate.exe", {L"-r", L"nonexistent.ref", L"-s", L"+2",
-                          L"test.txt"});
+  p.add(L"truncate.exe",
+        {L"-r", L"nonexistent.ref", L"-s", L"+2", L"test.txt"});
 
   auto r = p.run();
 

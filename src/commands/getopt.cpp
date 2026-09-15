@@ -41,8 +41,7 @@ auto constexpr GETOPT_OPTIONS = std::array{
     // [GNU] -o, --options: short option specification
     OPTION("-o", "--options", "short option specification", STRING_TYPE),
     // [GNU] -l, --longoptions: long options to be recognized
-    OPTION("-l", "--longoptions", "long options to be recognized",
-           STRING_TYPE),
+    OPTION("-l", "--longoptions", "long options to be recognized", STRING_TYPE),
     // [GNU] -n, --name: name used in diagnostics
     OPTION("-n", "--name", "name used in diagnostics", STRING_TYPE),
     // [GNU] -q, --quiet: disable error reporting by getopt
@@ -307,8 +306,7 @@ auto run(const Config& cfg) -> int {
   auto longopts_or = parse_long_options(cfg.longoptions);
   if (!longopts_or) {
     // [util-linux] parse_error(): exit status 2.
-    safeErrorPrintLn(
-        "getopt: empty long option after -l or --long argument");
+    safeErrorPrintLn("getopt: empty long option after -l or --long argument");
     safeErrorPrintLn("Try 'getopt --help' for more information.");
     return 2;
   }
@@ -443,8 +441,7 @@ auto run(const Config& cfg) -> int {
           continue;
         }
         if (double_dash) {
-          errors.report("unrecognized option '--" + std::string(lname) +
-                        "'");
+          errors.report("unrecognized option '--" + std::string(lname) + "'");
           exit_code = 1;
           continue;
         }

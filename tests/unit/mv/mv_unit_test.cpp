@@ -367,8 +367,7 @@ TEST(mv, mv_readonly_destination_no_prompt_on_non_tty) {
   tmp.write("dest.txt", "old");
   auto dest = tmp.path / "dest.txt";
   DWORD attrs = GetFileAttributesW(dest.wstring().c_str());
-  SetFileAttributesW(dest.wstring().c_str(),
-                   attrs | FILE_ATTRIBUTE_READONLY);
+  SetFileAttributesW(dest.wstring().c_str(), attrs | FILE_ATTRIBUTE_READONLY);
 
   Pipeline p;
   p.set_cwd(tmp.wpath());

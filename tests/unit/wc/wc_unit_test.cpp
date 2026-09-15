@@ -392,8 +392,9 @@ TEST(wc, wc_files0_from_reports_gnu_shaped_missing_list_diagnostic) {
 
   EXPECT_EQ(r.exit_code, 1);
   EXPECT_TRUE(r.stdout_text.empty());
-  EXPECT_TRUE(r.stderr_text.find(
-                  "wc: missing.bin: No such file or directory") != std::string::npos);
+  EXPECT_TRUE(
+      r.stderr_text.find("wc: missing.bin: No such file or directory") !=
+      std::string::npos);
 }
 
 TEST(wc, wc_files0_from_reports_directory_list_input) {
@@ -423,8 +424,9 @@ TEST(wc, wc_reports_gnu_shaped_missing_input_diagnostic) {
 
   EXPECT_EQ(r.exit_code, 1);
   EXPECT_TRUE(r.stdout_text.empty());
-  EXPECT_TRUE(r.stderr_text.find(
-                  "wc: missing.txt: No such file or directory") != std::string::npos);
+  EXPECT_TRUE(
+      r.stderr_text.find("wc: missing.txt: No such file or directory") !=
+      std::string::npos);
 }
 
 TEST(wc, wc_mixed_success_and_failure_still_prints_total_for_multiple_inputs) {
@@ -440,8 +442,9 @@ TEST(wc, wc_mixed_success_and_failure_still_prints_total_for_multiple_inputs) {
   EXPECT_EQ(r.exit_code, 1);
   EXPECT_TRUE(r.stdout_text.find("2 a.txt") != std::string::npos);
   EXPECT_TRUE(r.stdout_text.find("2 total") != std::string::npos);
-  EXPECT_TRUE(r.stderr_text.find(
-                  "wc: missing.txt: No such file or directory") != std::string::npos);
+  EXPECT_TRUE(
+      r.stderr_text.find("wc: missing.txt: No such file or directory") !=
+      std::string::npos);
 }
 
 TEST(wc, wc_reports_is_a_directory_for_directory_input) {

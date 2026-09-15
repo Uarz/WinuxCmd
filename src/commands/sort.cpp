@@ -1382,8 +1382,7 @@ auto build_config(const CommandContext<SORT_OPTIONS.size()>& ctx)
       }
     }
     if (match_count > 1) {
-      return std::unexpected("ambiguous argument '" + text +
-                             "' for '--check'");
+      return std::unexpected("ambiguous argument '" + text + "' for '--check'");
     }
     if (match_count == 0) {
       // Printed specially by the command entry point.
@@ -1424,10 +1423,9 @@ auto build_config(const CommandContext<SORT_OPTIONS.size()>& ctx)
         "' are incompatible");
   }
   if (cfg.debug && cfg.mode != OperationMode::Sort) {
-    return std::unexpected(
-        std::string("options '-") +
-        (cfg.mode == OperationMode::CheckQuiet ? "C" : "c") +
-        " --debug' are incompatible");
+    return std::unexpected(std::string("options '-") +
+                           (cfg.mode == OperationMode::CheckQuiet ? "C" : "c") +
+                           " --debug' are incompatible");
   }
   if (cfg.debug && !cfg.output_file.empty()) {
     return std::unexpected("options '-o --debug' are incompatible");

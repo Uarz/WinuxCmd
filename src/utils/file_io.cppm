@@ -111,6 +111,84 @@ auto failed_ofstream(int error) -> std::ofstream {
   return failed;
 }
 
+// Bridge an on-disk fifo marker (#1038) to a Windows named pipe so
+// WinuxCmd readers/writers get POSIX open() blocking semantics:
+// opening for read blocks in ConnectNamedPipe until a writer arrives,
+// opening for write waits until a reader creates the endpoint.
+export auto open_fifo_read_handle(std::wstring_view path) -> HANDLE {
+  const std::wstring pipe_name = native_path::winux_fifo_pipe_name_w(path);
+  HANDLE pipe = CreateNamedPipeW(
+      pipe_name.c_str(), PIPE_ACCESS_INBOUND,
+      PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, PIPE_UNLIMITED_INSTANCES,
+      64 * 1024, 64 * 1024, 0, nullptr);
+  if (pipe == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
+  if (!ConnectNamedPipe(pipe, nullptr) &&
+      GetLastError() != ERROR_PIPE_CONNECTED) {
+    CloseHandle(pipe);
+    return INVALID_HANDLE_VALUE;
+  }
+  return pipe;
+}
+
+export auto open_fifo_write_handle(std::wstring_view path) -> HANDLE {
+  const std::wstring pipe_name = native_path::winux_fifo_pipe_name_w(path);
+  for (;;) {
+    HANDLE pipe = CreateFileW(pipe_name.c_str(), GENERIC_WRITE, 0, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (pipe != INVALID_HANDLE_VALUE) return pipe;
+    const DWORD error = GetLastError();
+    if (error == ERROR_PIPE_BUSY) {
+      // GNU: O_WRONLY on a fifo blocks until a reader opens the pipe.
+      WaitNamedPipeW(pipe_name.c_str(), NMPWAIT_WAIT_FOREVER);
+      continue;
+    }
+    if (error == ERROR_FILE_NOT_FOUND) {
+      // No reader has created the endpoint yet; keep waiting.
+      Sleep(1);
+      continue;
+    }
+    return INVALID_HANDLE_VALUE;
+  }
+}
+
+auto open_fifo_read_stream(std::wstring_view path) -> std::ifstream {
+  HANDLE pipe = open_fifo_read_handle(path);
+  if (pipe == INVALID_HANDLE_VALUE) return failed_ifstream(EACCES);
+  const int fd =
+      _open_osfhandle(reinterpret_cast<intptr_t>(pipe), _O_RDONLY | _O_BINARY);
+  if (fd == -1) {
+    CloseHandle(pipe);
+    return failed_ifstream(EACCES);
+  }
+  std::FILE* file = _fdopen(fd, "rb");
+  if (!file) {
+    const int saved = errno;
+    _close(fd);
+    errno = saved;
+    return failed_ifstream(errno);
+  }
+  return std::ifstream(file);
+}
+
+auto open_fifo_write_stream(std::wstring_view path) -> std::ofstream {
+  HANDLE pipe = open_fifo_write_handle(path);
+  if (pipe == INVALID_HANDLE_VALUE) return failed_ofstream(EACCES);
+  const int fd =
+      _open_osfhandle(reinterpret_cast<intptr_t>(pipe), _O_WRONLY | _O_BINARY);
+  if (fd == -1) {
+    CloseHandle(pipe);
+    return failed_ofstream(EACCES);
+  }
+  std::FILE* file = _fdopen(fd, "wb");
+  if (!file) {
+    const int saved = errno;
+    _close(fd);
+    errno = saved;
+    return failed_ofstream(errno);
+  }
+  return std::ofstream(file);
+}
+
 export auto open_binary_file(std::string_view filename) -> std::ifstream {
   // /dev/stdin-family operands bind to the real fd 0 so piped input works
   // exactly like GNU (and a closed stdin reports failure, #1056/#973).
@@ -128,6 +206,9 @@ export auto open_binary_file(std::string_view filename) -> std::ifstream {
     std::ifstream failed;
     failed.setstate(std::ios::failbit);
     return failed;
+  }
+  if (native_path::is_winux_fifo_w(operand.normalized)) {
+    return open_fifo_read_stream(operand.normalized);
   }
   return std::ifstream(std::filesystem::path(operand.extended),
                        std::ios::binary);
@@ -150,6 +231,9 @@ export auto create_binary_file(std::string_view filename, bool append = false)
     std::ofstream failed;
     failed.setstate(std::ios::failbit);
     return failed;
+  }
+  if (native_path::is_winux_fifo_w(operand.normalized)) {
+    return open_fifo_write_stream(operand.normalized);
   }
   return std::ofstream(
       std::filesystem::path(operand.extended),
@@ -212,6 +296,17 @@ auto read_all_file(std::string_view filename)
                   FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
   if (file == INVALID_HANDLE_VALUE) {
     return std::unexpected(read_open_error(filename, operand, GetLastError()));
+  }
+
+  if (native_path::is_winux_fifo_w(operand.normalized)) {
+    CloseHandle(file);
+    file = open_fifo_read_handle(operand.normalized);
+    if (file == INVALID_HANDLE_VALUE) {
+      return std::unexpected(winux::i18n::format(
+          "utils.file.error.open", "cannot open '{}' for reading: {}", filename,
+          win32_posix_error_text(GetLastError(),
+                                 {.invalid_name_as_missing = true})));
+    }
   }
 
   UniqueHandle close_file(file);

@@ -331,14 +331,20 @@ auto process_file(const std::string& path, bool brief, bool symlink, bool mime)
   }
   // Regular file
   else {
-    // Get filename from path
-    size_t last_sep = wpath.find_last_of(L"\\/");
-    std::wstring filename =
-        (last_sep != std::wstring::npos) ? wpath.substr(last_sep + 1) : wpath;
+    // A WinuxCmd fifo marker (#1038) classifies as a named pipe.
+    if ((attrs & FILE_ATTRIBUTE_SYSTEM) != 0 &&
+        native_path::is_winux_fifo_w(wpath)) {
+      type = mime ? "inode/fifo; charset=binary" : "fifo (named pipe)";
+    } else {
+      // Get filename from path
+      size_t last_sep = wpath.find_last_of(L"\\/");
+      std::wstring filename =
+          (last_sep != std::wstring::npos) ? wpath.substr(last_sep + 1) : wpath;
 
-    auto classification = classify_by_magic(read_file_header(wpath))
-                              .value_or(classify_by_extension(filename));
-    type = mime ? classification.mime : classification.description;
+      auto classification = classify_by_magic(read_file_header(wpath))
+                                .value_or(classify_by_extension(filename));
+      type = mime ? classification.mime : classification.description;
+    }
   }
 
   if (brief) {

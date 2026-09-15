@@ -276,10 +276,13 @@ auto filetime_to_unix_seconds(FILETIME ft) -> int64_t {
   return static_cast<int64_t>((quad - kWindowsToUnixEpoch100ns) / 10000000ULL);
 }
 
-auto format_permissions(DWORD attrs) -> std::string {
+auto format_permissions(DWORD attrs, bool fifo = false) -> std::string {
   // [GNU] lstat() reports symlinks as lrwxrwxrwx regardless of the target.
   if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
     return "lrwxrwxrwx";
+  }
+  if (fifo) {
+    return (attrs & FILE_ATTRIBUTE_READONLY) ? "pr--r--r--" : "prw-r--r--";
   }
   const bool directory = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
   const bool writable = (attrs & FILE_ATTRIBUTE_READONLY) == 0;
@@ -313,7 +316,11 @@ auto format_mode_octal(DWORD attrs) -> std::string {
 auto st_mode_bits(const FileStatData& stat) -> uint32_t {
   // [GNU] S_IFIFO 0x1000, S_IFCHR 0x2000 — `stat -c %f -` on a pipe
   // prints 11b4, on /dev/null-style devices 21b6.
-  if (stat.fifo) return 0x1000u | 0666u;
+  if (stat.fifo) {
+    return 0x1000u |
+           ((stat.attrs.dwFileAttributes & FILE_ATTRIBUTE_READONLY) ? 0444u
+                                                                    : 0644u);
+  }
   if (stat.character_device) return 0x2000u | 0666u;
   const DWORD attrs = stat.attrs.dwFileAttributes;
   if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) return 0xA000u | 0777u;
@@ -446,6 +453,15 @@ auto load_file_stat(const std::filesystem::path& p, bool lstat_link = false)
   }
   stat.io_block_size = io_block_size_for(p);
   stat.character_device = native_path::is_character_device_w(p.wstring());
+  // WinuxCmd fifo markers (#1038) report like GNU lstat() on a FIFO:
+  // type "fifo", S_IFIFO mode bits, and st_size 0.
+  if (!stat.character_device &&
+      (stat.attrs.dwFileAttributes &
+       (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0 &&
+      native_path::is_winux_fifo_w(p.wstring())) {
+    stat.fifo = true;
+    stat.size = 0;
+  }
 
   DWORD open_flags = FILE_FLAG_BACKUP_SEMANTICS;
   if (lstat_link) {
@@ -791,7 +807,7 @@ auto render_format(std::string_view format, const std::string& filename,
         value = file_type_name(stat);
         break;
       case 'A':
-        value = format_permissions(stat.attrs.dwFileAttributes);
+        value = format_permissions(stat.attrs.dwFileAttributes, stat.fifo);
         break;
       case 'a':
         value = format_mode_octal(stat.attrs.dwFileAttributes);
@@ -1238,7 +1254,7 @@ auto emit_stat_output(const std::string& filename, const FileStatData& stat,
     safePrint("Access: (");
     safePrint(mode_buf);
     safePrint("/");
-    safePrint(format_permissions(stat.attrs.dwFileAttributes));
+    safePrint(format_permissions(stat.attrs.dwFileAttributes, stat.fifo));
     safePrint(")  ");
     safePrint("Uid: (");
     safePrint(pad_left(uid, 5));

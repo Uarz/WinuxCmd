@@ -64,7 +64,7 @@ using cmd::meta::OptionType;
  * but the match is case insensitive [IMPLEMENTED]
  * - @a -type: File is of
  *
- * type c: b,d,p,f,l,s,D [only d,f,l are supported]
+ * type c: b,d,p,f,l,s,D [only d,f,l,p are supported]
  * [IMPLEMENTED]
  * - @a
  * -size: File uses n units of space [IMPLEMENTED]
@@ -135,12 +135,12 @@ auto constexpr FIND_OPTIONS = std::array{
            STRING_TYPE),
     // [GNU]
     OPTION("-type", "",
-           "file is of type c: b,d,p,f,l,s,D [only d,f,l are supported]",
+           "file is of type c: b,d,p,f,l,s,D [only d,f,l,p are supported]",
            STRING_TYPE),
     // [GNU]
     OPTION("-xtype", "",
            "like -type but checks the opposite symlink resolution state [only "
-           "d,f,l are supported]",
+           "d,f,l,p are supported]",
            STRING_TYPE),
     // [GNU]
     OPTION("-execdir", "",
@@ -988,15 +988,21 @@ auto type_matches(const std::filesystem::directory_entry& e,
   bool link_like = (e.is_symlink(ec) && !ec) || is_directory_reparse_point(e);
   ec.clear();
 
-  if (type == "f") return e.is_regular_file(ec) && !ec;
+  if (type == "f") {
+    return e.is_regular_file(ec) && !ec &&
+           !native_path::is_winux_fifo_w(e.path().wstring());
+  }
   if (type == "d") return e.is_directory(ec) && !ec && !link_like;
   if (type == "l") return link_like;
+  // WinuxCmd fifo marker (#1038): on-disk marker file counts as 'p'.
+  if (type == "p") return native_path::is_winux_fifo_w(e.path().wstring());
 
   return false;
 }
 
 auto file_type_matches(std::filesystem::file_type file_type, bool link_like,
-                       std::string_view type) -> bool {
+                       const std::filesystem::path& p, std::string_view type)
+    -> bool {
   if (type.empty()) return true;
   if (type == "l") {
     return link_like || file_type == std::filesystem::file_type::symlink;
@@ -1005,8 +1011,11 @@ auto file_type_matches(std::filesystem::file_type file_type, bool link_like,
     return file_type == std::filesystem::file_type::directory && !link_like;
   }
   if (type == "f") {
-    return file_type == std::filesystem::file_type::regular && !link_like;
+    return file_type == std::filesystem::file_type::regular && !link_like &&
+           !native_path::is_winux_fifo_w(p.wstring());
   }
+  // WinuxCmd fifo marker (#1038).
+  if (type == "p") return native_path::is_winux_fifo_w(p.wstring());
   return false;
 }
 auto self_type_matches(const std::filesystem::path& p,
@@ -1017,14 +1026,14 @@ auto self_type_matches(const std::filesystem::path& p,
   if (ec) return false;
   bool link_like = status.type() == std::filesystem::file_type::symlink ||
                    is_directory_reparse_point(e);
-  return file_type_matches(status.type(), link_like, type);
+  return file_type_matches(status.type(), link_like, p, type);
 }
 auto target_type_matches(const std::filesystem::path& p, std::string_view type)
     -> std::optional<bool> {
   std::error_code ec;
   auto status = std::filesystem::status(p, ec);
   if (ec) return std::nullopt;
-  return file_type_matches(status.type(), false, type);
+  return file_type_matches(status.type(), false, p, type);
 }
 auto xtype_matches(const std::filesystem::path& p,
                    const std::filesystem::directory_entry& e,
@@ -1466,9 +1475,9 @@ class ExpressionParser {
       if (option == "-wholename") kind = ExprKind::Path;
       if (option == "-iwholename") kind = ExprKind::IPath;
       if (option == "-type" || option == "-xtype") {
-        if (*value != "f" && *value != "d" && *value != "l") {
+        if (*value != "f" && *value != "d" && *value != "l" && *value != "p") {
           return std::unexpected(std::string(option) +
-                                 " currently supports only f,d,l");
+                                 " currently supports only f,d,l,p");
         }
         kind = option == "-type" ? ExprKind::Type : ExprKind::XType;
       }
@@ -1906,8 +1915,9 @@ auto build_config(const CommandContext<FIND_OPTIONS.size()>& ctx)
   }
 
   if (!cfg.type_filter.empty() && cfg.type_filter != "f" &&
-      cfg.type_filter != "d" && cfg.type_filter != "l") {
-    return std::unexpected("-type currently supports only f,d,l");
+      cfg.type_filter != "d" && cfg.type_filter != "l" &&
+      cfg.type_filter != "p") {
+    return std::unexpected("-type currently supports only f,d,l,p");
   }
 
   auto size_text = ctx.get<std::string>("-size", "");
@@ -2537,7 +2547,9 @@ auto file_type_char(const std::filesystem::directory_entry& e) -> char {
   std::error_code ec;
   if ((e.is_symlink(ec) && !ec) || is_directory_reparse_point(e)) return 'l';
   ec.clear();
-  if (e.is_regular_file(ec) && !ec) return 'f';
+  if (e.is_regular_file(ec) && !ec) {
+    return native_path::is_winux_fifo_w(e.path().wstring()) ? 'p' : 'f';
+  }
   if (e.is_directory(ec) && !ec) return 'd';
   return '?';
 }

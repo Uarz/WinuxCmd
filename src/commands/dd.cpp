@@ -667,8 +667,14 @@ REGISTER_COMMAND(dd,
     } else {
       std::wstring winput =
           utf8_to_wstring(native_path::normalize_api_operand(cfg.input_file));
-      hIn = CreateFileW(winput.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+      if (native_path::is_winux_fifo_w(winput)) {
+        // On-disk fifo marker (#1038): read through the named pipe.
+        hIn = file_io::open_fifo_read_handle(winput);
+      } else {
+        hIn =
+            CreateFileW(winput.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+      }
       own_hIn = true;
       if (hIn == INVALID_HANDLE_VALUE) {
         safeErrorPrintLn(winux::i18n::format(
@@ -702,8 +708,13 @@ REGISTER_COMMAND(dd,
       } else if (cfg.notrunc || cfg.seek != 0) {
         creation = OPEN_ALWAYS;
       }
-      hOut = CreateFileW(woutput.c_str(), GENERIC_WRITE, 0, nullptr, creation,
-                         FILE_ATTRIBUTE_NORMAL, nullptr);
+      if (native_path::is_winux_fifo_w(woutput)) {
+        // On-disk fifo marker (#1038): write blocks until a reader opens.
+        hOut = file_io::open_fifo_write_handle(woutput);
+      } else {
+        hOut = CreateFileW(woutput.c_str(), GENERIC_WRITE, 0, nullptr, creation,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+      }
       own_hOut = true;
       if (hOut == INVALID_HANDLE_VALUE) {
         safeErrorPrintLn(winux::i18n::format(

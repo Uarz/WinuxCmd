@@ -2399,7 +2399,8 @@ auto get_file_size_string(const std::wstring &path,
                           const SizeConfig &size_cfg,
                           bool command_line_operand = false) -> std::string {
   uint64_t fileSize = 0;
-  if (is_symbolic_reparse_link(original_find_data) &&
+  if (!native_path::is_winux_fifo_w(path) &&
+      is_symbolic_reparse_link(original_find_data) &&
       !should_dereference_entry_metadata(resolve_dereference_mode(ctx),
                                          original_find_data,
                                          command_line_operand)) {
@@ -2531,6 +2532,9 @@ auto round_allocated_size_to_block_bytes(uint64_t allocated_size,
 
 auto get_allocated_usage_bytes(const std::wstring &path,
                                const WIN32_FIND_DATAW &find_data) -> uint64_t {
+  if (native_path::is_winux_fifo_w(path)) {
+    return 0;
+  }
   const uint64_t allocated_size = get_allocated_size_bytes(path, find_data);
   if (allocated_size == 0) {
     return 0;
@@ -3120,6 +3124,12 @@ auto list_directory(const std::string &path,
         continue;
       }
       info.perms = get_permissions_string(display_find_data);
+      // WinuxCmd fifo markers (#1038) list with a 'p' type char.
+      if (info.perms[0] == '-' &&
+          (display_find_data.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM) != 0 &&
+          native_path::is_winux_fifo_w(entry.full_path)) {
+        info.perms[0] = 'p';
+      }
       if (show_inode) {
         info.inode =
             get_file_index_string(entry.full_path, display_find_data, ctx);
@@ -3413,6 +3423,11 @@ auto list_file(const std::string &path,
   if (long_format) {
     // Long format output for single file
     auto perms = get_permissions_string(display_find_data);
+    if (perms[0] == '-' &&
+        (display_find_data.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM) != 0 &&
+        native_path::is_winux_fifo_w(lookup_wpath)) {
+      perms[0] = 'p';
+    }
     auto inode = show_inode
                      ? get_file_index_string(lookup_wpath, find_data, ctx, true)
                      : "";

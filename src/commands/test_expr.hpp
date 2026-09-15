@@ -112,6 +112,15 @@ inline auto stat_follow(const std::string& path) -> FileInfo {
     if (GetFileInformationByHandle(handle, &bh)) {
       info.exists = true;
       info.is_directory = (bh.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+      // A WinuxCmd fifo marker (#1038) is an on-disk file that stat()
+      // reports as a pipe (S_IFIFO, st_size 0).
+      if (!info.is_directory &&
+          native_path::is_winux_fifo_w(operand.normalized)) {
+        info.is_pipe = true;
+        info.size = 0;
+        CloseHandle(handle);
+        return info;
+      }
       info.is_readonly = (bh.dwFileAttributes & FILE_ATTRIBUTE_READONLY) != 0;
       info.size = (static_cast<unsigned long long>(bh.nFileSizeHigh) << 32) |
                   bh.nFileSizeLow;

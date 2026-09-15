@@ -380,8 +380,12 @@ REGISTER_COMMAND(cat, "cat",
       safeErrorPrintLn(": Not a directory");
       return false;
     }
-    std::ifstream file(std::filesystem::path(operand.extended),
-                       std::ios::binary);
+    // A WinuxCmd fifo marker (#1038) bridges to a named pipe read.
+    std::ifstream file =
+        native_path::is_winux_fifo_w(operand.normalized)
+            ? file_io::open_binary_file(path)
+            : std::ifstream(std::filesystem::path(operand.extended),
+                            std::ios::binary);
     if (!file) {
       safeErrorPrint("cat: ");
       safeErrorPrint(path);

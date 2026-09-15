@@ -445,6 +445,109 @@ export auto valid_attributes(DWORD attrs) -> bool {
   return attrs != INVALID_FILE_ATTRIBUTES;
 }
 
+// [GNU] canonicalize_filename_mode() existence rules shared by realpath and
+// readlink (-f/-e/-m).
+export enum class CanonMode {
+  all_but_last,  // every component but the last must exist (realpath, -f)
+  existing,      // every component must exist (realpath -e, readlink -e)
+  missing,       // no component needs to exist (realpath -m, readlink -m)
+};
+
+export auto canonicalize_path_w(std::wstring_view path, CanonMode mode,
+                                bool expand_symlinks, bool logical)
+    -> std::expected<std::wstring, int>;
+
+// On-disk representation of a WinuxCmd FIFO (#1038). Windows has no
+// filesystem FIFO node type, and MSYS2/Cygwin keep their FIFOs purely
+// in-runtime (invisible to native tools), so we emulate: a regular file
+// whose first bytes are kFifoMarker carrying FILE_ATTRIBUTE_SYSTEM, the
+// same trick Cygwin historically used for non-native symlinks.
+// Reader/writer opens in file_io bridge the marker to a deterministic
+// \\.\pipe\winuxcmd-fifo-<hash> endpoint, so blocking pipe semantics work
+// between WinuxCmd processes; non-WinuxCmd readers simply see the marker.
+export constexpr std::string_view kFifoMarker = "!<fifo>";
+
+export auto is_winux_fifo_w(std::wstring_view path) -> bool {
+  const DWORD attrs = attributes_w(path);
+  if (!valid_attributes(attrs) || (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+      (attrs & FILE_ATTRIBUTE_SYSTEM) == 0) {
+    return false;
+  }
+  const std::wstring native =
+      to_extended_path(std::wstring(strip_trailing_separators(path)));
+  HANDLE file =
+      CreateFileW(native.c_str(), GENERIC_READ,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  std::array<char, kFifoMarker.size()> buffer{};
+  DWORD read = 0;
+  const bool ok = ReadFile(file, buffer.data(),
+                           static_cast<DWORD>(buffer.size()), &read, nullptr);
+  CloseHandle(file);
+  return ok && read == buffer.size() &&
+         std::string_view(buffer.data(), read) == kFifoMarker;
+}
+
+export auto is_winux_fifo(std::string_view path) -> bool {
+  return is_winux_fifo_w(from_utf8(path));
+}
+
+// Deterministic \\.\pipe endpoint for a marker file, keyed on the
+// canonical path so independent processes rendezvous on the same name.
+export auto winux_fifo_pipe_name_w(std::wstring_view path) -> std::wstring {
+  std::wstring canon;
+  if (auto resolved =
+          canonicalize_path_w(path, CanonMode::missing, true, false);
+      resolved) {
+    canon = std::move(*resolved);
+  } else {
+    canon.assign(path);
+  }
+  for (auto& ch : canon) {
+    if (ch == L'/') ch = L'\\';
+    if (ch >= L'A' && ch <= L'Z') ch = static_cast<wchar_t>(ch - L'A' + L'a');
+  }
+  uint64_t hash = 14695981039346656037ull;  // FNV-1a
+  for (const wchar_t ch : canon) {
+    for (const int byte : {ch & 0xFF, (ch >> 8) & 0xFF}) {
+      hash = (hash ^ static_cast<uint8_t>(byte)) * 1099511628211ull;
+    }
+  }
+  std::wstring name = L"\\\\.\\pipe\\winuxcmd-fifo-";
+  char hex[17];
+  std::snprintf(hex, sizeof(hex), "%016llx",
+                static_cast<unsigned long long>(hash));
+  name.append(hex, hex + 16);
+  return name;
+}
+
+// Create a fifo marker file. Returns ERROR_SUCCESS or the Win32 error
+// (ERROR_FILE_EXISTS when the name is already taken).
+export auto create_winux_fifo_w(std::wstring_view path, bool readonly = false)
+    -> DWORD {
+  const std::wstring native =
+      to_extended_path(std::wstring(strip_trailing_separators(path)));
+  HANDLE file = CreateFileW(native.c_str(), GENERIC_WRITE, 0, nullptr,
+                            CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return GetLastError();
+  DWORD written = 0;
+  const bool ok =
+      WriteFile(file, kFifoMarker.data(),
+                static_cast<DWORD>(kFifoMarker.size()), &written, nullptr) &&
+      written == kFifoMarker.size();
+  const DWORD write_error = ok ? ERROR_SUCCESS : GetLastError();
+  CloseHandle(file);
+  if (!ok) {
+    DeleteFileW(native.c_str());
+    return write_error;
+  }
+  DWORD attrs = FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE;
+  if (readonly) attrs |= FILE_ATTRIBUTE_READONLY;
+  SetFileAttributesW(native.c_str(), attrs);
+  return ERROR_SUCCESS;
+}
+
 export auto attributes_are_directory(DWORD attrs) -> bool {
   return valid_attributes(attrs) && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
@@ -571,14 +674,6 @@ export auto join(std::string_view base, std::string_view relative)
     -> std::string {
   return to_utf8(join_w(from_utf8(base), from_utf8(relative)));
 }
-
-// [GNU] canonicalize_filename_mode() existence rules shared by realpath and
-// readlink (-f/-e/-m).
-export enum class CanonMode {
-  all_but_last,  // every component but the last must exist (realpath, -f)
-  existing,      // every component must exist (realpath -e, readlink -e)
-  missing,       // no component needs to exist (realpath -m, readlink -m)
-};
 
 namespace canonicalize_detail {
 // Split the relative part of a path into components, keeping "." and ".."

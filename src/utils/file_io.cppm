@@ -85,6 +85,9 @@ export auto create_binary_file(std::string_view filename) -> std::ofstream {
 }
 
 auto read_all_stdin() -> std::expected<std::string, std::string> {
+#ifdef _WIN32
+  _setmode(_fileno(stdin), _O_BINARY);
+#endif
   std::string content;
   std::array<char, kReadChunkSize> buffer{};
 

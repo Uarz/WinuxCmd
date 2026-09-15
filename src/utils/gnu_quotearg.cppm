@@ -38,13 +38,16 @@
 // ''$'\001'...).  Verified byte-exact against GNU 9.4 for inputs like
 // $'\x01'\''$'\x01' -> '\001'\'''$'\001''.
 
-#pragma once
+module;
 
 #include <cstdint>
 #include <string>
 #include <string_view>
 
-namespace gnu_quotearg {
+export module utils:gnu_quotearg;
+import std;
+
+export namespace gnu_quotearg {
 
 namespace detail {
 

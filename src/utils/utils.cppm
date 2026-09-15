@@ -41,3 +41,6 @@ export import :regex;
 export import :digest;
 export import :win32;
 export import :pager;
+export import :bigint;
+export import :gnu_float80;
+export import :gnu_quotearg;

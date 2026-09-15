@@ -34,9 +34,7 @@
 // (e.g. printf '%.2e' 2.455 -> 2.45e+00, printf '%a' pi -> 16 hex
 // fraction digits) we emulate the type here.
 //
-// Include this header after `import std;` in the including .cpp file.
-
-#pragma once
+module;
 
 #include <algorithm>
 #include <bit>
@@ -49,7 +47,10 @@
 #include <string_view>
 #include <vector>
 
-namespace gnu_float80 {
+export module utils:gnu_float80;
+import std;
+
+export namespace gnu_float80 {
 
 // Value = (negative ? -1 : +1) * mant * 2^(exp - 63).
 // For normal values mant's bit 63 is set; subnormals have exp == -16382

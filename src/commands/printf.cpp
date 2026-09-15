@@ -35,8 +35,6 @@
 #include <cstdio>
 
 #include "core/command_macros.h"
-#include "utils/gnu_float80.hpp"
-#include "utils/gnu_quotearg.hpp"
 import std;
 import core;
 import utils;

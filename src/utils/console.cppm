@@ -465,37 +465,53 @@ class wchar_buffer {
 // Wide string overloads (zero conversion)
 // ----------------------------------------------------------------------------
 export void safePrint(std::wstring_view wsv) {
+  std::string utf8 = wstring_to_utf8(wsv);
+  // L"..." literals are cataloged by the same legacy-key scheme; narrow the
+  // text, look it up, and emit the translation when one exists.
+  const auto translated = winux::i18n::translate_legacy(utf8);
   HANDLE h = getStdOut();
   if (isStdoutConsole()) {
-    if (!detail::writeConsoleW(h, wsv.data(), wsv.size()) &&
-        isBrokenPipeError(GetLastError())) {
+    if (translated != utf8) {
+      const std::wstring wide = utf8_to_wstring(translated);
+      if (!detail::writeConsoleW(h, wide.data(), wide.size()) &&
+          isBrokenPipeError(GetLastError())) {
+        g_stdout_pipe_closed = true;
+      }
+    } else if (!detail::writeConsoleW(h, wsv.data(), wsv.size()) &&
+               isBrokenPipeError(GetLastError())) {
       g_stdout_pipe_closed = true;
     }
     if (g_count_stdout_bytes) {
-      g_stdout_bytes_written += wstring_to_utf8(wsv).size();
+      g_stdout_bytes_written += translated.size();
     }
   } else {
-    std::string utf8 = wstring_to_utf8(wsv);
-    if (!detail::writeFile(h, utf8.data(), utf8.size()) &&
+    if (!detail::writeFile(h, translated.data(), translated.size()) &&
         isBrokenPipeError(GetLastError())) {
       g_stdout_pipe_closed = true;
     }
     if (g_count_stdout_bytes) {
-      g_stdout_bytes_written += utf8.size();
+      g_stdout_bytes_written += translated.size();
     }
   }
 }
 
 export void safeErrorPrint(std::wstring_view wsv) {
+  std::string utf8 = wstring_to_utf8(wsv);
+  const auto translated = winux::i18n::translate_legacy(utf8);
   HANDLE h = getStdErr();
   if (isStderrConsole()) {
-    if (!detail::writeConsoleW(h, wsv.data(), wsv.size()) &&
-        isBrokenPipeError(GetLastError())) {
+    if (translated != utf8) {
+      const std::wstring wide = utf8_to_wstring(translated);
+      if (!detail::writeConsoleW(h, wide.data(), wide.size()) &&
+          isBrokenPipeError(GetLastError())) {
+        g_stderr_pipe_closed = true;
+      }
+    } else if (!detail::writeConsoleW(h, wsv.data(), wsv.size()) &&
+               isBrokenPipeError(GetLastError())) {
       g_stderr_pipe_closed = true;
     }
   } else {
-    std::string utf8 = wstring_to_utf8(wsv);
-    if (!detail::writeFile(h, utf8.data(), utf8.size()) &&
+    if (!detail::writeFile(h, translated.data(), translated.size()) &&
         isBrokenPipeError(GetLastError())) {
       g_stderr_pipe_closed = true;
     }

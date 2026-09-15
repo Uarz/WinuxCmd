@@ -514,6 +514,24 @@ def extract(source_root: Path) -> dict:
                     digest ^= byte
                     digest = (digest * 1099511628211) & 0xFFFFFFFFFFFFFFFF
                 messages[f"legacy.{digest:016x}"] = value
+        # Explicit keyed calls: i18n::translate("key", "fallback") and
+        # i18n::format("key", "fallback", ...).  Only pure-literal key and
+        # fallback arguments qualify; dynamically built keys stay manual.
+        literal = r'(\s*"(?:\\.|[^"\\])*"\s*)+'
+        for call_name in ("i18n::translate", "i18n::format", "translate",
+                          "format"):
+            for body in calls(source, call_name):
+                args = split_args(body)
+                if len(args) < 2:
+                    continue
+                if not (re.fullmatch(literal, args[0])
+                        and re.fullmatch(literal, args[1])):
+                    continue
+                key = string_value(args[0])
+                fallback = string_value(args[1])
+                if (re.fullmatch(r"[a-z0-9_]+(?:\.[a-z0-9_]+)+", key)
+                        and fallback):
+                    messages.setdefault(key, fallback)
     messages.update(MANUAL_MESSAGES)
     return {"schema": 1, "locale": "en-US", "messages": dict(sorted(messages.items()))}
 

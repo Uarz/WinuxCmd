@@ -199,6 +199,39 @@ TEST(unexpand, unexpand_tab_stop_error_messages_match_gnu) {
   ascending.add(L"unexpand.exe", {L"-t", L"4,2"});
   EXPECT_EQ_TEXT(ascending.run().stderr_text,
                  "unexpand: tab sizes must be ascending\n");
+
+  Pipeline large;
+  large.add(L"unexpand.exe", {L"-t", L"99999999999999999999"});
+  auto large_result = large.run();
+  EXPECT_EQ(large_result.exit_code, 1);
+  EXPECT_EQ_TEXT(large_result.stderr_text,
+                 "unexpand: tab stop is too large '99999999999999999999'\n");
+}
+
+// Audit regression: an in-range huge tab interval must not break conversion
+// of ordinary input — 'a' is not a blank, so nothing is rewritten and no
+// giant tab column is ever reached.
+TEST(unexpand, unexpand_huge_tab_stop_handles_short_input) {
+  Pipeline p;
+  p.set_stdin("a\n");
+  p.add(L"unexpand.exe", {L"-t", L"999999999999"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "a\n");
+}
+
+// Leading blanks that never reach the huge tab stop pass through verbatim.
+TEST(unexpand, unexpand_huge_tab_stop_preserves_leading_blanks) {
+  Pipeline p;
+  p.set_stdin("   x\n");
+  p.add(L"unexpand.exe", {L"-t", L"999999999999"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "   x\n");
 }
 
 // [GNU] obsolescent -NUM options select tab stops without implying -a;

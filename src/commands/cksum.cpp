@@ -377,6 +377,13 @@ auto read_file(const std::string& filename) -> cp::Result<FileData> {
   FileData fd;
 
   if (filename == "-" || filename.empty()) {
+    // [GNU] closed stdin (<&-) reports "-: Bad file descriptor" rather
+    // than hashing an empty stream.
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected(
+          std::string(filename.empty() ? "-" : filename) +
+          ": Bad file descriptor");
+    }
     fd.data.assign(std::istreambuf_iterator<char>(std::cin),
                    std::istreambuf_iterator<char>());
     if (std::cin.fail() && !std::cin.eof()) {
@@ -403,7 +410,14 @@ auto read_crc_file(const std::string& filename)
     -> cp::Result<portable_digest::PosixCksumResult> {
   std::istream* input = &std::cin;
   std::ifstream file;
-  if (filename != "-" && !filename.empty()) {
+  if (filename == "-" || filename.empty()) {
+    // [GNU] closed stdin (<&-) reports "-: Bad file descriptor".
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected(
+          std::string(filename.empty() ? "-" : filename) +
+          ": Bad file descriptor");
+    }
+  } else {
     file.open(
         std::filesystem::u8path(native_path::normalize_api_operand(filename)),
         std::ios::binary);

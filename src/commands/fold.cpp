@@ -320,6 +320,12 @@ auto run(const Config& cfg) -> int {
   for (const auto& file : cfg.files) {
     std::string content;
     if (file == "-") {
+      // [GNU] closed stdin (<&-) errors "fold: -: Bad file descriptor".
+      if (file_io::stdin_is_bad()) {
+        cp::Result<int> result = std::unexpected("-: Bad file descriptor");
+        cp::report_error(result, L"fold");
+        return 1;
+      }
       content.assign(std::istreambuf_iterator<char>(std::cin),
                      std::istreambuf_iterator<char>());
     } else {

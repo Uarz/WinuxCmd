@@ -193,17 +193,33 @@ auto cut_input_open_error(std::string_view input_path) -> std::string {
          "' for reading: No such file or directory";
 }
 
-auto read_source(std::string_view path) -> cp::Result<std::string> {
-  if (path == "-") {
-    return std::string(std::istreambuf_iterator<char>(std::cin),
-                       std::istreambuf_iterator<char>());
+// Bytes of pending output allowed to accumulate before a flush. Output is
+// emitted in bounded chunks as records are processed, so downstream
+// consumers (e.g. `head`) see data immediately and a closed pipe is
+// detected while the producer may still be streaming input.
+constexpr size_t kOutputFlushThreshold = 64 * 1024;
+
+// Returns the process exit code when output can no longer continue, or
+// std::nullopt while streaming may proceed. A closed downstream pipe is a
+// quiet exit like GNU's SIGPIPE death; any other stdout write failure is a
+// fatal "write error" diagnostic with exit code 1.
+auto stop_status() -> std::optional<int> {
+  if (is_stdout_pipe_closed()) return 0;
+  if (is_stdout_write_failed()) {
+    safeErrorPrintLn("cut: write error");
+    return 1;
   }
-  std::ifstream in(native_path::normalize_api_operand(path), std::ios::binary);
-  if (!in.is_open()) {
-    return std::unexpected(cut_input_open_error(path));
+  return std::nullopt;
+}
+
+// Emit buffered output through safePrint so daemon capture handles and
+// console conversion keep working, then classify the write result.
+auto flush_output(std::string& output) -> std::optional<int> {
+  if (!output.empty()) {
+    safePrint(std::string_view(output.data(), output.size()));
+    output.clear();
   }
-  return std::string(std::istreambuf_iterator<char>(in),
-                     std::istreambuf_iterator<char>());
+  return stop_status();
 }
 
 auto build_config(const CommandContext<CUT_OPTIONS.size()>& ctx)
@@ -504,10 +520,23 @@ auto append_fast_field_record(std::string_view rec, const Config& cfg,
   return true;
 }
 
-auto run_file_fast_fields(const std::string& path, const Config& cfg) -> int {
+// Stream one record at a time: cut never holds more than the current
+// record plus a bounded output buffer, so `yes | cut -c1- | head -1` emits
+// immediately and exits quietly once the downstream pipe closes.
+auto run_file(const std::string& path, const Config& cfg) -> int {
   std::ifstream file;
   std::istream* input = nullptr;
   if (path == "-") {
+    // [GNU] closed stdin (<&-) errors "cut: -: Bad file descriptor".
+    if (file_io::stdin_is_bad()) {
+      cp::report_custom_error(L"cut", L"-: Bad file descriptor");
+      return 1;
+    }
+#ifdef _WIN32
+    // Binary mode keeps '\r', NUL records and 0x1A bytes intact; the
+    // newline path strips a trailing '\r' itself, matching file input.
+    _setmode(_fileno(stdin), _O_BINARY);
+#endif
     input = &std::cin;
   } else {
     file.open(native_path::normalize_api_operand(path), std::ios::binary);
@@ -520,77 +549,37 @@ auto run_file_fast_fields(const std::string& path, const Config& cfg) -> int {
   }
 
   const char record_delim = cfg.zero_terminated ? '\0' : '\n';
+  const bool fast_fields = can_use_fast_field_stream(cfg);
   std::string record;
   std::string output;
-  output.reserve(1024 * 1024);
-
-  auto flush = [&]() {
-    if (output.empty()) return;
-    safePrint(std::string_view(output.data(), output.size()));
-    output.clear();
-  };
+  output.reserve(kOutputFlushThreshold);
 
   while (std::getline(*input, record, record_delim)) {
     if (!cfg.zero_terminated && !record.empty() && record.back() == '\r') {
       record.pop_back();
     }
 
-    if (output.size() + record.size() + 1 > output.capacity()) {
-      flush();
-      if (is_stdout_pipe_closed()) return 0;
+    bool should_emit = true;
+    if (fast_fields) {
+      should_emit = append_fast_field_record(record, cfg, output);
+    } else {
+      std::string out = cut_line(record, cfg);
+      if (out.empty() && cfg.only_delimited &&
+          !record_has_field_delimiter(record, cfg)) {
+        should_emit = false;
+      } else {
+        output.append(out);
+      }
     }
-
-    const bool should_emit = append_fast_field_record(record, cfg, output);
     if (!should_emit) continue;
     output.push_back(record_delim);
-  }
 
-  flush();
-  return 0;
-}
-
-auto run_file(const std::string& path, const Config& cfg) -> int {
-  if (can_use_fast_field_stream(cfg)) {
-    return run_file_fast_fields(path, cfg);
-  }
-
-  auto content = read_source(path);
-  if (!content) {
-    cp::report_error(content, L"cut");
-    return 1;
-  }
-
-  char record_delim = cfg.zero_terminated ? '\0' : '\n';
-
-  std::vector<std::string> records;
-  size_t start = 0;
-  for (size_t i = 0; i < content->size(); ++i) {
-    if ((*content)[i] == record_delim) {
-      records.push_back(content->substr(start, i - start));
-      start = i + 1;
+    if (output.size() >= kOutputFlushThreshold) {
+      if (auto rc = flush_output(output)) return *rc;
     }
   }
-  if (start < content->size()) {
-    records.push_back(content->substr(start));
-  }
 
-  for (auto rec : records) {
-    if (!cfg.zero_terminated && !rec.empty() && rec.back() == '\r') {
-      rec.pop_back();
-    }
-
-    auto out = cut_line(rec, cfg);
-    auto has_delimiter = record_has_field_delimiter(rec, cfg);
-    if (out.empty() && cfg.only_delimited && !has_delimiter) {
-      continue;
-    }
-    safePrint(std::string_view(out.data(), out.size()));
-    if (cfg.zero_terminated) {
-      safePrint(char{'\0'});
-    } else {
-      safePrint("\n");
-    }
-  }
+  if (auto rc = flush_output(output)) return *rc;
   return 0;
 }
 
@@ -598,6 +587,9 @@ auto run(const Config& cfg) -> int {
   for (const auto& f : cfg.files) {
     int rc = run_file(f, cfg);
     if (rc != 0) return rc;
+    // A dead stdout ends the pipeline: remaining files would only hit the
+    // same failed writer (GNU dies on SIGPIPE mid-stream too).
+    if (auto stop = stop_status()) return *stop;
   }
   return 0;
 }

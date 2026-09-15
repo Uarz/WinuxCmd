@@ -109,7 +109,14 @@ auto calculate_checksum(const std::string& filename, uint32_t& block_count,
 
   std::istream* input = &std::cin;
   std::ifstream file;
-  if (filename != "-" && !filename.empty()) {
+  if (filename == "-" || filename.empty()) {
+    // [GNU] closed stdin (<&-) reports "-: Bad file descriptor".
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected(
+          std::string(filename.empty() ? "-" : filename) +
+          ": Bad file descriptor");
+    }
+  } else {
     file.open(native_path::normalize_api_operand(filename), std::ios::binary);
     if (!file) {
       return std::unexpected(input_open_error(filename));

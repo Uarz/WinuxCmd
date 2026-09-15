@@ -121,7 +121,13 @@ struct Config {
 auto read_all(std::istream& in) -> std::string { return read_text_stream(in); }
 
 auto read_source(std::string_view path) -> cp::Result<std::string> {
-  if (path == "-") return read_all(std::cin);
+  if (path == "-") {
+    // [GNU] closed stdin (<&-) is a read error, not an empty stream.
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected("error reading '-': Bad file descriptor");
+    }
+    return read_all(std::cin);
+  }
 
   auto content = file_io::read_all_file(path);
   if (!content) {
@@ -321,6 +327,10 @@ auto run(const Config& cfg) -> int {
       return 1;
     }
     input = &input_file;
+  } else if (file_io::stdin_is_bad()) {
+    // [GNU] closed stdin (<&-) errors "uniq: error reading '-'".
+    cp::report_custom_error(L"uniq", L"error reading '-': Bad file descriptor");
+    return 1;
   }
 
   std::ostream* out = &std::cout;

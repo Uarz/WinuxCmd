@@ -36,6 +36,7 @@ module;
 export module utils:digest;
 import std;
 import :console;
+import :file_io;
 import :native_path;
 
 export namespace portable_digest {
@@ -1078,12 +1079,19 @@ auto hash_file_hex(HashAlgorithm algorithm, const std::string& filename,
   std::istream* input = &std::cin;
   std::ifstream file;
   if (!filename.empty() && filename != "-") {
-    file.open(native_path::normalize_api_operand(filename),
-              text_mode ? std::ios::in : std::ios::binary);
+    // Route through open_binary_file so /dev/stdin-family operands bind the
+    // real fd 0 (closed stdin reports an error instead of blocking on
+    // CONIN$, and pipes/hashable data flow through, #1091).
+    file = file_io::open_binary_file(filename);
     if (!file) {
       return std::unexpected(detail::input_open_error(filename));
     }
     input = &file;
+  } else if (file_io::stdin_is_bad()) {
+    // [GNU] `md5sum <&-` reports "-: Bad file descriptor" rather than
+    // hashing an empty stream (#1091).
+    return std::unexpected(std::string(filename.empty() ? "-" : filename) +
+                           ": Bad file descriptor");
   }
 
   switch (algorithm) {

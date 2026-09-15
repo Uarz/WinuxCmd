@@ -486,6 +486,11 @@ auto run(const Config& cfg) -> int {
 
   for (const auto& file : cfg.files) {
     if (file == "-") {
+      // [GNU] closed stdin (<&-) errors "nl: -: Bad file descriptor".
+      if (file_io::stdin_is_bad()) {
+        safeErrorPrintLn("nl: -: Bad file descriptor");
+        return 1;
+      }
       // Read from stdin
       std::string line;
       while (std::getline(std::cin, line)) {

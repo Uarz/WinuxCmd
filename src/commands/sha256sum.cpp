@@ -218,6 +218,13 @@ auto calculate_sha256(const std::string& filename, bool text_mode = false)
 
   bool success = false;
   if (filename == "-" || filename.empty()) {
+    // [GNU] closed stdin (<&-) reports "-: Bad file descriptor" rather
+    // than hashing an empty stream.
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected(
+          std::string(filename.empty() ? "-" : filename) +
+          ": Bad file descriptor");
+    }
     // Read from stdin
     std::array<char, 8192> buffer;
     size_t bytes_read;

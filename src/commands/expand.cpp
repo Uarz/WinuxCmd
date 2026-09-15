@@ -164,24 +164,34 @@ auto parse_tab_stops(const std::string& spec) -> cp::Result<Config::TabStops> {
 }
 
 auto next_tab_stop(size_t column, const Config::TabStops& tab_stops) -> size_t {
+  const size_t max = std::numeric_limits<size_t>::max();
   for (size_t stop : tab_stops.stops) {
     if (stop > column) return stop;
   }
 
+  // Smallest multiple of INTERVAL strictly greater than COL. The result is
+  // saturated at SIZE_MAX instead of wrapping: an overflowing stop behind
+  // the current column would corrupt the padding count (next_stop - column
+  // would underflow into a bogus huge value for the wrong reason).
+  auto next_multiple = [max](size_t col, size_t interval) -> size_t {
+    const size_t delta = interval - col % interval;  // in [1, interval]
+    return col > max - delta ? max : col + delta;
+  };
+
   switch (tab_stops.repeat_mode) {
     case Config::TabStops::RepeatMode::every_multiple:
-      return ((column / tab_stops.interval) + 1) * tab_stops.interval;
+      return next_multiple(column, tab_stops.interval);
     case Config::TabStops::RepeatMode::after_last: {
       size_t anchor = tab_stops.stops.empty() ? 0 : tab_stops.stops.back();
       if (column < anchor) return anchor;
-      return anchor + (((column - anchor) / tab_stops.interval) + 1) *
-                          tab_stops.interval;
+      const size_t rel = next_multiple(column - anchor, tab_stops.interval);
+      return rel > max - anchor ? max : anchor + rel;
     }
     case Config::TabStops::RepeatMode::none:
-      return column + 1;
+      return column == max ? max : column + 1;
   }
 
-  return column + 1;
+  return column == max ? max : column + 1;
 }
 
 auto build_config(const CommandContext<EXPAND_OPTIONS.size()>& ctx)
@@ -228,40 +238,87 @@ auto build_config(const CommandContext<EXPAND_OPTIONS.size()>& ctx)
   return cfg;
 }
 
-// Expand tabs to spaces in a single line
+// Bounded stdout sink. Tab expansion can legitimately emit far more bytes
+// than it reads (`expand -t 999999999999` must really write ~1e12 spaces,
+// like GNU), so output is streamed through a fixed-size buffer instead of
+// being accumulated in a std::string — materializing the whole padding run
+// previously attempted a single ~1TB allocation that failed and silently
+// dropped all output.
+class ChunkedOutput {
+ public:
+  void put(char c) {
+    if (used_ == kChunkSize) flush();
+    buffer_[used_++] = c;
+  }
+
+  void write_spaces(size_t count) {
+    if (used_ != 0) {
+      const size_t n = std::min(count, kChunkSize - used_);
+      std::memcpy(buffer_.data() + used_, kSpaces.data(), n);
+      used_ += n;
+      count -= n;
+      if (used_ == kChunkSize) flush();
+    }
+    // Full chunks are written straight from the static space block so a
+    // huge padding run costs one bounded write per chunk, no big string.
+    while (count >= kChunkSize) {
+      safePrint(std::string_view(kSpaces.data(), kChunkSize));
+      count -= kChunkSize;
+    }
+    if (count != 0) {
+      std::memcpy(buffer_.data(), kSpaces.data(), count);
+      used_ = count;
+    }
+  }
+
+  void flush() {
+    if (used_ == 0) return;
+    safePrint(std::string_view(buffer_.data(), used_));
+    used_ = 0;
+  }
+
+ private:
+  static constexpr size_t kChunkSize = 64 * 1024;
+  static constexpr auto kSpaces = [] {
+    std::array<char, kChunkSize> filled{};
+    filled.fill(' ');
+    return filled;
+  }();
+  std::array<char, kChunkSize> buffer_{};
+  size_t used_ = 0;
+};
+
+// Expand tabs to spaces in a single line, streaming the result into OUT.
 auto expand_line(const std::string& line, const Config::TabStops& tab_stops,
-                 bool initial_only) -> std::string {
-  std::string result;
-  result.reserve(line.size() * 2);
+                 bool initial_only, ChunkedOutput& out) -> void {
   size_t column = 0;
   bool before_non_blank = true;
+  const size_t max = std::numeric_limits<size_t>::max();
 
   for (char c : line) {
     if (c == '\t') {
       size_t next_stop = next_tab_stop(column, tab_stops);
       if (!initial_only || before_non_blank) {
-        size_t spaces_needed = next_stop - column;
-        result.append(spaces_needed, ' ');
+        // next_tab_stop never wraps, so next_stop >= column here.
+        out.write_spaces(next_stop - column);
       } else {
-        result += c;
+        out.put(c);
       }
       column = next_stop;
     } else if (c == '\n') {
-      result += c;
+      out.put(c);
       column = 0;
       before_non_blank = true;
     } else if (c == '\b') {
-      result += c;
+      out.put(c);
       if (column > 0) --column;
       before_non_blank = false;
     } else {
-      result += c;
-      ++column;
+      out.put(c);
+      if (column != max) ++column;
       if (c != ' ') before_non_blank = false;
     }
   }
-
-  return result;
 }
 
 auto run(const Config& cfg) -> int {
@@ -282,6 +339,12 @@ auto run(const Config& cfg) -> int {
     std::string content;
 
     if (file == "-") {
+      // [GNU] closed stdin (<&-) errors "expand: -: Bad file descriptor".
+      if (file_io::stdin_is_bad()) {
+        cp::Result<int> result = std::unexpected("-: Bad file descriptor");
+        cp::report_error(result, L"expand");
+        return 1;
+      }
       // Read from stdin
       content.assign(std::istreambuf_iterator<char>(std::cin),
                      std::istreambuf_iterator<char>());
@@ -313,7 +376,7 @@ auto run(const Config& cfg) -> int {
     }
 
     // Process line by line to maintain line breaks
-    std::string result;
+    ChunkedOutput out;
     size_t line_start = 0;
     while (line_start < content.size()) {
       size_t line_end = content.find('\n', line_start);
@@ -324,7 +387,7 @@ auto run(const Config& cfg) -> int {
         if (!line.empty() && line.back() == '\r') {
           line.pop_back();
         }
-        result += expand_line(line, cfg.tab_stops, cfg.initial_only);
+        expand_line(line, cfg.tab_stops, cfg.initial_only, out);
         break;
       } else {
         line = content.substr(line_start,
@@ -333,12 +396,12 @@ auto run(const Config& cfg) -> int {
             line.back() == '\n') {
           line.erase(line.end() - 2);
         }
-        result += expand_line(line, cfg.tab_stops, cfg.initial_only);
+        expand_line(line, cfg.tab_stops, cfg.initial_only, out);
         line_start = line_end + 1;
       }
     }
 
-    safePrint(result);
+    out.flush();
   }
 
   return all_ok ? 0 : 1;

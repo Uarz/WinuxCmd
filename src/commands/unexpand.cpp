@@ -180,18 +180,27 @@ auto parse_tab_stops(std::string_view spec, Config::TabStops& tab_stops,
 // off for the rest of the line.
 auto get_next_tab_column(size_t column, const Config::TabStops& tab_stops,
                          bool& last_tab) -> size_t {
+  const size_t max = std::numeric_limits<size_t>::max();
   for (size_t stop : tab_stops.stops) {
     if (stop > column) return stop;
   }
 
+  // Smallest multiple of INTERVAL strictly greater than COL, saturated at
+  // SIZE_MAX rather than wrapping so a huge in-range interval never yields
+  // a tab column behind the current position.
+  auto next_multiple = [max](size_t col, size_t interval) -> size_t {
+    const size_t delta = interval - col % interval;  // in [1, interval]
+    return col > max - delta ? max : col + delta;
+  };
+
   switch (tab_stops.repeat_mode) {
     case Config::TabStops::RepeatMode::every_multiple:
-      return ((column / tab_stops.interval) + 1) * tab_stops.interval;
+      return next_multiple(column, tab_stops.interval);
     case Config::TabStops::RepeatMode::after_last: {
       size_t anchor = tab_stops.stops.empty() ? 0 : tab_stops.stops.back();
       if (column < anchor) return anchor;
-      return anchor + (((column - anchor) / tab_stops.interval) + 1) *
-                          tab_stops.interval;
+      const size_t rel = next_multiple(column - anchor, tab_stops.interval);
+      return rel > max - anchor ? max : anchor + rel;
     }
     case Config::TabStops::RepeatMode::none:
       break;
@@ -341,7 +350,8 @@ auto unexpand_line(const std::string& line, const Config::TabStops& tab_stops,
             column = next_tab_column;
             if (!pending_blank.empty()) pending_blank[0] = '\t';
           } else {
-            ++column;
+            // Saturate: a column at SIZE_MAX must not wrap to 0.
+            if (column != std::numeric_limits<size_t>::max()) ++column;
             if (!(prev_blank && column == next_tab_column)) {
               // It is not yet known whether the pending blanks will be
               // replaced by tabs.
@@ -364,7 +374,7 @@ auto unexpand_line(const std::string& line, const Config::TabStops& tab_stops,
         // Go back one column; the next tab stop is recomputed anyway.
         if (column > 0) --column;
       } else {
-        ++column;
+        if (column != std::numeric_limits<size_t>::max()) ++column;
       }
 
       if (!pending_blank.empty()) {

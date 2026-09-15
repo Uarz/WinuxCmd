@@ -886,6 +886,11 @@ REGISTER_COMMAND(
   auto max_input_bytes = od_pipeline::max_input_bytes_needed(cfg);
 
   if (cfg.files.empty() || cfg.files[0] == "-") {
+    // [GNU] closed stdin (<&-) errors "od: -: Bad file descriptor".
+    if (file_io::stdin_is_bad()) {
+      safeErrorPrintLn("od: -: Bad file descriptor");
+      return 1;
+    }
     _setmode(_fileno(stdin), _O_BINARY);
     od_pipeline::read_stream_bytes(std::cin, data, max_input_bytes);
   } else {

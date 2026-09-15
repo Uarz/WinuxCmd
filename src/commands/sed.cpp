@@ -2327,6 +2327,13 @@ auto process_files(const Config& cfg) -> int {
     std::ifstream file;
     std::istream* in = nullptr;
     if (f == "-") {
+      // [GNU] closed stdin (<&-) reports a read error instead of
+      // dereferencing a bad stream (MSYS sed itself segfaults here).
+      if (file_io::stdin_is_bad()) {
+        safeErrorPrint("sed: can't read -: Bad file descriptor\n");
+        any_error = true;
+        continue;
+      }
       in = &std::cin;
     } else {
       file.open(f, std::ios::binary);

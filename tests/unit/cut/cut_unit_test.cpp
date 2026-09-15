@@ -425,3 +425,117 @@ TEST(cut, cut_newline_mode_trims_trailing_cr_from_crlf_records) {
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_EQ_TEXT(r.stdout_text, "b\nd\n");
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1093: cut must stream records and emit each one immediately instead
+// of slurping the whole input first. The piped-stdin tests feed multi-line
+// input through a pipe, and `yes | cut | head` proves early exit on a closed
+// stdout pipe: with the old read-everything implementation that pipeline
+// produced no output before timing out; streaming cut emits records as they
+// arrive and exits quietly once head closes the pipe (SIGPIPE equivalent).
+// ---------------------------------------------------------------------------
+
+TEST(cut, cut_piped_stdin_multiline_fields) {
+  Pipeline p;
+  p.set_stdin("a,1\nb,2\nc,3\n");
+  p.add(L"cut.exe", {L"-d", L",", L"-f", L"2"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "1\n2\n3\n");
+}
+
+TEST(cut, cut_piped_stdin_multiline_characters) {
+  Pipeline p;
+  p.set_stdin("hello\nworld\n");
+  p.add(L"cut.exe", {L"-c", L"2-4"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "ell\norl\n");
+}
+
+TEST(cut, cut_piped_stdin_zero_terminated) {
+  Pipeline p;
+  p.set_stdin(std::string("a:b\0c:d\0", 8));
+  p.add(L"cut.exe", {L"-z", L"-d", L":", L"-f", L"2"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ(r.stdout_text, std::string("b\0d\0", 4));
+}
+
+TEST(cut, cut_piped_stdin_only_delimited_suppresses) {
+  Pipeline p;
+  p.set_stdin("nod\nhas:x\n");
+  p.add(L"cut.exe", {L"-d", L":", L"-f", L"2", L"-s"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "x\n");
+}
+
+// `yes | cut -c1- | head -n1` (issue #1093): GNU emits 'y' immediately and
+// dies on SIGPIPE when head exits. Streaming cut must do the same — emit
+// output before the input ends and exit quietly once the downstream pipe
+// closes. If cut ever goes back to buffering all input, `yes` never reaches
+// EOF and this test hangs instead of passing.
+TEST(cut, cut_streams_yes_through_head_exits_early_on_closed_pipe) {
+  Pipeline p;
+  p.add(L"yes.exe", {});
+  p.add(L"cut.exe", {L"-c1-"});
+  p.add(L"head.exe", {L"-n", L"1"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "y\n");
+}
+
+// 200k records exercise the streaming path far beyond the 64 KiB output
+// flush threshold: every line is cut and emitted in order with bounded
+// per-line memory. Verifying the full output proves no records are dropped,
+// duplicated, or reordered across flush boundaries.
+TEST(cut, cut_large_input_streams_with_bounded_memory) {
+  TempDir tmp;
+  std::string input;
+  std::string expected;
+  input.reserve(200000 * 12);
+  expected.reserve(200000 * 8);
+  for (int i = 0; i < 200000; ++i) {
+    std::string num = std::to_string(i);
+    input += "k" + num + ":v" + num + "\n";
+    expected += "v" + num + "\n";
+  }
+  tmp.write("big.txt", input);
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"cut.exe", {L"-d", L":", L"-f", L"2", L"big.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ(r.stdout_text.size(), expected.size());
+  EXPECT_TRUE(r.stdout_text == expected);
+}
+
+// Same streaming guarantee for the generic (non-fast) per-line path used by
+// -b/--complement: bounded memory, all records emitted in order.
+TEST(cut, cut_large_input_bytes_mode_streams_with_bounded_memory) {
+  TempDir tmp;
+  std::string input;
+  std::string expected;
+  for (int i = 0; i < 100000; ++i) {
+    input += "abcdef\n";
+    expected += "aef\n";  // complement of byte positions 2-4
+  }
+  tmp.write("big.txt", input);
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"cut.exe", {L"-b", L"2-4", L"--complement", L"big.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ(r.stdout_text.size(), expected.size());
+  EXPECT_TRUE(r.stdout_text == expected);
+}

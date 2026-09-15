@@ -527,6 +527,11 @@ auto read_lines(const std::string& filename)
   };
 
   if (filename == "-") {
+    // [GNU] closed stdin (<&-) errors "pr: 'standard input': Bad file
+    // descriptor" rather than producing an empty page set.
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected("'standard input': Bad file descriptor");
+    }
     std::string line;
     while (std::getline(std::cin, line)) {
       normalize_text_line(line);

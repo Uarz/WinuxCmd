@@ -469,7 +469,8 @@ struct ParsedKeyPosition {
 
 auto parse_key_position(std::string_view text)
     -> cp::Result<ParsedKeyPosition> {
-  if (text.empty()) return std::unexpected("invalid key spec '" + std::string(text) + "'");
+  if (text.empty())
+    return std::unexpected("invalid key spec '" + std::string(text) + "'");
 
   ParsedKeyPosition pos;
   size_t i = 0;
@@ -532,7 +533,8 @@ auto parse_key_position(std::string_view text)
 }
 
 auto parse_key_spec(std::string_view text) -> cp::Result<KeySpec> {
-  if (text.empty()) return std::unexpected("invalid key spec '" + std::string(text) + "'");
+  if (text.empty())
+    return std::unexpected("invalid key spec '" + std::string(text) + "'");
 
   KeySpec key;
 

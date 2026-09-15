@@ -178,10 +178,7 @@ auto constexpr LS_OPTIONS = std::array{
            "colorize the output; WHEN can be 'always', 'auto', or 'never'",
            STRING_TYPE),
     OPTION("-1", "", "list one file per line"),
-    // [DIFFERS] Emacs dired mode not supported on Windows
-    OPTION("-D", "--dired",
-           "generate output designed for Emacs dired mode [unsupported on "
-           "Windows]"),
+    OPTION("-D", "--dired", "generate output designed for Emacs dired mode"),
     OPTION("-G", "--no-group", "in a long listing, don't print group names"),
     OPTION("", "--group-directories-first", "group directories before files"),
     OPTION("", "--author", "show author in long format"),
@@ -193,10 +190,8 @@ auto constexpr LS_OPTIONS = std::array{
            "follow each command-line symlink to a directory"),
     OPTION("", "--hide", "do not list implied entries matching PATTERN",
            STRING_TYPE),
-    // [DIFFERS] OSC 8 hyperlink not fully supported on Windows terminals
     OPTION("", "--hyperlink",
-           "hyperlink file names when outputting to a terminal [unsupported on "
-           "Windows]",
+           "hyperlink file names; WHEN can be 'always', 'auto', or 'never'",
            OPTIONAL_STRING_TYPE),
     OPTION("", "--si", "like -h, but use powers of 1000 not 1024"),
     OPTION("", "--full-time", "like -l --time-style=full-iso"),
@@ -927,6 +922,76 @@ auto read_symlink_display_target(const std::wstring &full_path,
                               std::move(resolved_target)};
 }
 
+// [GNU] -D/--dired: records the byte offset range of every printed file
+// name and emits "//DIRED// start end ..." trailer lines for Emacs dired.
+// Offsets are UTF-8 byte positions in the output stream, counted by the
+// console layer (set_stdout_byte_counting).
+bool g_hyperlink_enabled = false;
+
+std::vector<std::pair<uint64_t, uint64_t>> g_dired_offsets;
+std::vector<std::pair<uint64_t, uint64_t>> g_subdired_offsets;
+
+auto dired_requested(const CommandContext<LS_OPTIONS.size()> &ctx) -> bool {
+  return ctx.has("-D") || ctx.has("--dired");
+}
+
+// Records a name that will appear at |name_offset| bytes inside a text
+// blob that is about to be printed.
+void dired_note_text_entry(uint64_t name_offset, uint64_t name_length) {
+  const uint64_t begin = stdout_bytes_written() + name_offset;
+  g_dired_offsets.push_back({begin, begin + name_length});
+}
+
+// [GNU] --hyperlink[=WHEN] wraps each name in an OSC 8 escape with a
+// file://HOST/path URI.  Bare --hyperlink means "always".
+auto hyperlink_mode(const CommandContext<LS_OPTIONS.size()> &ctx)
+    -> cp::Result<bool> {
+  if (!ctx.has("--hyperlink")) {
+    return false;
+  }
+  const std::string when = ctx.get<std::string>("--hyperlink", "");
+  if (when.empty() || when == "always" || when == "yes" || when == "force") {
+    return true;
+  }
+  if (when == "never" || when == "no" || when == "none") {
+    return false;
+  }
+  if (when == "auto" || when == "tty" || when == "if-tty") {
+    return isOutputConsole();
+  }
+  return std::unexpected("invalid --hyperlink argument '" + when + "'");
+}
+
+auto hyperlink_wrap(const std::wstring &display_name,
+                    const std::wstring &full_path) -> std::wstring {
+  // RFC 8089 file URI: file://<host>/<drive>:/<path with '/' separators>,
+  // percent-encoding non-unreserved bytes of the UTF-8 path.
+  static const std::string host = [] {
+    char buf[MAX_COMPUTERNAME_LENGTH + 1] = {};
+    DWORD len = sizeof(buf);
+    return GetComputerNameA(buf, &len) ? std::string(buf, len)
+                                       : std::string("localhost");
+  }();
+  std::wstring abs = std::filesystem::absolute(std::filesystem::path(full_path))
+                         .generic_wstring();
+  const std::string utf8 = wstring_to_utf8(abs);
+  std::string uri = "file://" + host + "/";
+  uri.reserve(uri.size() + utf8.size() + 8);
+  static constexpr char kUnreserved[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/@:";
+  for (unsigned char ch : utf8) {
+    if (strchr(kUnreserved, ch)) {
+      uri.push_back(static_cast<char>(ch));
+    } else {
+      char hex[4];
+      snprintf(hex, sizeof(hex), "%%%02X", ch);
+      uri += hex;
+    }
+  }
+  const std::wstring wuri = utf8_to_wstring(uri);
+  return L"\x1b]8;;" + wuri + L"\x07" + display_name + L"\x1b]8;;\x07";
+}
+
 auto build_display_name_parts(const std::wstring &name,
                               const std::wstring &full_path,
                               const WIN32_FIND_DATAW &find_data,
@@ -941,6 +1006,15 @@ auto build_display_name_parts(const std::wstring &name,
                                             command_line_operand);
   if (target) {
     target->display = apply_quoting_mode(target->display, quoting);
+  }
+  // [GNU] --hyperlink wraps the displayed name (and the symlink target
+  // separately) in an OSC 8 file:// URI escape.
+  if (g_hyperlink_enabled) {
+    rendered = hyperlink_wrap(rendered, full_path);
+    if (target) {
+      target->display =
+          hyperlink_wrap(target->display, target->resolved_path.native());
+    }
   }
   if (!target) {
     rendered += get_indicator_suffix(name, find_data, ctx);
@@ -1008,8 +1082,14 @@ auto print_display_name(const std::wstring &name, const std::wstring &full_path,
   auto parts = build_display_name_parts(name, full_path, find_data, ctx,
                                         command_line_operand);
 
+  const bool dired = dired_requested(ctx);
   if (!color_enabled) {
-    safePrint(wstring_to_utf8(parts.rendered_name));
+    const std::string name_utf8 = wstring_to_utf8(parts.rendered_name);
+    const uint64_t name_begin = stdout_bytes_written();
+    safePrint(name_utf8);
+    if (dired) {
+      g_dired_offsets.push_back({name_begin, name_begin + name_utf8.size()});
+    }
     if (parts.target) {
       safePrint(" -> ");
       safePrint(wstring_to_utf8(parts.target->display));
@@ -1023,7 +1103,12 @@ auto print_display_name(const std::wstring &name, const std::wstring &full_path,
     safePrint(color_prefix_sequence());
     safePrint(entry_color);
   }
-  safePrint(wstring_to_utf8(parts.rendered_name));
+  const std::string name_utf8 = wstring_to_utf8(parts.rendered_name);
+  const uint64_t name_begin = stdout_bytes_written();
+  safePrint(name_utf8);
+  if (dired) {
+    g_dired_offsets.push_back({name_begin, name_begin + name_utf8.size()});
+  }
   if (has_color) {
     safePrint(COLOR_RESET);
   }
@@ -1753,6 +1838,9 @@ auto print_record_terminator(const CommandContext<LS_OPTIONS.size()> &ctx)
 struct RenderedEntry {
   std::string text;
   size_t visible_width = 0;
+  // [GNU] --dired: byte offset/length of the file name inside |text|.
+  size_t name_offset = 0;
+  size_t name_length = 0;
 };
 
 auto render_inline_entry(const EntryInfo &entry,
@@ -1771,12 +1859,15 @@ auto render_inline_entry(const EntryInfo &entry,
     text += wstring_to_utf8(color_prefix_sequence());
     text += wstring_to_utf8(entry_color);
   }
-  text += wstring_to_utf8(display_name);
+  const std::string name_utf8 = wstring_to_utf8(display_name);
+  const size_t name_offset = text.size();
+  text += name_utf8;
   if (color_enabled && !entry_color.empty()) {
     text += wstring_to_utf8(COLOR_RESET);
   }
 
-  return {std::move(text), prefix.size() + string_display_width(display_name)};
+  return {std::move(text), prefix.size() + string_display_width(display_name),
+          name_offset, name_utf8.size()};
 }
 
 auto build_rendered_entries(const std::vector<EntryInfo> &entries,
@@ -1792,7 +1883,9 @@ auto build_rendered_entries(const std::vector<EntryInfo> &entries,
 }
 
 auto print_rendered_entries(const std::vector<RenderedEntry> &entries,
-                            size_t width) -> void {
+                            size_t width,
+                            const CommandContext<LS_OPTIONS.size()> &ctx)
+    -> void {
   size_t line_width = 0;
   for (size_t i = 0; i < entries.size(); ++i) {
     if (i > 0) {
@@ -1806,6 +1899,9 @@ auto print_rendered_entries(const std::vector<RenderedEntry> &entries,
         safePrint(", ");
         line_width += 2;
       }
+    }
+    if (dired_requested(ctx)) {
+      dired_note_text_entry(entries[i].name_offset, entries[i].name_length);
     }
     safePrint(entries[i].text);
     line_width += entries[i].visible_width;
@@ -1937,6 +2033,10 @@ auto print_grid(const std::vector<EntryInfo> &entries,
                                    : static_cast<size_t>(row + col * rows);
       if (index >= rendered.size()) continue;
 
+      if (dired_requested(ctx)) {
+        dired_note_text_entry(rendered[index].name_offset,
+                              rendered[index].name_length);
+      }
       safePrint(rendered[index].text);
       current_column += rendered[index].visible_width;
       bool has_later_entry_in_row = false;
@@ -3184,7 +3284,7 @@ auto list_directory(const std::string &path,
     if (width <= 0) {
       width = get_terminal_width();
     }
-    print_rendered_entries(rendered, static_cast<size_t>(width));
+    print_rendered_entries(rendered, static_cast<size_t>(width), ctx);
     safePrintLn(L"");
   } else if (format_mode == FormatMode::OnePerLine) {
     if (show_blocks) {
@@ -3192,6 +3292,9 @@ auto list_directory(const std::string &path,
     }
     auto rendered = build_rendered_entries(entries, ctx);
     for (const auto &entry : rendered) {
+      if (dired_requested(ctx)) {
+        dired_note_text_entry(entry.name_offset, entry.name_length);
+      }
       safePrint(entry.text);
       print_record_terminator(ctx);
     }
@@ -3378,6 +3481,9 @@ auto list_file(const std::string &path,
     auto rendered = render_inline_entry(
         {operand_display_name, lookup_wpath, find_data, true}, ctx,
         resolve_color_enabled(ctx));
+    if (dired_requested(ctx)) {
+      dired_note_text_entry(rendered.name_offset, rendered.name_length);
+    }
     safePrint(rendered.text);
     print_record_terminator(ctx);
   }
@@ -3408,6 +3514,10 @@ auto list_directory_recursive(const std::string &path,
   // including a single command-line directory operand.
   if (print_current_header) {
     const std::string display_path = make_generic_display_path(path);
+    if (dired_requested(ctx)) {
+      const uint64_t begin = stdout_bytes_written();
+      g_subdired_offsets.push_back({begin, begin + display_path.size()});
+    }
     safePrintLn(std::wstring(display_path.begin(), display_path.end()) + L":");
   }
 
@@ -3726,6 +3836,11 @@ auto process_paths(const std::vector<std::string> &paths,
         }
       } else {
         if (multiple_operands) {
+          if (dired_requested(ctx)) {
+            const uint64_t begin = stdout_bytes_written();
+            g_subdired_offsets.push_back({begin, begin + path.size()});
+            g_dired_offsets.push_back({begin, begin + path.size()});
+          }
           safePrintLn(std::wstring(path.begin(), path.end()) + L":");
         }
 
@@ -3798,21 +3913,25 @@ REGISTER_COMMAND(
   using namespace ls_pipeline;
   using namespace core::pipeline;
 
-  // [DIFFERS] -D/--dired: Emacs dired mode not supported on Windows
-  if (ctx.has("-D") || ctx.has("--dired")) {
-    safeErrorPrintLn(
-        winux::i18n::translate("command.ls.error.dired-unsupported",
-                               "ls: --dired is not supported on Windows"));
-    return 1;
-  }
-
-  // [DIFFERS] --hyperlink: OSC 8 hyperlinks not supported on Windows terminals
+  // [GNU] --hyperlink[=WHEN]: validate the argument up front so an invalid
+  // value fails before any listing output.
+  ls_pipeline::g_dired_offsets.clear();
+  ls_pipeline::g_subdired_offsets.clear();
   if (ctx.has("--hyperlink")) {
-    safeErrorPrintLn(
-        winux::i18n::translate("command.ls.error.hyperlink-unsupported",
-                               "ls: --hyperlink is not supported on Windows"));
-    return 1;
+    auto link = ls_pipeline::hyperlink_mode(ctx);
+    if (!link) {
+      safeErrorPrintLn("ls: " + link.error());
+      safeErrorPrintLn("Valid arguments are:");
+      safeErrorPrintLn("  - 'always', 'yes', 'force'");
+      safeErrorPrintLn("  - 'never', 'no', 'none'");
+      safeErrorPrintLn("  - 'auto', 'tty', 'if-tty'");
+      return 1;
+    }
+    ls_pipeline::g_hyperlink_enabled = *link;
+  } else {
+    ls_pipeline::g_hyperlink_enabled = false;
   }
+  set_stdout_byte_counting(ls_pipeline::dired_requested(ctx));
 
   // [DIFFERS] -Z/--context: SELinux security context not applicable on Windows
   if (ctx.has("-Z") || ctx.has("--context")) {
@@ -3823,6 +3942,25 @@ REGISTER_COMMAND(
   }
 
   auto result = process_command(ctx);
+  if (ls_pipeline::dired_requested(ctx)) {
+    // [GNU] trailers: //DIRED// name ranges, //SUBDIRED// directory header
+    // ranges, then the //DIRED-OPTIONS// line.
+    std::string trailer = "//DIRED//";
+    for (const auto &[b, e] : ls_pipeline::g_dired_offsets) {
+      trailer += " " + std::to_string(b) + " " + std::to_string(e);
+    }
+    trailer += "\n";
+    if (!ls_pipeline::g_subdired_offsets.empty()) {
+      trailer += "//SUBDIRED//";
+      for (const auto &[b, e] : ls_pipeline::g_subdired_offsets) {
+        trailer += " " + std::to_string(b) + " " + std::to_string(e);
+      }
+      trailer += "\n";
+    }
+    trailer += "//DIRED-OPTIONS// --quoting-style=literal\n";
+    safePrint(trailer);
+    set_stdout_byte_counting(false);
+  }
   if (!result) {
     const std::string error = std::string(result.error());
     // [GNU] Bad --time-style values and an unparseable TIME_STYLE

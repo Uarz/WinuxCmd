@@ -800,8 +800,7 @@ auto render_format(std::string_view format, const std::string& filename,
         // [GNU] %f: raw mode in hex.
         char buf[32];
         snprintf(buf, sizeof(buf), "%x",
-                 static_cast<unsigned int>(
-                     st_mode_bits(stat)));
+                 static_cast<unsigned int>(st_mode_bits(stat)));
         value = buf;
         break;
       }
@@ -1027,8 +1026,7 @@ auto print_file_system_stat(const std::string& filename,
 }
 
 auto emit_stat_output(const std::string& filename, const FileStatData& stat,
-                      const std::string& link_target, const Config& cfg)
-    -> int;
+                      const std::string& link_target, const Config& cfg) -> int;
 
 // [GNU] `stat -` stats open file descriptor 0: a pipe reports "fifo"
 // (S_IFIFO), a console "character special file", a redirected file a
@@ -1234,8 +1232,7 @@ auto emit_stat_output(const std::string& filename, const FileStatData& stat,
     safePrint("\n");
 
     char mode_buf[8];
-    snprintf(mode_buf, sizeof(mode_buf), "%04o",
-             st_mode_bits(stat) & 07777u);
+    snprintf(mode_buf, sizeof(mode_buf), "%04o", st_mode_bits(stat) & 07777u);
     const std::string uid = stat.owner_id.empty() ? "0" : stat.owner_id;
     const std::string gid = stat.group_id.empty() ? "0" : stat.group_id;
     safePrint("Access: (");

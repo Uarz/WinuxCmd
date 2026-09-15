@@ -3136,3 +3136,53 @@ TEST(ls, ls_dereference_dangling_entry_in_listing_marks_question_row) {
   EXPECT_TRUE(r.stdout_text.find("l?????????") != std::string::npos);
   EXPECT_TRUE(r.stdout_text.find("dangling") != std::string::npos);
 }
+
+// [GNU] -D/--dired emits //DIRED// name byte ranges plus the
+// //DIRED-OPTIONS// trailer (issue #1067).
+TEST(ls, ls_dired_emits_name_offsets_and_trailer) {
+  TempDir tmp;
+  tmp.write("aa.txt", "x");
+  tmp.write("bb.txt", "y");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"ls.exe", {L"--dired", L"-1", L"aa.txt", L"bb.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stdout_text.find("aa.txt\nbb.txt\n") != std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("//DIRED// 0 6 7 13\n") != std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("//DIRED-OPTIONS// --quoting-style=literal") !=
+              std::string::npos);
+}
+
+// [GNU] --hyperlink wraps each name in an OSC 8 file:// URI escape;
+// "auto" suppresses it when stdout is not a terminal.
+TEST(ls, ls_hyperlink_wraps_names_in_osc8) {
+  TempDir tmp;
+  tmp.write("f.txt", "x");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"ls.exe", {L"--hyperlink=always", L"f.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stdout_text.find("]8;;file://") != std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("f.txt]8;;") != std::string::npos);
+}
+
+TEST(ls, ls_hyperlink_rejects_invalid_when_with_gnu_list) {
+  TempDir tmp;
+  tmp.write("f.txt", "x");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"ls.exe", {L"--hyperlink=bogus", L"f.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stderr_text.find("invalid --hyperlink argument 'bogus'") !=
+              std::string::npos);
+  EXPECT_TRUE(r.stderr_text.find("Valid arguments are:") != std::string::npos);
+}

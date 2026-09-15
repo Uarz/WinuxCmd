@@ -167,6 +167,17 @@ export bool is_stdout_write_failed() { return g_stdout_write_error != 0; }
 // is_stdout_write_failed() is false.
 export DWORD stdout_write_error() { return g_stdout_write_error; }
 
+// Byte counter for `ls --dired`: GNU emits "//DIRED//" trailer lines with
+// the byte offsets of each filename in the output stream.  Counting is
+// opt-in (set_stdout_byte_counting) so the extra UTF-8 length computation
+// on the console path is only paid while a listing is running.
+thread_local uint64_t g_stdout_bytes_written = 0;
+thread_local bool g_count_stdout_bytes = false;
+
+export void set_stdout_byte_counting(bool on) { g_count_stdout_bytes = on; }
+
+export uint64_t stdout_bytes_written() { return g_stdout_bytes_written; }
+
 export void clear_pipe_closed_flags() {
   g_stdout_pipe_closed = false;
   g_stderr_pipe_closed = false;
@@ -460,11 +471,17 @@ export void safePrint(std::wstring_view wsv) {
         isBrokenPipeError(GetLastError())) {
       g_stdout_pipe_closed = true;
     }
+    if (g_count_stdout_bytes) {
+      g_stdout_bytes_written += wstring_to_utf8(wsv).size();
+    }
   } else {
     std::string utf8 = wstring_to_utf8(wsv);
     if (!detail::writeFile(h, utf8.data(), utf8.size()) &&
         isBrokenPipeError(GetLastError())) {
       g_stdout_pipe_closed = true;
+    }
+    if (g_count_stdout_bytes) {
+      g_stdout_bytes_written += utf8.size();
     }
   }
 }
@@ -515,6 +532,9 @@ export void safePrint(std::string_view sv) {
         isBrokenPipeError(GetLastError())) {
       g_stdout_pipe_closed = true;
     }
+  }
+  if (g_count_stdout_bytes) {
+    g_stdout_bytes_written += sv.size();
   }
 }
 

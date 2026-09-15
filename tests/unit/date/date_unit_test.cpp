@@ -466,6 +466,24 @@ TEST(date, date_case_flags_dangling_percent) {
   EXPECT_EQ(r.stdout_text, "%^|100%|1|1\n");
 }
 
+// [GNU] %E/%O select the locale's alternative representation; with no
+// alternate digits/eras available they fall back to the base conversion
+// (issue #1088).
+TEST(date, date_eo_modifiers_fall_back_to_base_conversion) {
+  TempDir tmp;
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"date.exe",
+        {L"-u", L"--date", L"@0", L"+%EY|%Oy|%Od|%Om|%Ec|%OH|%OM|%OS"});
+
+  auto r = p.run();
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("date %E/%O stdout", r.stdout_text);
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ(r.stdout_text, "1970|70|01|01|Thu Jan  1 00:00:00 1970|00|00|00\n");
+}
+
 // [GNU] --uct and --rfc-822 are deprecated hidden aliases accepted for
 // back-compat: --uct == --utc, --rfc-822 == -R/--rfc-email (issue #1073).
 TEST(date, date_deprecated_uct_and_rfc822_aliases) {

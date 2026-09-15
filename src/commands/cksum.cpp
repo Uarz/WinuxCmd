@@ -380,9 +380,8 @@ auto read_file(const std::string& filename) -> cp::Result<FileData> {
     // [GNU] closed stdin (<&-) reports "-: Bad file descriptor" rather
     // than hashing an empty stream.
     if (file_io::stdin_is_bad()) {
-      return std::unexpected(
-          std::string(filename.empty() ? "-" : filename) +
-          ": Bad file descriptor");
+      return std::unexpected(std::string(filename.empty() ? "-" : filename) +
+                             ": Bad file descriptor");
     }
     fd.data.assign(std::istreambuf_iterator<char>(std::cin),
                    std::istreambuf_iterator<char>());
@@ -413,9 +412,8 @@ auto read_crc_file(const std::string& filename)
   if (filename == "-" || filename.empty()) {
     // [GNU] closed stdin (<&-) reports "-: Bad file descriptor".
     if (file_io::stdin_is_bad()) {
-      return std::unexpected(
-          std::string(filename.empty() ? "-" : filename) +
-          ": Bad file descriptor");
+      return std::unexpected(std::string(filename.empty() ? "-" : filename) +
+                             ": Bad file descriptor");
     }
   } else {
     file.open(

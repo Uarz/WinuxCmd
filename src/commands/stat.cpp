@@ -134,6 +134,8 @@ struct FileStatData {
   // FILE_ATTRIBUTE_ARCHIVE and is indistinguishable from an ordinary file by
   // attributes alone, but GNU reports /dev/null as a character special file.
   bool character_device = false;
+  // [GNU] `stat -` on a pipe reports "fifo" (st_mode S_IFIFO).
+  bool fifo = false;
   std::string owner_name;
   std::string owner_id;
   std::string group_name;
@@ -288,6 +290,7 @@ auto format_permissions(DWORD attrs) -> std::string {
 }
 
 auto file_type_name(const FileStatData& stat) -> std::string {
+  if (stat.fifo) return "fifo";
   if (stat.character_device) return "character special file";
   const DWORD attrs = stat.attrs.dwFileAttributes;
   if (attrs & FILE_ATTRIBUTE_DIRECTORY) return "directory";
@@ -307,7 +310,12 @@ auto format_mode_octal(DWORD attrs) -> std::string {
 
 // [GNU] %f is the raw st_mode in hex (type bits | permission bits), e.g.
 // 81a4 for a 0644 regular file, 41ed for a directory, a1ff for a symlink.
-auto st_mode_bits(DWORD attrs) -> uint32_t {
+auto st_mode_bits(const FileStatData& stat) -> uint32_t {
+  // [GNU] S_IFIFO 0x1000, S_IFCHR 0x2000 — `stat -c %f -` on a pipe
+  // prints 11b4, on /dev/null-style devices 21b6.
+  if (stat.fifo) return 0x1000u | 0666u;
+  if (stat.character_device) return 0x2000u | 0666u;
+  const DWORD attrs = stat.attrs.dwFileAttributes;
   if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) return 0xA000u | 0777u;
   if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
     return 0x4000u | ((attrs & FILE_ATTRIBUTE_READONLY) ? 0555u : 0755u);
@@ -793,7 +801,7 @@ auto render_format(std::string_view format, const std::string& filename,
         char buf[32];
         snprintf(buf, sizeof(buf), "%x",
                  static_cast<unsigned int>(
-                     st_mode_bits(stat.attrs.dwFileAttributes)));
+                     st_mode_bits(stat)));
         value = buf;
         break;
       }
@@ -1018,7 +1026,60 @@ auto print_file_system_stat(const std::string& filename,
   return 0;
 }
 
+auto emit_stat_output(const std::string& filename, const FileStatData& stat,
+                      const std::string& link_target, const Config& cfg)
+    -> int;
+
+// [GNU] `stat -` stats open file descriptor 0: a pipe reports "fifo"
+// (S_IFIFO), a console "character special file", a redirected file a
+// regular file.  Closed stdin is "cannot stat standard input: Bad file
+// descriptor".
+auto load_stdin_stat() -> cp::Result<FileStatData> {
+  if (file_io::stdin_is_bad()) {
+    return std::unexpected("cannot stat standard input: Bad file descriptor");
+  }
+  FileStatData stat;
+  stat.io_block_size = 4096;
+  const HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+  const DWORD ftype = (h != nullptr && h != INVALID_HANDLE_VALUE)
+                          ? GetFileType(h)
+                          : FILE_TYPE_UNKNOWN;
+  stat.fifo = (ftype == FILE_TYPE_PIPE);
+  stat.character_device = (ftype == FILE_TYPE_CHAR);
+  if (ftype == FILE_TYPE_DISK) {
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (GetFileInformationByHandle(h, &info)) {
+      stat.size = (uint64_t(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+      stat.allocated_size = stat.size;
+      stat.file_index =
+          (uint64_t(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
+      stat.hard_links = info.nNumberOfLinks;
+      stat.volume_serial = info.dwVolumeSerialNumber;
+      stat.attrs.dwFileAttributes = info.dwFileAttributes;
+      stat.attrs.ftCreationTime = info.ftCreationTime;
+      stat.attrs.ftLastAccessTime = info.ftLastAccessTime;
+      stat.attrs.ftLastWriteTime = info.ftLastWriteTime;
+      stat.change_time = info.ftLastWriteTime;
+    }
+  }
+  return stat;
+}
+
 auto print_stat(const std::string& filename, const Config& cfg) -> int {
+  // [GNU] "-" names standard input, not a file literally called "-".
+  if (filename == "-") {
+    if (cfg.file_system) {
+      safeErrorPrintLn("stat: cannot read file system information for '-'");
+      return 1;
+    }
+    auto stdin_result = load_stdin_stat();
+    if (!stdin_result) {
+      safeErrorPrint("stat: ");
+      safeErrorPrintLn(stdin_result.error());
+      return 1;
+    }
+    return emit_stat_output(filename, *stdin_result, "", cfg);
+  }
   // Decode UTF-8 explicitly: a narrow std::filesystem::path decodes via the
   // system ACP, and exists() without the \\?\ prefix fails beyond MAX_PATH
   // (#1061).
@@ -1103,6 +1164,15 @@ auto print_stat(const std::string& filename, const Config& cfg) -> int {
     }
   }
 
+  return emit_stat_output(filename, stat, link_target, cfg);
+}
+
+// Shared stat output for both file operands and the synthesized stdin
+// stat (`stat -`).  |link_target| is non-empty for a non-dereferenced
+// symlink operand.
+auto emit_stat_output(const std::string& filename, const FileStatData& stat,
+                      const std::string& link_target, const Config& cfg)
+    -> int {
   if (cfg.terse) {
     // [GNU] -t: %n %s %b %f %u %g %D %i %h %t %T %X %Y %Z %W %o (#1023)
     bool ctx_failed = false;
@@ -1165,7 +1235,7 @@ auto print_stat(const std::string& filename, const Config& cfg) -> int {
 
     char mode_buf[8];
     snprintf(mode_buf, sizeof(mode_buf), "%04o",
-             st_mode_bits(stat.attrs.dwFileAttributes) & 07777u);
+             st_mode_bits(stat) & 07777u);
     const std::string uid = stat.owner_id.empty() ? "0" : stat.owner_id;
     const std::string gid = stat.group_id.empty() ? "0" : stat.group_id;
     safePrint("Access: (");

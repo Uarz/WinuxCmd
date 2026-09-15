@@ -436,8 +436,8 @@ TEST(du, du_si_is_long_option_only) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_NE(r.stdout_text.find(format_size_for_test(
-                                 allocated_size(1500, tmp.path), true)),
+  EXPECT_NE(r.stdout_text.find(
+                format_size_for_test(allocated_size(1500, tmp.path), true)),
             std::string::npos);
 }
 
@@ -457,8 +457,7 @@ TEST(du, du_block_size_one_reports_bytes) {
   TEST_LOG("du.exe --block-size=1 output", r.stdout_text);
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_EQ(first_usage_value(r.stdout_text),
-            expected_blocks(6, 1, tmp.path));
+  EXPECT_EQ(first_usage_value(r.stdout_text), expected_blocks(6, 1, tmp.path));
 }
 
 TEST(du, du_apparent_size_is_accepted_as_windows_file_length_mode) {
@@ -633,8 +632,8 @@ TEST(du, du_later_human_readable_overrides_block_size) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_NE(r.stdout_text.find(format_size_for_test(
-                                 allocated_size(1500, tmp.path), false)),
+  EXPECT_NE(r.stdout_text.find(
+                format_size_for_test(allocated_size(1500, tmp.path), false)),
             std::string::npos);
 }
 
@@ -664,8 +663,8 @@ TEST(du, du_block_size_human_readable_word) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_NE(r.stdout_text.find(format_size_for_test(
-                                 allocated_size(1500, tmp.path), false)),
+  EXPECT_NE(r.stdout_text.find(
+                format_size_for_test(allocated_size(1500, tmp.path), false)),
             std::string::npos);
 }
 
@@ -680,8 +679,8 @@ TEST(du, du_block_size_si_word) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_NE(r.stdout_text.find(format_size_for_test(
-                                 allocated_size(10000, tmp.path), true)),
+  EXPECT_NE(r.stdout_text.find(
+                format_size_for_test(allocated_size(10000, tmp.path), true)),
             std::string::npos);
 }
 
@@ -995,7 +994,7 @@ TEST(du, du_prints_children_before_parent_and_forward_slashes) {
   EXPECT_TRUE(sub_pos != std::string::npos);
   EXPECT_TRUE(root_pos != std::string::npos);
   EXPECT_TRUE(sub_pos < root_pos);
-  EXPECT_TRUE(r.stdout_text.find("d3\d3sub") == std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("d3\\d3sub") == std::string::npos);
 }
 
 TEST(du, du_dereference_dangling_operand_errors) {

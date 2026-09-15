@@ -51,6 +51,34 @@ case "$(uname -s 2>/dev/null)" in
   *) ORACLE_PLATFORM=unknown ;;
 esac
 
+# The oracle's wording depends on its locale: GNU quote() renders Unicode curly
+# quotes (U+2018/2019) under a UTF-8 locale and ASCII quotes under C, so the
+# same case was PASS on a machine whose oracle ran in C and KNOWN_DIFF on one
+# whose oracle ran in a UTF-8 locale. Pin the oracle locale so a verdict depends
+# only on the program under test, never on the host environment.
+#
+# The subject runs under the same locale. Pinning one side only would leave the
+# comparison one-sided: `locale charmap` is *defined* by the selected locale, so
+# a subject that honors LC_ALL would still be measured against an environment it
+# never ran in.
+ORACLE_LOCALE="${ORACLE_LOCALE:-C}"
+
+# True when the oracle version (second argument) is >= the required one (first).
+# Written with awk so it does not depend on a GNU `sort -V`.
+version_ge() {
+  awk -v want="$1" -v have="$2" 'BEGIN {
+    n = split(want, W, "."); m = split(have, H, ".");
+    limit = (n > m ? n : m);
+    for (i = 1; i <= limit; i++) {
+      a = (i <= n ? W[i] + 0 : 0);
+      b = (i <= m ? H[i] + 0 : 0);
+      if (b > a) exit 0;
+      if (b < a) exit 1;
+    }
+    exit 0;
+  }'
+}
+
 find_oracle() {
   if [ -n "$GNU_BIN" ] && [ -x "$GNU_BIN/$1" ]; then
     printf '%s/%s' "$GNU_BIN" "$1"
@@ -89,10 +117,10 @@ shell_quote() {
 }
 
 run_case() {
-  local case_file=$1 work wdir gdir line block cmd args timeout setup stdin files case_oracle
+  local case_file=$1 work wdir gdir line block cmd args timeout setup stdin files case_oracle case_oracle_min
   work=$(mktemp -d) || return 2
   wdir="$work/w"; gdir="$work/g"; mkdir -p "$wdir" "$gdir"
-  cmd=""; args=""; timeout=10; setup=""; stdin=""; files=""; block=""; case_oracle=""
+  cmd=""; args=""; timeout=10; setup=""; stdin=""; files=""; block=""; case_oracle=""; case_oracle_min=""
   while IFS= read -r line || [ -n "$line" ]; do
     if [ -n "$block" ]; then
       if [[ "$line" == "  "* ]]; then
@@ -107,6 +135,7 @@ run_case() {
       timeout:*) timeout=${line#timeout: };;
       files:*) files=${line#files: };;
       oracle:*) case_oracle=${line#oracle: }; case_oracle=${case_oracle# };;
+      oracle_version:*) case_oracle_min=${line#oracle_version: };;
       setup:\ \|) block=setup;;
       stdin:\ \|) block=stdin;;
     esac
@@ -120,6 +149,19 @@ run_case() {
     rm -rf "$work"
     printf '%s\t%s\tSKIP\n' "${case_file#$ROOT/}" "$cmd"
     return 0
+  fi
+  # A case may pin a minimum oracle version for behavior that genuinely changed
+  # in coreutils (J as a military zone, for example, only exists from 9.2).
+  # Skipping is the honest verdict there: an 8.32 oracle cannot answer the
+  # question, so the case is neither a product difference nor a pass.
+  if [ -n "$case_oracle_min" ]; then
+    local want=${case_oracle_min#>=}
+    want=${want# }
+    if [ -z "$ORACLE_VERSION" ] || ! version_ge "$want" "$ORACLE_VERSION"; then
+      rm -rf "$work"
+      printf '%s\t%s\tSKIP\n' "${case_file#$ROOT/}" "$cmd"
+      return 0
+    fi
   fi
   [ -z "$setup" ] || {
     (cd "$wdir" && printf '%b' "$setup" | sh >/dev/null 2>&1)
@@ -181,9 +223,9 @@ run_case() {
     wcommand="exec $wquoted $(shell_quote "$cmd") $case_args"
   fi
   local gcommand="exec $gquoted $case_args"
-  (cd "$wdir" && export PATH="$(dirname "$wcmd"):$PATH" WINUX_LANG=en && printf '%b' "$stdin" | MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
+  (cd "$wdir" && export PATH="$(dirname "$wcmd"):$PATH" WINUX_LANG=en LC_ALL="$ORACLE_LOCALE" LANG="$ORACLE_LOCALE" && printf '%b' "$stdin" | MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
     "$timeout_cmd" "$timeout" bash -c "$wcommand" >"$wout" 2>"$werr"); wrc=$?
-  (cd "$gdir" && export PATH="$(dirname "$gcmd"):$PATH" && printf '%b' "$stdin" | MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
+  (cd "$gdir" && export PATH="$(dirname "$gcmd"):$PATH" LC_ALL="$ORACLE_LOCALE" LANG="$ORACLE_LOCALE" && printf '%b' "$stdin" | MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
     "$timeout_cmd" "$timeout" bash -c "$gcommand" >"$gout" 2>"$gerr"); grc=$?
   files_equal=true
   if [ -n "$files" ]; then
@@ -220,6 +262,8 @@ if [ -z "$oracle" ]; then
   echo "ERROR: GNU coreutils oracle not found" >&2
   exit 2
 fi
+ORACLE_VERSION=$(printf '%s' "$oracle" | awk '
+  { for (i = NF; i >= 1; i--) if ($i ~ /^[0-9]+(\.[0-9]+)*$/) { print $i; exit } }')
 timeout_cmd=$(find_timeout)
 if [ -z "$timeout_cmd" ]; then
   echo "ERROR: GNU timeout oracle not found; set GNU_BIN to a GNU coreutils bin directory" >&2
@@ -230,7 +274,7 @@ if [ "$case_count" -eq 0 ]; then
   echo "ERROR: differential corpus is empty: $CORPUS" >&2
   exit 2
 fi
-printf '# Differential report\n\nOracle: `%s`\n\n| Case | Result |\n|---|---|\n' "$oracle" > "$REPORT"
+printf '# Differential report\n\nOracle: `%s`\n\nOracle locale: `%s`\n\n| Case | Result |\n|---|---|\n' "$oracle" "$ORACLE_LOCALE" > "$REPORT"
 results=$(mktemp)
 find "$CORPUS" -type f -name '*.case' | sort | while IFS= read -r file; do
   if [ -n "$ONLY" ] && ! awk -v wanted="$ONLY" '$0 == "cmd: " wanted { found=1 } END { exit !found }' "$file"; then

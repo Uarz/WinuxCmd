@@ -130,6 +130,10 @@ struct FileStatData {
   uint64_t volume_serial = 0;
   uint32_t hard_links = 1;
   uint32_t io_block_size = 4096;
+  // [GNU] A Windows character device (NUL, CONIN$, CONOUT$) reports
+  // FILE_ATTRIBUTE_ARCHIVE and is indistinguishable from an ordinary file by
+  // attributes alone, but GNU reports /dev/null as a character special file.
+  bool character_device = false;
   std::string owner_name;
   std::string owner_id;
   std::string group_name;
@@ -283,7 +287,9 @@ auto format_permissions(DWORD attrs) -> std::string {
   return perm;
 }
 
-auto file_type_name(DWORD attrs) -> std::string {
+auto file_type_name(const FileStatData& stat) -> std::string {
+  if (stat.character_device) return "character special file";
+  const DWORD attrs = stat.attrs.dwFileAttributes;
   if (attrs & FILE_ATTRIBUTE_DIRECTORY) return "directory";
   if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) return "symbolic link";
   return "regular file";
@@ -391,8 +397,10 @@ auto load_file_stat(const std::filesystem::path& p, bool lstat_link = false)
     -> cp::Result<FileStatData> {
   FileStatData stat;
   auto operand = native_path::make_api_path_operand_w(p.wstring());
-  if (!GetFileAttributesExW(operand.extended.c_str(), GetFileExInfoStandard,
-                            &stat.attrs)) {
+  // GetFileAttributesExW rejects DOS device names outright (see
+  // native_path::file_attribute_data_w), so the shared device-aware probe is
+  // what lets `stat /dev/null` report a character device instead of failing.
+  if (!native_path::file_attribute_data_w(operand.extended, stat.attrs)) {
     if (!lstat_link) {
       return std::unexpected("Access denied");
     }
@@ -429,6 +437,7 @@ auto load_file_stat(const std::filesystem::path& p, bool lstat_link = false)
     }
   }
   stat.io_block_size = io_block_size_for(p);
+  stat.character_device = native_path::is_character_device_w(p.wstring());
 
   DWORD open_flags = FILE_FLAG_BACKUP_SEMANTICS;
   if (lstat_link) {
@@ -771,7 +780,7 @@ auto render_format(std::string_view format, const std::string& filename,
         value = "512";
         break;
       case 'F':
-        value = file_type_name(stat.attrs.dwFileAttributes);
+        value = file_type_name(stat);
         break;
       case 'A':
         value = format_permissions(stat.attrs.dwFileAttributes);
@@ -1139,7 +1148,7 @@ auto print_stat(const std::string& filename, const Config& cfg) -> int {
     safePrint(" IO Block: ");
     safePrint(pad_right(std::to_string(stat.io_block_size), 6));
     safePrint(" ");
-    safePrint(file_type_name(stat.attrs.dwFileAttributes));
+    safePrint(file_type_name(stat));
     safePrint("\n");
 
     // [GNU] "Device: <major>,<minor>". Windows exposes a single device

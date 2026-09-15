@@ -1650,9 +1650,17 @@ auto parse_date_argument(const std::string &arg, bool use_utc,
 
   // [GNU] military timezone specs (parse-datetime.y military_table):
   // "<HH|HHMM><L>", "<HH>:<MM>[:<SS>]<L>", or a lone "<L>" meaning today at
-  // 00:00 in that zone. A-I = UTC+1..+9, K-M = UTC+10..+12, N-Y = UTC-1..-12,
-  // Z = UTC, and J = the local zone (uutils #12893, #12895). 'T' is the ISO
-  // 8601 date/time separator, not a zone.
+  // 00:00 in that zone. A-I = UTC+1..+9, K-M = UTC+10..+12 (J is not in the
+  // sequence), N-Y = UTC-1..-12, Z = UTC, and J is the LOCAL zone. 'T' is the
+  // ISO 8601 date/time separator, not a zone.
+  //
+  // J was added upstream in gnulib commit 9cde39f8 (2022-05-17, "parse-datetime:
+  // support 'J' military time zone", released in coreutils 9.2), which added
+  // `{ "J", 'J', 0 }` to military_table and a matching `item: 'J'` grammar rule.
+  // Coreutils 8.32 predates it and rejects J outright, so J is the one military
+  // letter whose expected result depends on the oracle version: the differential
+  // cases carry an `oracle_version:` precondition for exactly that reason.
+  // (uutils #12893, #12895)
   {
     static const std::regex military_hms_re(
         R"(^([0-9]{1,2}):([0-9]{2})(?::([0-9]{2}))?\s*([A-Za-z])$)");

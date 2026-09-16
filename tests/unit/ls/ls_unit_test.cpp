@@ -529,9 +529,9 @@ TEST(ls, ls_long_format_L_dereferences_directory_entry_symlink) {
 
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_TRUE(r.stdout_text.find("dirlink -> targetdir") == std::string::npos);
-  EXPECT_TRUE(std::regex_search(r.stdout_text,
-                                std::regex(R"(^d[rwx-]{9}\s+\d+\s+.*dirlink$)",
-                                           std::regex_constants::multiline)));
+  EXPECT_TRUE(std::regex_search(
+      r.stdout_text,
+      std::regex(R"((^|\n)d[rwx-]{9}\s+\d+\s+.*dirlink(\n|$))")));
 }
 
 TEST(ls,
@@ -1007,9 +1007,9 @@ TEST(ls, ls_long_format_dotdot_uses_parent_directory_metadata) {
   const auto expected_parent_size = match[1].str();
 
   EXPECT_TRUE(std::regex_search(
-      r.stdout_text, std::regex("^drwx[rwx-]*\\s+\\d+\\s+\\S+\\s+\\S+\\s+" +
-                                    expected_parent_size + "\\s+.*\\.\\.$",
-                                std::regex::multiline)));
+      r.stdout_text,
+      std::regex("(^|\\n)drwx[rwx-]*\\s+\\d+\\s+\\S+\\s+\\S+\\s+" +
+                 expected_parent_size + "\\s+.*\\.\\.(\\n|$)")));
   if (expected_parent_size != "0") {
     EXPECT_TRUE(r.stdout_text.find("total 0\n") == std::string::npos);
   }
@@ -2926,8 +2926,8 @@ TEST(ls, ls_block_size_humanizes_blocks_and_total) {
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_TRUE(r.stdout_text.find("total 1.0K\n") == 0);
   EXPECT_TRUE(std::regex_search(
-      r.stdout_text, std::regex(R"(^1\.0K\s+-[rwx-]{9}\s+\d+\s+.*sample\.txt$)",
-                                std::regex::multiline)));
+      r.stdout_text,
+      std::regex(R"((^|\n)1\.0K\s+-[rwx-]{9}\s+\d+\s+.*sample\.txt(\n|$))")));
   EXPECT_TRUE(r.stdout_text.find("sample.txt") != std::string::npos);
 }
 

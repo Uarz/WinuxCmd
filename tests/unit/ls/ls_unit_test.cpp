@@ -2478,7 +2478,14 @@ TEST(ls, ls_time_style_custom_format_supports_strftime_tokens) {
 TEST(ls, ls_time_style_custom_format_supports_epoch_seconds) {
   TempDir tmp;
   tmp.write("a.txt", "a");
-  EXPECT_TRUE(set_last_write_time(tmp.path / "a.txt", 2023, 1, 2, 3, 4, 5));
+  // Epoch seconds are absolute; a local calendar fixture varies by runner TZ.
+  const auto timestamp =
+      std::chrono::sys_seconds{std::chrono::seconds{1672599845}};
+  std::error_code error;
+  std::filesystem::last_write_time(
+      tmp.path / "a.txt",
+      std::chrono::clock_cast<std::chrono::file_clock>(timestamp), error);
+  ASSERT_FALSE(error);
 
   Pipeline p;
   p.set_cwd(tmp.wpath());

@@ -9,6 +9,7 @@ import utils;
 import container;
 
 auto constexpr TPUT_OPTIONS =
+    // [EXT] operand
     std::array{OPTION("", "", "terminal capabilities", STRING_TYPE)};
 
 REGISTER_COMMAND(tput,
@@ -28,7 +29,7 @@ REGISTER_COMMAND(tput,
   std::string cap = std::string(ctx.positionals[0]);
 
   if (cap == "clear") {
-    safePrint("\033[2J\033[H");
+    safePrint("\033[H\033[2J\033[3J");
   } else if (cap == "reset") {
     safePrint("\033c");
   } else if (cap == "bold") {

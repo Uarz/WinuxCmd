@@ -29,6 +29,66 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
+
+namespace temp_dir_detail {
+
+inline std::wstring extended_path(const std::filesystem::path &path) {
+  auto native = path.wstring();
+  if (native.rfind(L"\\\\?\\", 0) == 0) return native;
+
+  wchar_t absolute[MAX_PATH * 4];
+  DWORD len =
+      GetFullPathNameW(native.c_str(), static_cast<DWORD>(std::size(absolute)),
+                       absolute, nullptr);
+  if (len == 0 || len >= std::size(absolute)) return native;
+
+  std::wstring out(absolute, len);
+  if (out.rfind(L"\\\\", 0) == 0) return L"\\\\?\\UNC\\" + out.substr(2);
+  return L"\\\\?\\" + out;
+}
+
+inline void write_all(const std::filesystem::path &path, const char *data,
+                      size_t size) {
+  auto extended = extended_path(path);
+  HANDLE file = CreateFileW(extended.c_str(), GENERIC_WRITE, 0, nullptr,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return;
+
+  DWORD written = 0;
+  if (size > 0) {
+    WriteFile(file, data, static_cast<DWORD>(size), &written, nullptr);
+  }
+  CloseHandle(file);
+}
+
+inline std::string read_all(const std::filesystem::path &path) {
+  auto extended = extended_path(path);
+  HANDLE file =
+      CreateFileW(extended.c_str(), GENERIC_READ,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return {};
+
+  std::string out;
+  char buffer[4096];
+  DWORD read = 0;
+  while (ReadFile(file, buffer, sizeof(buffer), &read, nullptr) && read > 0) {
+    out.append(buffer, buffer + read);
+  }
+  CloseHandle(file);
+  return out;
+}
+
+inline DWORD attributes(const std::filesystem::path &path) {
+  return GetFileAttributesW(path.wstring().c_str());
+}
+
+inline bool set_attributes(const std::filesystem::path &path, DWORD attrs) {
+  return SetFileAttributesW(path.wstring().c_str(), attrs) != FALSE;
+}
+
+}  // namespace temp_dir_detail
 
 /**
  * @brief Temporary directory management for tests
@@ -94,9 +154,23 @@ struct TempDir {
   void write(const std::string &rel, const std::string &content) const {
     auto p = path / rel;
     std::filesystem::create_directories(p.parent_path());
+    temp_dir_detail::write_all(p, content.data(), content.size());
+  }
 
-    std::ofstream ofs(p, std::ios::binary);
-    ofs.write(content.data(), content.size());
+  /**
+   * @brief Write text content and return the created file path
+   *
+   * Convenience wrapper for tests that need to pass the path to a command.
+   *
+   * @param rel Relative path within temporary directory
+   * @param content Text content to write
+   * @return std::filesystem::path Absolute path to the created file
+   */
+  [[nodiscard]]
+  std::filesystem::path write_file(const std::string &rel,
+                                   const std::string &content) const {
+    write(rel, content);
+    return path / rel;
   }
 
   /**
@@ -111,9 +185,23 @@ struct TempDir {
                    const std::vector<char> &data) const {
     auto p = path / rel;
     std::filesystem::create_directories(p.parent_path());
+    temp_dir_detail::write_all(p, data.data(), data.size());
+  }
 
-    std::ofstream ofs(p, std::ios::binary);
-    ofs.write(data.data(), data.size());
+  /**
+   * @brief Write binary content and return the created file path
+   *
+   * Convenience wrapper for tests that need to pass the path to a command.
+   *
+   * @param rel Relative path within temporary directory
+   * @param data Raw bytes to write
+   * @return std::filesystem::path Absolute path to the created file
+   */
+  [[nodiscard]]
+  std::filesystem::path write_bytes_file(const std::string &rel,
+                                         const std::vector<char> &data) const {
+    write_bytes(rel, data);
+    return path / rel;
   }
 
   /**
@@ -127,9 +215,7 @@ struct TempDir {
    */
   std::string read(const std::string &rel) const {
     auto p = path / rel;
-    std::ifstream ifs(p, std::ios::binary);
-    return std::string((std::istreambuf_iterator<char>(ifs)),
-                       std::istreambuf_iterator<char>());
+    return temp_dir_detail::read_all(p);
   }
 
   /**
@@ -143,5 +229,26 @@ struct TempDir {
   void mkdir(const std::string &rel) const {
     auto p = path / rel;
     std::filesystem::create_directories(p);
+  }
+
+  [[nodiscard]]
+  DWORD attrs(const std::string &rel) const {
+    return temp_dir_detail::attributes(path / rel);
+  }
+
+  bool set_attrs(const std::string &rel, DWORD attrs) const {
+    return temp_dir_detail::set_attributes(path / rel, attrs);
+  }
+
+  bool add_attrs(const std::string &rel, DWORD bits) const {
+    DWORD current = attrs(rel);
+    if (current == INVALID_FILE_ATTRIBUTES) return false;
+    return set_attrs(rel, current | bits);
+  }
+
+  bool clear_attrs(const std::string &rel, DWORD bits) const {
+    DWORD current = attrs(rel);
+    if (current == INVALID_FILE_ATTRIBUTES) return false;
+    return set_attrs(rel, current & ~bits);
   }
 };

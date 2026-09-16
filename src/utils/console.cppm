@@ -17,6 +17,7 @@ export module utils:console;
 
 import std;
 import :utf8;
+import :i18n;
 
 /// @brief ANSI escape sequences for terminal text coloring.
 /// These follow the default GNU `ls --color=auto` scheme and are compatible
@@ -38,12 +39,18 @@ export constexpr auto COLOR_SOURCE =
 export constexpr auto COLOR_MEDIA =
     L"\033[01;35m";  ///< Media: .jpg, .mp4 (bold magenta)
 
+export constexpr auto ANSI_RESET = "\033[0m";
+export constexpr auto ANSI_BOLD = "\033[1m";
+export constexpr auto ANSI_DIM = "\033[2m";
+export constexpr auto ANSI_UNDERLINE = "\033[4m";
+
 namespace {
 thread_local HANDLE g_cached_stdout = INVALID_HANDLE_VALUE;
 thread_local HANDLE g_cached_stderr = INVALID_HANDLE_VALUE;
 thread_local bool g_handles_valid = false;
 thread_local bool g_stdout_pipe_closed = false;
 thread_local bool g_stderr_pipe_closed = false;
+thread_local DWORD g_stdout_write_error = 0;
 thread_local bool g_stdout_is_console = false;
 thread_local bool g_stderr_is_console = false;
 thread_local bool g_console_checked = false;
@@ -82,6 +89,52 @@ HANDLE getStdErr() {
 bool isBrokenPipeError(DWORD err) {
   return err == ERROR_BROKEN_PIPE || err == ERROR_NO_DATA;
 }
+
+// Record a failed write to stdout. A broken pipe maps to GNU's SIGPIPE
+// death (the command exits quietly); any other failure — for example
+// ERROR_INVALID_HANDLE when the caller closed stdout (`>&-`) — is a fatal
+// "write error" the command is expected to report.
+void note_stdout_write_failure() {
+  const DWORD err = GetLastError();
+  if (isBrokenPipeError(err)) {
+    g_stdout_pipe_closed = true;
+  } else if (err != ERROR_SUCCESS) {
+    g_stdout_write_error = err;
+  }
+}
+
+bool env_var_present(const char* name) {
+  char* value = nullptr;
+  size_t len = 0;
+  if (_dupenv_s(&value, &len, name) != 0 || value == nullptr) {
+    return false;
+  }
+  bool present = std::string_view(value).size() > 0;
+  std::free(value);
+  return present;
+}
+
+bool env_var_equals(const char* name, std::string_view expected) {
+  char* value = nullptr;
+  size_t len = 0;
+  if (_dupenv_s(&value, &len, name) != 0 || value == nullptr) {
+    return false;
+  }
+  std::string actual(value);
+  std::free(value);
+  return actual == expected;
+}
+
+bool enable_virtual_terminal_processing(HANDLE h) {
+  if (h == INVALID_HANDLE_VALUE || h == nullptr) return false;
+
+  DWORD mode = 0;
+  if (!GetConsoleMode(h, &mode)) return false;
+
+  if ((mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0) return true;
+
+  return SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
+}
 }  // namespace
 
 // Exported function to set output capture handles
@@ -104,9 +157,31 @@ export bool is_stdout_pipe_closed() { return g_stdout_pipe_closed; }
 
 export bool is_stderr_pipe_closed() { return g_stderr_pipe_closed; }
 
+// True once a stdout write failed for a reason other than a closed pipe
+// (broken-pipe failures raise is_stdout_pipe_closed() instead). Commands
+// that stream output should treat this as fatal: GNU reports a "write
+// error" diagnostic and exits non-zero rather than silently dropping data.
+export bool is_stdout_write_failed() { return g_stdout_write_error != 0; }
+
+// The Win32 error code recorded by the first failed stdout write; 0 when
+// is_stdout_write_failed() is false.
+export DWORD stdout_write_error() { return g_stdout_write_error; }
+
+// Byte counter for `ls --dired`: GNU emits "//DIRED//" trailer lines with
+// the byte offsets of each filename in the output stream.  Counting is
+// opt-in (set_stdout_byte_counting) so the extra UTF-8 length computation
+// on the console path is only paid while a listing is running.
+thread_local uint64_t g_stdout_bytes_written = 0;
+thread_local bool g_count_stdout_bytes = false;
+
+export void set_stdout_byte_counting(bool on) { g_count_stdout_bytes = on; }
+
+export uint64_t stdout_bytes_written() { return g_stdout_bytes_written; }
+
 export void clear_pipe_closed_flags() {
   g_stdout_pipe_closed = false;
   g_stderr_pipe_closed = false;
+  g_stdout_write_error = 0;
 }
 
 bool isConsoleHandle(HANDLE h) {
@@ -156,6 +231,112 @@ export bool isOutputConsole() { return isConsoleHandle(getStdOut()); }
 
 export bool isErrorConsole() { return isConsoleHandle(getStdErr()); }
 
+export bool isInputConsole() {
+  return isConsoleHandle(GetStdHandle(STD_INPUT_HANDLE));
+}
+
+export std::pair<int, int> getConsoleViewportSize() {
+  if (!isOutputConsole()) return {80, 24};
+
+  CONSOLE_SCREEN_BUFFER_INFO csbi{};
+  HANDLE hConsole = getStdOut();
+  if (hConsole == INVALID_HANDLE_VALUE ||
+      !GetConsoleScreenBufferInfo(hConsole, &csbi)) {
+    return {80, 24};
+  }
+
+  int width = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+  int height = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+  return {std::max(width, 1), std::max(height, 2)};
+}
+
+export void clearConsoleViewport() {
+  HANDLE hConsole = getStdOut();
+  if (hConsole == INVALID_HANDLE_VALUE || hConsole == nullptr) return;
+
+  CONSOLE_SCREEN_BUFFER_INFO csbi{};
+  if (!GetConsoleScreenBufferInfo(hConsole, &csbi)) return;
+
+  const SHORT left = csbi.srWindow.Left;
+  const SHORT top = csbi.srWindow.Top;
+  const SHORT width = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+  const SHORT height = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+  DWORD written = 0;
+
+  for (SHORT row = 0; row < height; ++row) {
+    COORD start{left, static_cast<SHORT>(top + row)};
+    FillConsoleOutputCharacterW(hConsole, L' ', static_cast<DWORD>(width),
+                                start, &written);
+    FillConsoleOutputAttribute(hConsole, csbi.wAttributes,
+                               static_cast<DWORD>(width), start, &written);
+  }
+
+  SetConsoleCursorPosition(hConsole, {left, top});
+}
+
+export std::string ansiFg256(int color) {
+  color = std::clamp(color, 0, 255);
+  return "\033[38;5;" + std::to_string(color) + "m";
+}
+
+export std::string ansiBg256(int color) {
+  color = std::clamp(color, 0, 255);
+  return "\033[48;5;" + std::to_string(color) + "m";
+}
+
+export std::string ansiFgRgb(int red, int green, int blue) {
+  red = std::clamp(red, 0, 255);
+  green = std::clamp(green, 0, 255);
+  blue = std::clamp(blue, 0, 255);
+  return "\033[38;2;" + std::to_string(red) + ";" + std::to_string(green) +
+         ";" + std::to_string(blue) + "m";
+}
+
+export std::string ansiBgRgb(int red, int green, int blue) {
+  red = std::clamp(red, 0, 255);
+  green = std::clamp(green, 0, 255);
+  blue = std::clamp(blue, 0, 255);
+  return "\033[48;2;" + std::to_string(red) + ";" + std::to_string(green) +
+         ";" + std::to_string(blue) + "m";
+}
+
+export bool enableAnsiColorStdout() {
+  return enable_virtual_terminal_processing(getStdOut());
+}
+
+export bool enableAnsiColorStderr() {
+  return enable_virtual_terminal_processing(getStdErr());
+}
+
+export bool shouldUseAnsiColorStdout() {
+  if (!isOutputConsole()) return false;
+  if (env_var_present("NO_COLOR")) return false;
+  if (env_var_equals("TERM", "dumb")) return false;
+  return enableAnsiColorStdout();
+}
+
+export bool shouldUseAnsiColorStderr() {
+  if (!isErrorConsole()) return false;
+  if (env_var_present("NO_COLOR")) return false;
+  if (env_var_equals("TERM", "dumb")) return false;
+  return enableAnsiColorStderr();
+}
+
+export std::string colorizeStdout(std::string_view text,
+                                  std::string_view style) {
+  if (!shouldUseAnsiColorStdout() || text.empty() || style.empty()) {
+    return std::string(text);
+  }
+
+  std::string result;
+  result.reserve(style.size() + text.size() +
+                 std::string_view(ANSI_RESET).size());
+  result.append(style);
+  result.append(text);
+  result.append(ANSI_RESET);
+  return result;
+}
+
 /**
  * @brief Check if terminal supports color
  * @return true if terminal supports color, false otherwise
@@ -166,39 +347,14 @@ export bool isTerminalSupportsColor() {
     return false;
   }
 
-  DWORD consoleMode;
-  HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-  if (hConsole == INVALID_HANDLE_VALUE) {
-    return false;
-  }
-  if (!GetConsoleMode(hConsole, &consoleMode)) {
-    return false;
-  }
-
-  // Check if Windows Terminal/CMD supports ANSI color
-  return (consoleMode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
+  return enableAnsiColorStdout();
 }
 
 /**
  * @brief Get terminal width
  * @return Terminal width in columns
  */
-export int getTerminalWidth() {
-  if (!isOutputConsole()) {
-    return 80;
-  }  // Default width for pipe/file
-
-  CONSOLE_SCREEN_BUFFER_INFO csbi;
-  HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-  if (hConsole == INVALID_HANDLE_VALUE) {
-    return 80;
-  }
-  if (!GetConsoleScreenBufferInfo(hConsole, &csbi)) {
-    return 80;
-  }
-
-  return csbi.srWindow.Right - csbi.srWindow.Left + 1;
-}
+export int getTerminalWidth() { return getConsoleViewportSize().first; }
 
 /**
  * @brief Smart set console mode (only enable wide char for console)
@@ -309,31 +465,53 @@ class wchar_buffer {
 // Wide string overloads (zero conversion)
 // ----------------------------------------------------------------------------
 export void safePrint(std::wstring_view wsv) {
+  std::string utf8 = wstring_to_utf8(wsv);
+  // L"..." literals are cataloged by the same legacy-key scheme; narrow the
+  // text, look it up, and emit the translation when one exists.
+  const auto translated = winux::i18n::translate_legacy(utf8);
   HANDLE h = getStdOut();
   if (isStdoutConsole()) {
-    if (!detail::writeConsoleW(h, wsv.data(), wsv.size()) &&
+    if (translated != utf8) {
+      const std::wstring wide = utf8_to_wstring(translated);
+      if (!detail::writeConsoleW(h, wide.data(), wide.size()) &&
+          isBrokenPipeError(GetLastError())) {
+        g_stdout_pipe_closed = true;
+      }
+    } else if (!detail::writeConsoleW(h, wsv.data(), wsv.size()) &&
+               isBrokenPipeError(GetLastError())) {
+      g_stdout_pipe_closed = true;
+    }
+    if (g_count_stdout_bytes) {
+      g_stdout_bytes_written += translated.size();
+    }
+  } else {
+    if (!detail::writeFile(h, translated.data(), translated.size()) &&
         isBrokenPipeError(GetLastError())) {
       g_stdout_pipe_closed = true;
     }
-  } else {
-    std::string utf8 = wstring_to_utf8(wsv);
-    if (!detail::writeFile(h, utf8.data(), utf8.size()) &&
-        isBrokenPipeError(GetLastError())) {
-      g_stdout_pipe_closed = true;
+    if (g_count_stdout_bytes) {
+      g_stdout_bytes_written += translated.size();
     }
   }
 }
 
 export void safeErrorPrint(std::wstring_view wsv) {
+  std::string utf8 = wstring_to_utf8(wsv);
+  const auto translated = winux::i18n::translate_legacy(utf8);
   HANDLE h = getStdErr();
   if (isStderrConsole()) {
-    if (!detail::writeConsoleW(h, wsv.data(), wsv.size()) &&
-        isBrokenPipeError(GetLastError())) {
+    if (translated != utf8) {
+      const std::wstring wide = utf8_to_wstring(translated);
+      if (!detail::writeConsoleW(h, wide.data(), wide.size()) &&
+          isBrokenPipeError(GetLastError())) {
+        g_stderr_pipe_closed = true;
+      }
+    } else if (!detail::writeConsoleW(h, wsv.data(), wsv.size()) &&
+               isBrokenPipeError(GetLastError())) {
       g_stderr_pipe_closed = true;
     }
   } else {
-    std::string utf8 = wstring_to_utf8(wsv);
-    if (!detail::writeFile(h, utf8.data(), utf8.size()) &&
+    if (!detail::writeFile(h, translated.data(), translated.size()) &&
         isBrokenPipeError(GetLastError())) {
       g_stderr_pipe_closed = true;
     }
@@ -354,6 +532,8 @@ export void safeErrorPrintLn(std::wstring_view wsv) {
 // UTF-8 string overloads (stack conversion)
 // ----------------------------------------------------------------------------
 export void safePrint(std::string_view sv) {
+  const auto translated = winux::i18n::translate_legacy(sv);
+  sv = translated;
   HANDLE h = getStdOut();
   if (isStdoutConsole()) {
     detail::wchar_buffer buf(sv);
@@ -369,9 +549,14 @@ export void safePrint(std::string_view sv) {
       g_stdout_pipe_closed = true;
     }
   }
+  if (g_count_stdout_bytes) {
+    g_stdout_bytes_written += sv.size();
+  }
 }
 
 export void safeErrorPrint(std::string_view sv) {
+  const auto translated = winux::i18n::translate_legacy(sv);
+  sv = translated;
   HANDLE h = getStdErr();
   if (isStderrConsole()) {
     detail::wchar_buffer buf(sv);
@@ -390,12 +575,12 @@ export void safeErrorPrint(std::string_view sv) {
 }
 
 export void safePrintLn(std::string_view sv) {
-  safePrint(sv);
+  safePrint(winux::i18n::translate_legacy(sv));
   safePrint("\n");
 }
 
 export void safeErrorPrintLn(std::string_view sv) {
-  safeErrorPrint(sv);
+  safeErrorPrint(winux::i18n::translate_help_hint(sv));
   safeErrorPrint("\n");
 }
 

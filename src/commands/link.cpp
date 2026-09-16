@@ -41,54 +41,63 @@ import utils;
 using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
+// [GNU] link accepts no options besides --help/--version; FILE1 FILE2 are
+// positional operands only.
 auto constexpr LINK_OPTIONS =
-    std::array{OPTION("", "", "create link to file", STRING_TYPE)};
+    std::array{OPTION("", "", "FILE1 FILE2", STRING_TYPE)};
+
+auto link_windows_error_text(DWORD error) -> std::string {
+  Win32ErrorTextOptions options;
+  options.file_exists = true;
+  options.privilege_not_held_as_not_permitted = true;
+  return win32_posix_error_text(error, options);
+}
 
 REGISTER_COMMAND(
-    link,
-    /* name */
-    "link",
-
-    /* synopsis */
-    "link [OPTION]... FILE LINKNAME",
-    "Create a hard link to FILE named LINKNAME.\n"
-    "\n"
-    "On Windows, this creates a hard link using CreateHardLink API.\n"
-    "Note: Hard links only work on NTFS file systems.\n"
-    "\n"
-    "This command has no options other than --help and --version.",
-    "  link file.txt link_to_file.txt\n"
-    "  link existing new_link",
-
-    /* see also */
-    "ln(1), unlink(1)", "WinuxCmd", "Copyright © 2026 WinuxCmd", LINK_OPTIONS) {
-  namespace cp = core::pipeline;
-
-  if (ctx.positionals.size() < 2) {
-    safeErrorPrintLn("link: missing file operand");
-    safePrintLn("Try 'link --help' for more information.");
+    link_cmd, "link", "link FILE1 FILE2",
+    "Call the link function to create a link named FILE2 to an existing "
+    "FILE1.\n",
+    "  link existing.txt newlink.txt", "ln(1), symlink(2)", "WinuxCmd",
+    "Copyright © 2026 WinuxCmd", LINK_OPTIONS) {
+  const auto& positionals = ctx.positionals;
+  if (positionals.size() < 2) {
+    if (positionals.empty()) {
+      safeErrorPrintLn("link: missing operand");
+    } else {
+      safeErrorPrint("link: missing operand after '");
+      safeErrorPrint(std::string(positionals[0]));
+      safeErrorPrintLn("'");
+    }
+    safeErrorPrintLn("Try 'link --help' for more information.");
     return 1;
   }
-  if (ctx.positionals.size() > 2) {
-    safeErrorPrintLn("link: extra operand '" + std::string(ctx.positionals[2]) +
-                     "'");
-    safePrintLn("Try 'link --help' for more information.");
+  if (positionals.size() > 2) {
+    safeErrorPrint("link: extra operand '");
+    safeErrorPrint(std::string(positionals[2]));
+    safeErrorPrintLn("'");
+    safeErrorPrintLn("Try 'link --help' for more information.");
     return 1;
   }
 
-  std::string file = std::string(ctx.positionals[0]);
-  std::string linkname = std::string(ctx.positionals[1]);
+  const std::string file1(positionals[0]);
+  const std::string file2(positionals[1]);
 
-  std::wstring wfile = utf8_to_wstring(file);
-  std::wstring wlinkname = utf8_to_wstring(linkname);
+  // Resolve through the shared operand boundary so MSYS-style paths and
+  // extended-length names behave like other tools.
+  const auto target = native_path::make_api_path_operand(file1);
+  const auto link_name = native_path::make_api_path_operand(file2);
 
-  BOOL result = CreateHardLinkW(wlinkname.c_str(), wfile.c_str(), nullptr);
-  if (!result) {
-    DWORD error = GetLastError();
-    safeErrorPrintLn("link: cannot create link '" + linkname +
-                     "': " + std::to_string(error));
-    return 1;
+  if (CreateHardLinkW(link_name.extended.c_str(), target.extended.c_str(),
+                      nullptr)) {
+    return 0;
   }
 
-  return 0;
+  const DWORD error = GetLastError();
+  safeErrorPrint("link: cannot create link '");
+  safeErrorPrint(file2);
+  safeErrorPrint("' to '");
+  safeErrorPrint(file1);
+  safeErrorPrint("': ");
+  safeErrorPrintLn(link_windows_error_text(error));
+  return 1;
 }

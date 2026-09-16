@@ -42,6 +42,7 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr UNIX2DOS_OPTIONS = std::array{
+    // [EXT] option
     OPTION("-v", "--verbose", "print a message for each file", BOOL_TYPE)};
 
 REGISTER_COMMAND(unix2dos,
@@ -118,18 +119,11 @@ REGISTER_COMMAND(unix2dos,
   };
 
   if (ctx.positionals.empty()) {
-    // Read from stdin, write to stdout
-    std::string line;
-    bool first = true;
-    while (std::getline(std::cin, line)) {
-      if (!first) {
-        safePrint("\r\n");
-      }
-      safePrint(line);
-      first = false;
-    }
-    if (!first) {
-      safePrint("\r\n");
+    std::string content((std::istreambuf_iterator<char>(std::cin)), {});
+    for (size_t i = 0; i < content.size(); ++i) {
+      if (content[i] == '\n' && (i == 0 || content[i - 1] != '\r'))
+        safePrint("\r");
+      safePrint(content.substr(i, 1));
     }
   } else {
     // Process each file in place

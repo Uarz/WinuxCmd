@@ -80,16 +80,27 @@ using namespace core::pipeline;
  */
 // clang-format off
 constexpr auto RM_OPTIONS = std::array{
+// [GNU]
     OPTION("-f", "--force", "ignore nonexistent files and arguments, never prompt"),
+// [GNU]
     OPTION("-i", "", "prompt before every removal"),
+// [GNU]
     OPTION("-I", "", "prompt once before removing more than three files, or when removing recursively"),
+// [GNU]
     OPTION("-d", "--dir", "remove empty directories"),
+// [GNU]
     OPTION("-r", "--recursive", "remove directories and their contents recursively"),
+// [GNU]
     OPTION("-R", "--recursive", "remove directories and their contents recursively"),
+// [GNU]
     OPTION("-v", "--verbose", "explain what is being done"),
+// [GNU]
     OPTION("", "--interactive", "prompt according to WHEN: never, once (-I), or always (-i)", OPTIONAL_STRING_TYPE),
+// [GNU]
     OPTION("", "--one-file-system", "when removing a hierarchy recursively, skip any directory that is on a file system different from that of the corresponding command line argument"),
+// [DIFFERS]
     OPTION("", "--no-preserve-root", "do not treat '/' specially"),
+// [DIFFERS]
     OPTION("", "--preserve-root", "do not remove '/' (default)", OPTIONAL_STRING_TYPE)};
 // clang-format on
 
@@ -142,24 +153,41 @@ auto get_system_error_message(DWORD error) -> std::wstring {
 }
 
 /**
- * @brief Convert a path to Windows extended-length path (\\?\) format.
- *
- * This bypasses reserved device name resolution (nul, con, prn, aux, com*,
- * lpt*) and also removes the MAX_PATH limit. The path is first resolved to an
- * absolute path via GetFullPathNameW, then prefixed with "\\?\\\\". If
- * resolution fails the original path is returned unchanged.
+ * @brief Read a single y/n response from stdin, consuming the entire input
+ * line to prevent leftover characters from polluting subsequent prompts.
+ * @return true if the user answered 'y' or 'Y', false otherwise.
  */
-auto to_extended_path(const std::wstring& path) -> std::wstring {
-  // Already in extended form
-  if (path.size() >= 4 && path.compare(0, 4, L"\\\\?\\") == 0) {
-    return path;
+auto read_yes_no_response() -> bool {
+  std::string line;
+  if (!std::getline(std::cin, line)) {
+    return false;
   }
-  wchar_t abs_buf[32768];
-  DWORD len = GetFullPathNameW(path.c_str(), 32768, abs_buf, nullptr);
-  if (len == 0 || len >= 32768) {
-    return path;  // fallback: use original
-  }
-  return L"\\\\?\\" + std::wstring(abs_buf, len);
+  return !line.empty() && (line[0] == 'y' || line[0] == 'Y');
+}
+
+/**
+ * @brief Prompt the user to confirm removal of a file or item.
+ * @param path Path to display in the prompt.
+ * @return true if the user confirms, false otherwise.
+ */
+auto prompt_remove_file(std::string_view path) -> bool {
+  safeErrorPrint("rm: remove '");
+  safeErrorPrint(path);
+  safeErrorPrint("'? (y/n) ");
+  return read_yes_no_response();
+}
+
+/**
+ * @brief Prompt the user to confirm descending into a directory.
+ * Matches GNU rm's "descend into directory" prompt for -ri.
+ * @param path Path to display in the prompt.
+ * @return true if the user confirms, false otherwise.
+ */
+auto prompt_descend_directory(std::string_view path) -> bool {
+  safeErrorPrint("rm: descend into directory '");
+  safeErrorPrint(path);
+  safeErrorPrint("'? (y/n) ");
+  return read_yes_no_response();
 }
 
 /**
@@ -206,24 +234,88 @@ auto confirm_bulk_remove(size_t path_count, bool recursive) -> bool {
   safeErrorPrint(std::to_string(path_count));
   safeErrorPrint(recursive ? " arguments recursively? (y/n) "
                            : " arguments? (y/n) ");
-
-  char response = '\0';
-  std::cin >> response;
-  return response == 'y' || response == 'Y';
+  return read_yes_no_response();
 }
 
 auto parse_interactive_mode(std::string_view value)
     -> std::optional<InteractiveMode> {
-  if (value.empty() || value == "always") {
+  if (value.empty() || value == "always" || value == "yes") {
     return InteractiveMode::always;
   }
   if (value == "once") {
     return InteractiveMode::once;
   }
-  if (value == "never") {
+  if (value == "never" || value == "no" || value == "none") {
     return InteractiveMode::never;
   }
   return std::nullopt;
+}
+
+auto path_is_current_or_parent_directory(std::wstring_view path) -> bool {
+  path = native_path::strip_trailing_separators(path);
+  size_t pos = path.find_last_of(L"\\/");
+  auto name = pos == std::wstring_view::npos ? path : path.substr(pos + 1);
+  if (name.empty() && pos != std::wstring_view::npos) {
+    auto parent = native_path::strip_trailing_separators(path.substr(0, pos));
+    pos = parent.find_last_of(L"\\/");
+    name = pos == std::wstring_view::npos ? parent : parent.substr(pos + 1);
+  }
+  return name == L"." || name == L"..";
+}
+
+auto clear_readonly_attribute(const std::wstring& path, DWORD attr) -> void {
+  if (attr == INVALID_FILE_ATTRIBUTES ||
+      (attr & FILE_ATTRIBUTE_READONLY) == 0) {
+    return;
+  }
+  SetFileAttributesW(path.c_str(), attr & ~FILE_ATTRIBUTE_READONLY);
+}
+
+auto remove_empty_directory_path(const std::wstring& wpath,
+                                 std::string_view display_path,
+                                 const RmConfig& cfg) -> bool {
+  DWORD attr = GetFileAttributesW(wpath.c_str());
+  clear_readonly_attribute(wpath, attr);
+  if (!RemoveDirectoryW(wpath.c_str())) {
+    DWORD error = GetLastError();
+    std::wstring errorMsg = get_system_error_message(error);
+    safeErrorPrint("rm: cannot remove directory '");
+    safeErrorPrint(display_path);
+    safeErrorPrint("': ");
+    safeErrorPrint(errorMsg);
+    safeErrorPrint("\n");
+    return false;
+  }
+
+  if (cfg.verbose) {
+    safePrint("removed '");
+    safePrint(display_path);
+    safePrint("'\n");
+  }
+  return true;
+}
+
+auto remove_file_path(const std::wstring& wpath, std::string_view display_path,
+                      const RmConfig& cfg) -> bool {
+  DWORD attr = GetFileAttributesW(wpath.c_str());
+  clear_readonly_attribute(wpath, attr);
+  if (!DeleteFileW(wpath.c_str())) {
+    DWORD error = GetLastError();
+    std::wstring errorMsg = get_system_error_message(error);
+    safeErrorPrint("rm: cannot remove file '");
+    safeErrorPrint(display_path);
+    safeErrorPrint("': ");
+    safeErrorPrint(errorMsg);
+    safeErrorPrint("\n");
+    return false;
+  }
+
+  if (cfg.verbose) {
+    safePrint("removed '");
+    safePrint(display_path);
+    safePrint("'\n");
+  }
+  return true;
 }
 
 auto build_config(const CommandContext<RM_OPTIONS.size()>& ctx)
@@ -291,8 +383,17 @@ auto remove_path(const std::string& path, const RmConfig& cfg) -> bool {
   // Use extended-length path to bypass Windows reserved device names
   // (nul, con, prn, aux, com0-9, lpt0-9) which would otherwise redirect
   // file operations to the corresponding device instead of the actual file.
-  std::wstring wpath = to_extended_path(utf8_to_wstring(path));
-  DWORD attr = GetFileAttributesW(wpath.c_str());
+  auto operand = native_path::make_api_path_operand(path);
+  const std::wstring& wpath = operand.extended;
+  DWORD attr = native_path::operand_target_attributes_w(operand);
+
+  if (cfg.recursive &&
+      path_is_current_or_parent_directory(utf8_to_wstring(path))) {
+    safeErrorPrint("rm: refusing to remove '.' or '..' directory: skipping '");
+    safeErrorPrint(path);
+    safeErrorPrint("'\n");
+    return false;
+  }
 
   if (cfg.preserve_root && is_root_path(path)) {
     safeErrorPrint("rm: it is dangerous to operate recursively on root '");
@@ -307,11 +408,13 @@ auto remove_path(const std::string& path, const RmConfig& cfg) -> bool {
     if (!wvol.empty()) {
       // Normalize: ensure trailing backslash for comparison
       std::wstring norm_path = wpath;
-      if (!norm_path.empty() && norm_path.back() != L'\\' && norm_path.back() != L'/') {
+      if (!norm_path.empty() && norm_path.back() != L'\\' &&
+          norm_path.back() != L'/') {
         norm_path += L'\\';
       }
       std::wstring norm_vol = wvol;
-      if (!norm_vol.empty() && norm_vol.back() != L'\\' && norm_vol.back() != L'/') {
+      if (!norm_vol.empty() && norm_vol.back() != L'\\' &&
+          norm_vol.back() != L'/') {
         norm_vol += L'\\';
       }
       if (_wcsicmp(norm_path.c_str(), norm_vol.c_str()) == 0) {
@@ -337,15 +440,29 @@ auto remove_path(const std::string& path, const RmConfig& cfg) -> bool {
     }
   }
 
-  if (cfg.interactive == InteractiveMode::always) {
-    // OPTIMIZED: Avoid wstring concatenation
-    safeErrorPrint("rm: remove '");
+  if (operand.had_trailing_separator &&
+      (attr & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+    safeErrorPrint("rm: cannot remove '");
     safeErrorPrint(path);
-    safeErrorPrint("'? (y/n) ");
-    char response;
-    std::cin.get(response);
-    if (response != 'y' && response != 'Y') {
-      return true;
+    safeErrorPrint("': Not a directory\n");
+    return false;
+  }
+
+  const bool is_directory = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+  const bool is_reparse_point = (attr & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+
+  // Interactive prompt before removal
+  if (cfg.interactive == InteractiveMode::always) {
+    bool response;
+    if (is_directory && cfg.recursive && !is_reparse_point) {
+      // For directories with -r, prompt to descend (GNU-style)
+      response = prompt_descend_directory(path);
+    } else {
+      // For files, symlinks, or non-recursive directories, prompt to remove
+      response = prompt_remove_file(path);
+    }
+    if (!response) {
+      return true;  // user declined, treat as success
     }
   }
 
@@ -358,26 +475,14 @@ auto remove_path(const std::string& path, const RmConfig& cfg) -> bool {
       return false;
     }
 
-    if (!RemoveDirectoryW(wpath.c_str())) {
-      DWORD error = GetLastError();
-      std::wstring errorMsg = get_system_error_message(error);
-      safeErrorPrint("rm: cannot remove directory '");
-      safeErrorPrint(path);
-      safeErrorPrint("': ");
-      safeErrorPrint(errorMsg);
-      safeErrorPrint("\n");
-      return false;
-    }
-
-    if (cfg.verbose) {
-      safePrint("removed '");
-      safePrint(path);
-      safePrint("'\n");
-    }
-    return true;
+    return remove_empty_directory_path(wpath, path, cfg);
   }
 
   if (attr & FILE_ATTRIBUTE_DIRECTORY) {
+    if (attr & FILE_ATTRIBUTE_REPARSE_POINT) {
+      return remove_empty_directory_path(wpath, path, cfg);
+    }
+
     // Recursive function to delete directory with post-order traversal
     std::function<bool(const std::wstring&)> remove_directory_recursive;
     std::wstring root_volume =
@@ -421,33 +526,36 @@ auto remove_path(const std::string& path, const RmConfig& cfg) -> bool {
 
       std::vector<std::wstring> subdirs;
       bool success = true;
+      bool all_removed = true;
 
       do {
         std::wstring itemName(findData.cFileName);
         if (itemName != L"." && itemName != L"..") {
           std::wstring itemPath = dirPath + L"\\" + itemName;
+          std::string itemStr = wstring_to_utf8(itemPath);
 
           if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            // Prompt before descending into subdirectories
+            if (cfg.interactive == InteractiveMode::always &&
+                !(findData.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+              if (!prompt_descend_directory(itemStr)) {
+                all_removed = false;  // user declined, leave subtree
+                continue;
+              }
+            }
             // Store subdirectory for later recursive deletion
             subdirs.push_back(itemPath);
           } else {
-            // Delete file
-            if (!DeleteFileW(itemPath.c_str())) {
-              DWORD error = GetLastError();
-              std::string itemPathStr = wstring_to_utf8(itemPath);
-              std::wstring errorMsg = get_system_error_message(error);
-              safeErrorPrint("rm: cannot remove file '");
-              safeErrorPrint(itemPathStr);
-              safeErrorPrint("': ");
-              safeErrorPrint(errorMsg);
-              safeErrorPrint("\n");
+            // Prompt before removing files
+            if (cfg.interactive == InteractiveMode::always) {
+              if (!prompt_remove_file(itemStr)) {
+                all_removed = false;  // user declined
+                continue;
+              }
+            }
+            if (!remove_file_path(itemPath, itemStr, cfg)) {
               success = false;
-            } else if (cfg.verbose) {
-              // OPTIMIZED: Direct conversion
-              std::string itemPathStr = wstring_to_utf8(itemPath);
-              safePrint("removed '");
-              safePrint(itemPathStr);
-              safePrint("'\n");
+              all_removed = false;
             }
           }
         }
@@ -462,58 +570,47 @@ auto remove_path(const std::string& path, const RmConfig& cfg) -> bool {
 
       // Recursively delete all subdirectories (post-order traversal)
       for (const auto& subdir : subdirs) {
-        if (!remove_directory_recursive(subdir)) {
-          return false;
+        DWORD sub_attr = GetFileAttributesW(subdir.c_str());
+        bool sub_success = false;
+        if (sub_attr != INVALID_FILE_ATTRIBUTES &&
+            (sub_attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
+          // Prompt before removing reparse points (symlinks/junctions)
+          if (cfg.interactive == InteractiveMode::always) {
+            if (!prompt_remove_file(wstring_to_utf8(subdir))) {
+              all_removed = false;
+              continue;
+            }
+          }
+          sub_success =
+              remove_empty_directory_path(subdir, wstring_to_utf8(subdir), cfg);
+        } else {
+          sub_success = remove_directory_recursive(subdir);
+        }
+        if (!sub_success) {
+          success = false;
+          all_removed = false;
         }
       }
 
-      // Finally, remove the directory itself
-      if (!RemoveDirectoryW(dirPath.c_str())) {
-        DWORD error = GetLastError();
-        std::string dirPathStr = wstring_to_utf8(dirPath);
-        std::wstring errorMsg = get_system_error_message(error);
-        safeErrorPrint("rm: cannot remove directory '");
-        safeErrorPrint(dirPathStr);
-        safeErrorPrint("': ");
-        safeErrorPrint(errorMsg);
-        safeErrorPrint("\n");
+      if (!success) {
         return false;
       }
 
-      if (cfg.verbose) {
-        // OPTIMIZED: Direct conversion
-        std::string dirPathStr = wstring_to_utf8(dirPath);
-        safePrint("removed '");
-        safePrint(dirPathStr);
-        safePrint("'\n");
+      // If the user declined to remove any child, the directory is still
+      // non-empty — leave it alone (matches GNU rm behavior).
+      if (!all_removed) {
+        return true;
       }
 
-      return true;
+      // Finally, remove the directory itself
+      return remove_empty_directory_path(dirPath, wstring_to_utf8(dirPath),
+                                         cfg);
     };
 
     // Start recursive directory deletion
     return remove_directory_recursive(wpath);
   } else {
-    // Delete regular file
-    BOOL success = DeleteFileW(wpath.c_str());
-    if (!success) {
-      DWORD error = GetLastError();
-      std::wstring errorMsg = get_system_error_message(error);
-      // OPTIMIZED: Avoid redundant conversions
-      safeErrorPrint("rm: cannot remove file '");
-      safeErrorPrint(path);
-      safeErrorPrint("': ");
-      safeErrorPrint(errorMsg);
-      safeErrorPrint("\n");
-      return false;
-    }
-
-    if (cfg.verbose) {
-      // OPTIMIZED: Avoid wstring conversion
-      safePrint("removed '");
-      safePrint(path);
-      safePrint("'\n");
-    }
+    return remove_file_path(wpath, path, cfg);
   }
 
   return true;
@@ -603,8 +700,52 @@ REGISTER_COMMAND(
     RM_OPTIONS) {
   using namespace rm_pipeline;
 
+  // [GNU] rm.c refuses ANY abbreviated spelling of --no-preserve-root
+  // (getopt_long resolves the prefix, then rm errors out before acting):
+  //   rm --no-p f  ->  "rm: you may not abbreviate the --no-preserve-root
+  //   option" (exit 1, nothing removed).
+  // ctx.raw_args is post-normalization: the dispatcher already expands
+  // unambiguous long-option prefixes (getopt_long behaviour), so the
+  // abbreviation is invisible there.  Inspect the original process
+  // arguments via the CRT globals instead (uutils#10188, issue 962).
+  {
+    constexpr std::string_view kNoPreserveRoot = "--no-preserve-root";
+    bool end_of_options = false;
+    for (int i = 1; i < __argc; ++i) {
+      const std::string token = wstring_to_utf8(__wargv[i]);
+      std::string_view arg(token);
+      if (end_of_options || arg == "--") {
+        end_of_options = true;
+        continue;
+      }
+      if (!arg.starts_with("--")) continue;
+      const auto eq = arg.find('=');
+      const bool has_arg = eq != std::string_view::npos;
+      const std::string_view name = has_arg ? arg.substr(0, eq) : arg;
+      if (name.size() <= 2 || !kNoPreserveRoot.starts_with(name)) continue;
+      if (has_arg) {
+        // getopt_long reports the argument on the *resolved* option name
+        // before rm's abbreviation check runs.
+        safeErrorPrintLn(
+            "rm: option '--no-preserve-root' doesn't allow an argument");
+        safeErrorPrintLn("Try 'rm --help' for more information.");
+        return 1;
+      }
+      if (name.size() < kNoPreserveRoot.size()) {
+        safeErrorPrintLn(
+            "rm: you may not abbreviate the --no-preserve-root option");
+        return 1;
+      }
+    }
+  }
+
   auto result = process_command(ctx);
   if (!result) {
+    if (result.error() == "missing file operand") {
+      safeErrorPrintLn("rm: missing file operand");
+      safeErrorPrintLn("Try 'rm --help' for more information.");
+      return 1;
+    }
     cp::report_error(result, L"rm");
     return 1;
   }

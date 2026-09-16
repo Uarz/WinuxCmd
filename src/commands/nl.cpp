@@ -43,25 +43,36 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr NL_OPTIONS = std::array{
+    // [GNU]
     OPTION("-b", "--body-numbering", "use STYLE for numbering body lines",
            STRING_TYPE),
+    // [GNU]
     OPTION("-d", "--section-delimiter", "use CC for logical page delimiters",
            STRING_TYPE),
+    // [GNU]
     OPTION("-f", "--footer-numbering", "use STYLE for numbering footer lines",
            STRING_TYPE),
+    // [GNU]
     OPTION("-h", "--header-numbering", "use STYLE for numbering header lines",
            STRING_TYPE),
+    // [GNU]
     OPTION("-i", "--line-increment", "line number increment at each line",
            STRING_TYPE),
+    // [GNU]
     OPTION("-l", "--join-blank-lines",
            "group NUMBER empty lines as one numbered line", STRING_TYPE),
+    // [GNU]
     OPTION("-n", "--number-format", "use FORMAT for line numbers", STRING_TYPE),
+    // [GNU]
     OPTION("-p", "--no-renumber", "do not reset line numbers at logical pages",
            BOOL_TYPE),
+    // [GNU]
     OPTION("-s", "--number-separator",
            "add STRING after (possible) line number", STRING_TYPE),
+    // [GNU]
     OPTION("-v", "--starting-line-number",
            "first line number on each logical page", STRING_TYPE),
+    // [GNU]
     OPTION("-w", "--number-width", "width of line numbers", STRING_TYPE)};
 
 namespace nl_pipeline {
@@ -73,29 +84,78 @@ struct Config {
   std::string body_numbering = "t";
   std::string header_numbering = "n";
   std::string footer_numbering = "n";
-  int line_increment = 1;
-  int join_blank_lines = 1;
+  long long line_increment = 1;
+  long long join_blank_lines = 1;
   std::string number_format = "rn";
   bool no_renumber = false;
   std::string section_delimiter = "\\:";
   std::string separator = "\t";
-  int starting_number = 1;
-  int number_width = 6;
+  long long starting_number = 1;
+  long long number_width = 6;
   SmallVector<std::string, 64> files;
 };
 
-auto parse_int(const std::string& text, std::string_view error)
-    -> cp::Result<int> {
-  try {
-    size_t pos = 0;
-    int value = std::stoi(text, &pos);
-    if (pos != text.size()) {
-      return std::unexpected(std::string(error));
-    }
-    return value;
-  } catch (...) {
-    return std::unexpected(std::string(error));
+// [GNU] nl.c parses -i/-v with xdectointmax (any intmax_t value; a leading
+// sign is allowed, including 0) and -l/-w with xdectoumax (minimum 1). Any
+// trailing junk makes the operand invalid; exceeding the range appends the
+// errno description to the diagnostic.
+struct NlNumber {
+  long long value = 0;
+  bool overflow = false;
+};
+
+auto parse_nl_number(std::string_view text) -> std::optional<NlNumber> {
+  size_t pos = 0;
+  bool negative = false;
+  if (pos < text.size() && (text[pos] == '+' || text[pos] == '-')) {
+    negative = text[pos] == '-';
+    ++pos;
   }
+  const size_t digits_begin = pos;
+  unsigned long long magnitude = 0;
+  bool overflow = false;
+  while (pos < text.size() &&
+         std::isdigit(static_cast<unsigned char>(text[pos])) != 0) {
+    const unsigned long long digit =
+        static_cast<unsigned long long>(text[pos] - '0');
+    if (magnitude >
+        (std::numeric_limits<unsigned long long>::max() - digit) / 10) {
+      overflow = true;
+    } else {
+      magnitude = magnitude * 10 + digit;
+    }
+    ++pos;
+  }
+  if (pos == digits_begin || pos != text.size()) return std::nullopt;
+
+  NlNumber result;
+  constexpr auto kMax =
+      static_cast<unsigned long long>(std::numeric_limits<long long>::max());
+  if (overflow || (!negative && magnitude > kMax) ||
+      (negative && magnitude > kMax + 1)) {
+    result.overflow = true;
+    return result;
+  }
+  result.value =
+      negative ? (magnitude == kMax + 1 ? std::numeric_limits<long long>::min()
+                                        : -static_cast<long long>(magnitude))
+               : static_cast<long long>(magnitude);
+  return result;
+}
+
+// Compose "invalid <what>: '<text>'" plus the GNU errno suffix that the
+// failing conversion produced.
+auto invalid_number_error(std::string_view key, std::string_view fallback,
+                          std::string_view text,
+                          std::string_view suffix_key = {},
+                          std::string_view suffix_fallback = {})
+    -> std::string {
+  std::string msg =
+      winux::i18n::format(key, std::string(fallback), std::string(text));
+  if (!suffix_key.empty()) {
+    msg += winux::i18n::translate(suffix_key, suffix_fallback);
+  }
+  return msg;
 }
 
 auto validate_numbering_style(const std::string& style,
@@ -104,9 +164,9 @@ auto validate_numbering_style(const std::string& style,
     return 0;
   }
   if (style.starts_with("p")) {
-    try {
-      std::regex unused(style.substr(1), std::regex_constants::basic);
-    } catch (const std::regex_error&) {
+    auto pattern =
+        portable_regex::compile(portable_regex::Syntax::Basic, style.substr(1));
+    if (!pattern) {
       return std::unexpected("invalid " + std::string(section) +
                              " numbering style");
     }
@@ -124,120 +184,148 @@ auto section_token(const Config& cfg, int repeats) -> std::string {
   return token;
 }
 
+// The last occurrence of an option wins in GNU getopt; an option given with
+// an empty value still counts as given.
+auto last_string_value(const CommandContext<NL_OPTIONS.size()>& ctx,
+                       std::initializer_list<std::string_view> names)
+    -> std::optional<std::string> {
+  const auto occurrences = ctx.string_occurrences(names);
+  if (occurrences.empty()) return std::nullopt;
+  return occurrences.back().value;
+}
+
 auto build_config(const CommandContext<NL_OPTIONS.size()>& ctx)
     -> cp::Result<Config> {
   Config cfg;
 
-  auto body_opt = ctx.get<std::string>("--body-numbering", "");
-  if (body_opt.empty()) {
-    body_opt = ctx.get<std::string>("-b", "");
-  }
-  if (!body_opt.empty()) {
-    cfg.body_numbering = body_opt;
+  // [GNU] numbering-style operands are diagnosed with the rejected value and
+  // followed by "Try 'nl --help' for more information." (usage()).
+  auto style_error = [](std::string_view section, std::string_view value) {
+    return winux::i18n::format("command.nl.error.numbering_style",
+                               "invalid {} numbering style: '{}'", section,
+                               std::string(value)) +
+           "\n" +
+           winux::i18n::format("common.try_help",
+                               "Try '{} --help' for more information.", "nl");
+  };
+
+  if (auto body_opt = last_string_value(ctx, {"-b", "--body-numbering"})) {
+    cfg.body_numbering = *body_opt;
     auto valid = validate_numbering_style(cfg.body_numbering, "body");
-    if (!valid) return std::unexpected(valid.error());
+    if (!valid) return std::unexpected(style_error("body", *body_opt));
   }
 
-  auto header_opt = ctx.get<std::string>("--header-numbering", "");
-  if (header_opt.empty()) {
-    header_opt = ctx.get<std::string>("-h", "");
-  }
-  if (!header_opt.empty()) {
-    cfg.header_numbering = header_opt;
+  if (auto header_opt = last_string_value(ctx, {"-h", "--header-numbering"})) {
+    cfg.header_numbering = *header_opt;
     auto valid = validate_numbering_style(cfg.header_numbering, "header");
-    if (!valid) return std::unexpected(valid.error());
+    if (!valid) return std::unexpected(style_error("header", *header_opt));
   }
 
-  auto footer_opt = ctx.get<std::string>("--footer-numbering", "");
-  if (footer_opt.empty()) {
-    footer_opt = ctx.get<std::string>("-f", "");
-  }
-  if (!footer_opt.empty()) {
-    cfg.footer_numbering = footer_opt;
+  if (auto footer_opt = last_string_value(ctx, {"-f", "--footer-numbering"})) {
+    cfg.footer_numbering = *footer_opt;
     auto valid = validate_numbering_style(cfg.footer_numbering, "footer");
-    if (!valid) return std::unexpected(valid.error());
+    if (!valid) return std::unexpected(style_error("footer", *footer_opt));
   }
 
-  auto increment_opt = ctx.get<std::string>("--line-increment", "");
-  if (increment_opt.empty()) {
-    increment_opt = ctx.get<std::string>("-i", "");
-  }
-  if (!increment_opt.empty()) {
-    auto value = parse_int(increment_opt, "invalid line increment");
-    if (!value) return std::unexpected(value.error());
-    cfg.line_increment = *value;
-  }
-
-  auto join_blank_opt = ctx.get<std::string>("--join-blank-lines", "");
-  if (join_blank_opt.empty()) {
-    join_blank_opt = ctx.get<std::string>("-l", "");
-  }
-  if (!join_blank_opt.empty()) {
-    auto value = parse_int(join_blank_opt, "invalid blank line count");
-    if (!value) return std::unexpected(value.error());
-    if (*value <= 0) {
-      return std::unexpected("blank line count must be positive");
+  if (auto increment_opt = last_string_value(ctx, {"-i", "--line-increment"})) {
+    // [GNU] xdectointmax: zero and negative increments are legal ("nl -i 0"
+    // repeats the same line number); only non-numeric input and overflow
+    // are errors.
+    auto value = parse_nl_number(*increment_opt);
+    if (!value || value->overflow) {
+      return std::unexpected(invalid_number_error(
+          "command.nl.error.invalid_increment",
+          "invalid line number increment: '{}'", *increment_opt,
+          (value && value->overflow) ? "common.error.value_too_large"
+                                     : std::string_view{},
+          ": Value too large for defined data type"));
     }
-    cfg.join_blank_lines = *value;
+    cfg.line_increment = value->value;
   }
 
-  auto format_opt = ctx.get<std::string>("--number-format", "");
-  if (format_opt.empty()) {
-    format_opt = ctx.get<std::string>("-n", "");
-  }
-  if (!format_opt.empty()) {
-    if (format_opt != "ln" && format_opt != "rn" && format_opt != "rz") {
-      return std::unexpected("invalid line number format");
+  if (auto join_blank_opt =
+          last_string_value(ctx, {"-l", "--join-blank-lines"})) {
+    // [GNU] xdectoumax with minimum 1: 0, negative and overflowing counts
+    // are all "Numerical result out of range".
+    auto value = parse_nl_number(*join_blank_opt);
+    if (!value) {
+      return std::unexpected(invalid_number_error(
+          "command.nl.error.invalid_join",
+          "invalid line number of blank lines: '{}'", *join_blank_opt));
     }
-    cfg.number_format = format_opt;
+    if (value->overflow || value->value < 1) {
+      return std::unexpected(invalid_number_error(
+          "command.nl.error.invalid_join",
+          "invalid line number of blank lines: '{}'", *join_blank_opt,
+          "common.error.result_out_of_range",
+          ": Numerical result out of range"));
+    }
+    cfg.join_blank_lines = value->value;
+  }
+
+  if (auto format_opt = last_string_value(ctx, {"-n", "--number-format"})) {
+    if (*format_opt != "ln" && *format_opt != "rn" && *format_opt != "rz") {
+      return std::unexpected(
+          winux::i18n::format("command.nl.error.numbering_format",
+                              "invalid line numbering format: '{}'",
+                              *format_opt) +
+          "\n" +
+          winux::i18n::format("common.try_help",
+                              "Try '{} --help' for more information.", "nl"));
+    }
+    cfg.number_format = *format_opt;
   }
 
   cfg.no_renumber =
       ctx.get<bool>("--no-renumber", false) || ctx.get<bool>("-p", false);
 
-  auto delimiter_opt = ctx.get<std::string>("--section-delimiter", "");
-  if (delimiter_opt.empty() && ctx.has("-d")) {
-    delimiter_opt = ctx.get<std::string>("-d", "");
-  }
-  if (ctx.has("--section-delimiter") || ctx.has("-d")) {
-    if (delimiter_opt.empty()) {
+  if (auto delimiter_opt =
+          last_string_value(ctx, {"-d", "--section-delimiter"})) {
+    if (delimiter_opt->empty()) {
       cfg.section_delimiter.clear();
-    } else if (delimiter_opt.size() == 1) {
-      cfg.section_delimiter = delimiter_opt + ":";
+    } else if (delimiter_opt->size() == 1) {
+      cfg.section_delimiter = *delimiter_opt + ":";
     } else {
-      cfg.section_delimiter = delimiter_opt;
+      cfg.section_delimiter = *delimiter_opt;
     }
   }
 
-  auto separator_opt = ctx.get<std::string>("--number-separator", "");
-  if (separator_opt.empty()) {
-    separator_opt = ctx.get<std::string>("-s", "");
-  }
-  if (ctx.has("--number-separator") || ctx.has("-s")) {
-    cfg.separator = separator_opt;
+  if (auto separator_opt =
+          last_string_value(ctx, {"-s", "--number-separator"})) {
+    cfg.separator = *separator_opt;
   }
 
-  auto start_opt = ctx.get<std::string>("--starting-line-number", "");
-  if (start_opt.empty()) {
-    start_opt = ctx.get<std::string>("-v", "");
-  }
-  if (!start_opt.empty()) {
-    auto value = parse_int(start_opt, "invalid starting line number");
-    if (!value) return std::unexpected(value.error());
-    cfg.starting_number = *value;
-  }
-
-  auto width_opt = ctx.get<std::string>("--number-width", "");
-  if (width_opt.empty()) {
-    width_opt = ctx.get<std::string>("-w", "");
-  }
-  if (!width_opt.empty()) {
-    auto value = parse_int(width_opt, "invalid line number width");
-    if (!value) return std::unexpected(value.error());
-    if (*value <= 0) {
-      return std::unexpected("line number width must be positive");
+  if (auto start_opt =
+          last_string_value(ctx, {"-v", "--starting-line-number"})) {
+    auto value = parse_nl_number(*start_opt);
+    if (!value || value->overflow) {
+      return std::unexpected(invalid_number_error(
+          "command.nl.error.invalid_start",
+          "invalid starting line number: '{}'", *start_opt,
+          (value && value->overflow) ? "common.error.value_too_large"
+                                     : std::string_view{},
+          ": Value too large for defined data type"));
     }
-    cfg.number_width = *value;
+    cfg.starting_number = value->value;
+  }
+
+  if (auto width_opt = last_string_value(ctx, {"-w", "--number-width"})) {
+    // [GNU] xdectoumax with minimum 1: 0, negative and overflowing widths
+    // are all "Numerical result out of range".
+    auto value = parse_nl_number(*width_opt);
+    if (!value) {
+      return std::unexpected(invalid_number_error(
+          "command.nl.error.invalid_width",
+          "invalid line number field width: '{}'", *width_opt));
+    }
+    if (value->overflow || value->value < 1) {
+      return std::unexpected(
+          invalid_number_error("command.nl.error.invalid_width",
+                               "invalid line number field width: '{}'",
+                               *width_opt, "common.error.result_out_of_range",
+                               ": Numerical result out of range"));
+    }
+    cfg.number_width = value->value;
   }
 
   for (auto arg : ctx.positionals) {
@@ -262,7 +350,7 @@ auto build_config(const CommandContext<NL_OPTIONS.size()>& ctx)
 }
 
 auto should_number_line(const std::string& style, const std::string& line,
-                        int& blank_count, int join_blank_lines) -> bool {
+                        int& blank_count, long long join_blank_lines) -> bool {
   if (style == "n") {
     blank_count = 0;
     return false;
@@ -275,8 +363,9 @@ auto should_number_line(const std::string& style, const std::string& line,
 
   if (style.starts_with("p")) {
     blank_count = 0;
-    std::regex pattern(style.substr(1), std::regex_constants::basic);
-    return std::regex_search(line, pattern);
+    auto pattern =
+        portable_regex::compile(portable_regex::Syntax::Basic, style.substr(1));
+    return pattern && !pattern.pattern.find_all(line).empty();
   }
 
   if (!line.empty()) {
@@ -300,22 +389,36 @@ auto style_for_section(const Config& cfg, Section section)
   return cfg.body_numbering;
 }
 
-auto format_line_number(int line_number, const Config& cfg) -> std::string {
+auto format_line_number(long long line_number, const Config& cfg)
+    -> std::string {
   char num_buf[64];
+  // snprintf field widths are int; widths above INT_MAX saturate.
+  const int width =
+      cfg.number_width > static_cast<long long>(std::numeric_limits<int>::max())
+          ? std::numeric_limits<int>::max()
+          : static_cast<int>(cfg.number_width);
 
   if (cfg.number_format == "ln") {
-    snprintf(num_buf, sizeof(num_buf), "%-*d", cfg.number_width, line_number);
+    snprintf(num_buf, sizeof(num_buf), "%-*lld", width, line_number);
   } else if (cfg.number_format == "rz") {
-    snprintf(num_buf, sizeof(num_buf), "%0*d", cfg.number_width, line_number);
+    snprintf(num_buf, sizeof(num_buf), "%0*lld", width, line_number);
   } else {
-    snprintf(num_buf, sizeof(num_buf), "%*d", cfg.number_width, line_number);
+    snprintf(num_buf, sizeof(num_buf), "%*lld", width, line_number);
   }
 
   return num_buf;
 }
 
+auto unnumbered_prefix(const Config& cfg) -> std::string {
+  const long long width =
+      std::min(cfg.number_width,
+               static_cast<long long>(std::numeric_limits<int>::max()));
+  return std::string(static_cast<size_t>(width) + cfg.separator.size(), ' ');
+}
+
 auto print_data_line(const std::string& line, const Config& cfg,
-                     Section section, int& line_number, int& blank_count) {
+                     Section section, long long& line_number,
+                     int& blank_count) {
   bool should_number = should_number_line(style_for_section(cfg, section), line,
                                           blank_count, cfg.join_blank_lines);
 
@@ -327,11 +430,12 @@ auto print_data_line(const std::string& line, const Config& cfg,
     return;
   }
 
-  safePrintLn(cfg.separator + line);
+  safePrint(unnumbered_prefix(cfg));
+  safePrintLn(line);
 }
 
 auto handle_section_delimiter(const std::string& line, const Config& cfg,
-                              Section& section, int& line_number,
+                              Section& section, long long& line_number,
                               int& blank_count) -> bool {
   if (cfg.section_delimiter.empty()) {
     return false;
@@ -356,7 +460,7 @@ auto handle_section_delimiter(const std::string& line, const Config& cfg,
 }
 
 auto process_line(const std::string& line, const Config& cfg, Section& section,
-                  int& line_number, int& blank_count) {
+                  long long& line_number, int& blank_count) {
   if (handle_section_delimiter(line, cfg, section, line_number, blank_count)) {
     return;
   }
@@ -365,23 +469,43 @@ auto process_line(const std::string& line, const Config& cfg, Section& section,
 }
 
 auto run(const Config& cfg) -> int {
-  int line_number = cfg.starting_number;
+  auto nl_input_open_error = [](std::string_view path) -> std::string {
+    std::error_code ec;
+    auto status = std::filesystem::status(std::filesystem::u8path(path), ec);
+    if (!ec && status.type() == std::filesystem::file_type::directory) {
+      return std::string("cannot open '") + std::string(path) +
+             "' for reading: Is a directory";
+    }
+    return std::string("cannot open '") + std::string(path) +
+           "' for reading: No such file or directory";
+  };
+
+  long long line_number = cfg.starting_number;
   int blank_count = 0;
   Section section = Section::Body;
 
   for (const auto& file : cfg.files) {
     if (file == "-") {
+      // [GNU] closed stdin (<&-) errors "nl: -: Bad file descriptor".
+      if (file_io::stdin_is_bad()) {
+        safeErrorPrintLn("nl: -: Bad file descriptor");
+        return 1;
+      }
       // Read from stdin
       std::string line;
       while (std::getline(std::cin, line)) {
+        if (!line.empty() && line.back() == '\r') {
+          line.pop_back();
+        }
         process_line(line, cfg, section, line_number, blank_count);
       }
     } else {
       // Read from file
-      std::ifstream f(file, std::ios::binary);
+      std::ifstream f(native_path::normalize_api_operand(file),
+                      std::ios::binary);
       if (!f) {
-        auto err = std::string("cannot open '") + file + "' for reading";
-        cp::Result<int> result = std::unexpected(std::string_view(err));
+        auto err = nl_input_open_error(file);
+        cp::Result<int> result = std::unexpected(err);
         cp::report_error(result, L"nl");
         return 1;
       }
@@ -397,6 +521,9 @@ auto run(const Config& cfg) -> int {
           line = line.substr(3);
         }
         first_line = false;
+        if (!line.empty() && line.back() == '\r') {
+          line.pop_back();
+        }
 
         process_line(line, cfg, section, line_number, blank_count);
       }

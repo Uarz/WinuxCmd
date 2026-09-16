@@ -27,7 +27,7 @@
 /// @Author: WinuxCmd
 /// @contributors:
 ///   - caomengxuan666 <2507560089@qq.com>
-/// @Description: Implemention for sort.
+/// @Description: Implementation for sort.
 /// @Version: 0.1.0
 /// @License: MIT
 /// @Copyright: Copyright © 2026 WinuxCmd
@@ -40,47 +40,98 @@ import core;
 import utils;
 import container;
 
+using cmd::meta::option_matches;
 using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr SORT_OPTIONS = std::array{
+    // [GNU] -b, --ignore-leading-blanks
     OPTION("-b", "--ignore-leading-blanks", "ignore leading blanks"),
+    // [GNU] -d, --dictionary-order
     OPTION("-d", "--dictionary-order",
            "consider only blanks and alphanumeric characters"),
+    // [GNU] -f, --ignore-case
     OPTION("-f", "--ignore-case", "fold lower case to upper case"),
+    // [GNU] -g, --general-numeric-sort
     OPTION("-g", "--general-numeric-sort",
            "compare according to string numerical value"),
+    // [GNU] -i, --ignore-nonprinting
     OPTION("-i", "--ignore-nonprinting", "consider only printable characters"),
+    // [GNU] -h, --human-numeric-sort
     OPTION("-h", "--human-numeric-sort",
            "compare human readable numbers (e.g., 1K, 2M)"),
+    // [GNU] -M, --month-sort
     OPTION("-M", "--month-sort", "compare as month names"),
+    // [GNU] -m, --merge
     OPTION("-m", "--merge", "merge already sorted files"),
+    // [GNU] -n, --numeric-sort
     OPTION("-n", "--numeric-sort",
            "compare according to string numerical value"),
+    // [GNU] -V, --version-sort
     OPTION("-V", "--version-sort", "compare version numbers naturally"),
+    // [GNU] -R, --random-sort
     OPTION("-R", "--random-sort", "sort by random hash of keys"),
+    // [GNU] --random-source
     OPTION("", "--random-source", "get random bytes from FILE", STRING_TYPE),
+    // [GNU] -r, --reverse
     OPTION("-r", "--reverse", "reverse the result of comparisons"),
+    // [GNU] -S, --buffer-size
     OPTION("-S", "--buffer-size",
            "use SIZE for the main memory buffer; accepted as a memory hint",
            STRING_TYPE),
+    // [GNU] --parallel
+    OPTION("", "--parallel",
+           "change the number of sorts run concurrently to N; accepted as a "
+           "concurrency hint",
+           STRING_TYPE),
+    // [GNU] -s, --stable
     OPTION("-s", "--stable",
            "stabilize sort by disabling last-resort comparison"),
+    // [GNU] -u, --unique
     OPTION("-u", "--unique", "output only the first of equal runs"),
+    // [GNU] -z, --zero-terminated
     OPTION("-z", "--zero-terminated", "line delimiter is NUL, not newline"),
-    OPTION("-c", "--check", "check whether input is sorted"),
-    OPTION("-C", "", "check whether input is sorted quietly"),
+    // [GNU] --files0-from: read input from the file specified
+    OPTION("", "--files0-from", "read input from the file specified",
+           STRING_TYPE),
+    // [GNU] -c takes no argument (a glued "-cquiet" is an invalid option);
+    // --check accepts the optional =diagnose-first|quiet|silent argument.
+    OPTION("-c", "", "check whether input is sorted; diagnose-first"),
+    OPTION("", "--check",
+           "check whether input is sorted; accepts =diagnose-first|quiet|"
+           "silent",
+           OPTIONAL_STRING_TYPE),
+    // [GNU] -C, --check-silent
+    OPTION("-C", "--check-silent", "check whether input is sorted quietly"),
+    // [GNU] --debug
     OPTION("", "--debug", "print sort key diagnostics to standard error"),
+    // [GNU] -o, --output
     OPTION("-o", "--output", "write result to FILE instead of standard output",
            STRING_TYPE),
+    // [GNU] option
     OPTION(
         "", "--files0-from",
         "read input from the files specified by NUL-terminated names in FILE",
         STRING_TYPE),
+    // [GNU] --batch-size
+    OPTION("", "--batch-size",
+           "merge at most NMERGE inputs at once; accepted as a merge hint",
+           STRING_TYPE),
+    // [GNU] --compress-program
+    OPTION("", "--compress-program",
+           "compress temporaries with PROG; accepted as a compression hint",
+           STRING_TYPE),
+    // [GNU] -T, --temporary-directory
+    OPTION("-T", "--temporary-directory",
+           "use DIR for temporaries; accepted as a temporary-directory hint",
+           STRING_TYPE),
+    // [GNU] --sort
     OPTION("", "--sort", "set sort order; 'version' enables version sort",
            STRING_TYPE),
+    // [GNU] -t, --field-separator
     OPTION("-t", "--field-separator",
            "use SEP instead of non-blank to blank transition", STRING_TYPE),
+    // [GNU] -k, --key
     OPTION("-k", "--key", "sort via a key; KEYDEF has form F[.C][,F[.C]]",
            STRING_TYPE)};
 
@@ -137,7 +188,11 @@ struct Config {
   std::optional<char> field_separator;
   std::string output_file;
   std::string files0_from;
+  std::string batch_size_hint;
+  std::string compress_program_hint;
+  std::string temporary_directory_hint;
   std::string random_source;
+  std::string parallel_hint;
   uint64_t random_seed = 0;
   std::vector<KeySpec> keys;
   SmallVector<std::string, 64>
@@ -146,25 +201,80 @@ struct Config {
 
 auto read_all(std::istream& in) -> std::string { return read_text_stream(in); }
 
-auto read_source(std::string_view path) -> cp::Result<std::string> {
-  if (path == "-") return read_all(std::cin);
+auto describe_input_open_failure(std::string_view path) -> std::string {
+  // Probe through the extended API path so >MAX_PATH operands and DOS
+  // device names resolve like the open itself (#1061).
+  DWORD attrs = native_path::attributes_w(utf8_to_wstring(std::string(path)));
+  if (attrs == INVALID_FILE_ATTRIBUTES) {
+    return "No such file or directory";
+  }
+  if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+    return "Is a directory";
+  }
+  return "Permission denied";
+}
 
-  std::ifstream in(std::string(path), std::ios::binary);
+auto read_source(std::string_view path) -> cp::Result<std::string> {
+  // [GNU] A closed standard input (<&-) is a stat/read error, not EOF
+  // (#973). GNU reports "sort: stat failed: -: Bad file descriptor".
+  if (path == "-") {
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected("stat failed: -: Bad file descriptor");
+    }
+    return read_all(std::cin);
+  }
+
+  auto in = file_io::open_binary_file(path);
   if (!in.is_open()) {
-    return std::unexpected("cannot open '" + std::string(path) + "'");
+    return std::unexpected("cannot read: " + std::string(path) + ": " +
+                           describe_input_open_failure(path));
   }
   return read_all(in);
 }
 
+auto read_simple_lexical_source(std::string_view path)
+    -> cp::Result<std::string> {
+  if (path == "-") return read_source(path);
+
+  auto in = file_io::open_binary_file(path);
+  in.seekg(0, std::ios::end);
+  if (!in.is_open()) {
+    return std::unexpected("cannot read: " + std::string(path) + ": " +
+                           describe_input_open_failure(path));
+  }
+
+  const auto end = in.tellg();
+  if (end < 0) return read_source(path);
+
+  std::string bytes(static_cast<size_t>(end), '\0');
+  in.seekg(0, std::ios::beg);
+  if (!bytes.empty()) {
+    in.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (!in && !in.eof()) return read_source(path);
+    bytes.resize(static_cast<size_t>(in.gcount()));
+  }
+
+  if (bytes.size() >= 3 && static_cast<std::uint8_t>(bytes[0]) == 0xEF &&
+      static_cast<std::uint8_t>(bytes[1]) == 0xBB &&
+      static_cast<std::uint8_t>(bytes[2]) == 0xBF) {
+    bytes.erase(0, 3);
+  }
+  return bytes;
+}
+
 auto read_binary_source(std::string_view path) -> cp::Result<std::string> {
   if (path == "-") {
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected("stat failed: -: Bad file descriptor");
+    }
     return std::string{std::istreambuf_iterator<char>{std::cin},
                        std::istreambuf_iterator<char>{}};
   }
 
-  std::ifstream in(std::string(path), std::ios::binary);
+  auto in = file_io::open_binary_file(path);
   if (!in.is_open()) {
-    return std::unexpected("cannot open '" + std::string(path) + "'");
+    return std::unexpected("cannot read: " + std::string(path) + ": " +
+                           describe_input_open_failure(path));
   }
   return std::string{std::istreambuf_iterator<char>{in},
                      std::istreambuf_iterator<char>{}};
@@ -175,9 +285,12 @@ auto read_files0_from(const std::string& path)
   std::istream* input = nullptr;
   std::ifstream file;
   if (path == "-") {
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected("stat failed: -: Bad file descriptor");
+    }
     input = &std::cin;
   } else {
-    file.open(path, std::ios::binary);
+    file = file_io::open_binary_file(path);
     if (!file.is_open()) {
       return std::unexpected("cannot open file list '" + path + "'");
     }
@@ -186,9 +299,21 @@ auto read_files0_from(const std::string& path)
 
   std::vector<std::string> paths;
   std::string name;
+  size_t file_number = 1;
   while (std::getline(*input, name, '\0')) {
-    if (!name.empty()) paths.push_back(name);
+    if (name.empty()) {
+      return std::unexpected(path + ":" + std::to_string(file_number) +
+                             ": invalid zero-length file name");
+    }
+    if (name == "-") {
+      return std::unexpected(
+          "when reading file names from standard input, "
+          "no file name of '-' allowed");
+    }
+    paths.push_back(name);
+    ++file_number;
   }
+  if (paths.empty()) return std::unexpected("no input from " + path);
   return paths;
 }
 
@@ -209,21 +334,6 @@ auto split_records(std::string_view content, char delimiter)
   return out;
 }
 
-auto to_lower_ascii(std::string_view s) -> std::string {
-  std::string out;
-  out.reserve(s.size());
-  for (unsigned char c : s) {
-    out.push_back(static_cast<char>(std::tolower(c)));
-  }
-  return out;
-}
-
-auto option_matches(const OptionMeta& meta, std::string_view short_name,
-                    std::string_view long_name) -> bool {
-  return (!short_name.empty() && meta.short_name == short_name) ||
-         (!long_name.empty() && meta.long_name == long_name);
-}
-
 auto normalize_text_key(std::string_view s, bool dictionary_order,
                         bool ignore_nonprinting, bool ignore_case)
     -> std::string {
@@ -239,7 +349,7 @@ auto normalize_text_key(std::string_view s, bool dictionary_order,
     out.push_back(static_cast<char>(c));
   }
   if (ignore_case) {
-    out = to_lower_ascii(out);
+    out = ascii_lower_copy(out);
   }
   return out;
 }
@@ -359,7 +469,8 @@ struct ParsedKeyPosition {
 
 auto parse_key_position(std::string_view text)
     -> cp::Result<ParsedKeyPosition> {
-  if (text.empty()) return std::unexpected("invalid key spec");
+  if (text.empty())
+    return std::unexpected("invalid key spec '" + std::string(text) + "'");
 
   ParsedKeyPosition pos;
   size_t i = 0;
@@ -368,15 +479,24 @@ auto parse_key_position(std::string_view text)
     ++i;
   }
   if (i == 0) {
-    return std::unexpected("invalid key spec");
+    return std::unexpected("invalid key spec '" + std::string(text) + "'");
   }
 
   auto field_text = text.substr(0, i);
+  // [GNU] overflowing field/char numbers are accepted and clamp (the field is
+  // beyond every line, so the key is empty; uutils #7185).
+  unsigned long long field_big = 0;
   auto [ptr, ec] = std::from_chars(
-      field_text.data(), field_text.data() + field_text.size(), pos.field);
-  if (ec != std::errc() || ptr != field_text.data() + field_text.size() ||
-      pos.field == 0) {
-    return std::unexpected("invalid key spec");
+      field_text.data(), field_text.data() + field_text.size(), field_big);
+  if ((ec != std::errc() && ec != std::errc::result_out_of_range) ||
+      ptr != field_text.data() + field_text.size()) {
+    return std::unexpected("invalid key spec '" + std::string(text) + "'");
+  }
+  pos.field = ec == std::errc::result_out_of_range
+                  ? std::numeric_limits<size_t>::max()
+                  : static_cast<size_t>(field_big);
+  if (pos.field == 0) {
+    return std::unexpected("invalid key spec '" + std::string(text) + "'");
   }
 
   if (i < text.size() && text[i] == '.') {
@@ -387,22 +507,25 @@ auto parse_key_position(std::string_view text)
       ++i;
     }
     if (i == char_start) {
-      return std::unexpected("invalid key spec");
+      return std::unexpected("invalid key spec '" + std::string(text) + "'");
     }
     size_t value = 0;
     auto char_text = text.substr(char_start, i - char_start);
     auto [char_ptr, char_ec] = std::from_chars(
         char_text.data(), char_text.data() + char_text.size(), value);
-    if (char_ec != std::errc() ||
-        char_ptr != char_text.data() + char_text.size()) {
-      return std::unexpected("invalid key spec");
+    if (char_ec == std::errc::result_out_of_range) {
+      // [GNU] clamp overflowing character offsets like field numbers.
+      value = std::numeric_limits<size_t>::max();
+    } else if (char_ec != std::errc() ||
+               char_ptr != char_text.data() + char_text.size()) {
+      return std::unexpected("invalid key spec '" + std::string(text) + "'");
     }
     pos.character = value;
   }
 
   for (size_t j = i; j < text.size(); ++j) {
     if (!is_key_modifier(text[j])) {
-      return std::unexpected("invalid key spec");
+      return std::unexpected("invalid key spec '" + std::string(text) + "'");
     }
   }
   pos.modifiers = text.substr(i);
@@ -410,7 +533,8 @@ auto parse_key_position(std::string_view text)
 }
 
 auto parse_key_spec(std::string_view text) -> cp::Result<KeySpec> {
-  if (text.empty()) return std::unexpected("invalid key spec");
+  if (text.empty())
+    return std::unexpected("invalid key spec '" + std::string(text) + "'");
 
   KeySpec key;
 
@@ -418,7 +542,7 @@ auto parse_key_spec(std::string_view text) -> cp::Result<KeySpec> {
   auto first = parse_key_position(text.substr(0, comma));
   if (!first) return std::unexpected(first.error());
   if (first->character.has_value() && *first->character == 0) {
-    return std::unexpected("invalid key spec");
+    return std::unexpected("invalid key spec '" + std::string(text) + "'");
   }
 
   key.start_field = first->field;
@@ -929,7 +1053,7 @@ void apply_global_sort_mode(Config& cfg, SortMode mode) {
 }
 
 auto parse_sort_mode_word(std::string_view text) -> std::optional<SortMode> {
-  auto lowered = to_lower_ascii(text);
+  auto lowered = ascii_lower_copy(text);
   if (lowered == "general-numeric" || lowered == "g") {
     return SortMode::GeneralNumeric;
   }
@@ -1141,6 +1265,59 @@ auto parse_buffer_size_hint(std::string_view text) -> bool {
   return false;
 }
 
+auto parse_parallel_hint(std::string_view text) -> bool {
+  if (text.empty()) return false;
+
+  unsigned int value = 0;
+  auto [ptr, ec] =
+      std::from_chars(text.data(), text.data() + text.size(), value);
+  if (ec != std::errc() || ptr != text.data() + text.size()) {
+    return false;
+  }
+  return value > 0;
+}
+
+// [GNU] --batch-size is bounded by the number of files that can be open at
+// once: RLIMIT_NOFILE - 3 (stdin/stdout/stderr). Windows has no rlimit; the
+// MSYS2/Cygwin builds of GNU sort report a 3200 fd budget (OPEN_MAX), so the
+// same cap keeps the diagnostics identical on this platform.
+inline constexpr unsigned int MAX_BATCH_SIZE_HINT = 3200 - 3;
+
+// Returns an empty string when the hint is valid, otherwise the GNU-style
+// diagnostic to print.
+auto validate_batch_size_hint(std::string_view text) -> std::string {
+  uintmax_t value = 0;
+  auto [ptr, ec] =
+      std::from_chars(text.data(), text.data() + text.size(), value);
+  if (text.empty() || ec != std::errc() || ptr != text.data() + text.size()) {
+    return "invalid --batch-size argument '" + std::string(text) + "'";
+  }
+  if (value < 2) {
+    return "invalid --batch-size argument '" + std::string(text) +
+           "'\nsort: minimum --batch-size argument is '2'";
+  }
+  if (value > MAX_BATCH_SIZE_HINT) {
+    return "--batch-size argument '" + std::string(text) +
+           "' too large\nsort: maximum --batch-size argument with current "
+           "rlimit is " +
+           std::to_string(MAX_BATCH_SIZE_HINT);
+  }
+  return {};
+}
+
+auto validate_compress_program_hint(std::string_view text) -> bool {
+  return !text.empty();
+}
+
+auto validate_temporary_directory_hint(std::string_view text) -> bool {
+  if (text.empty()) return false;
+
+  std::error_code ec;
+  const auto path = std::filesystem::u8path(text);
+  return std::filesystem::exists(path, ec) &&
+         std::filesystem::is_directory(path, ec) && !ec;
+}
+
 auto build_config(const CommandContext<SORT_OPTIONS.size()>& ctx)
     -> cp::Result<Config> {
   Config cfg;
@@ -1160,10 +1337,71 @@ auto build_config(const CommandContext<SORT_OPTIONS.size()>& ctx)
   cfg.stable = ctx.get<bool>("--stable", false) || ctx.get<bool>("-s", false);
   cfg.unique = ctx.get<bool>("--unique", false) || ctx.get<bool>("-u", false);
   cfg.debug = ctx.get<bool>("--debug", false);
-  if (ctx.get<bool>("--check", false) || ctx.get<bool>("-c", false)) {
-    cfg.mode = OperationMode::Check;
+  // [GNU] -c and --check select the diagnose-first check mode, while -C,
+  // --check-silent and --check=quiet/silent select the quiet mode. Mixing
+  // the two modes is rejected at parse time ("options '-cC' are
+  // incompatible"). --check values follow argmatch rules: unique prefixes
+  // of {quiet, silent, diagnose-first} are accepted, an explicitly empty
+  // "--check=" is an ambiguity, and anything else is an invalid argument.
+  bool want_check = false;
+  bool want_check_quiet = false;
+  bool check_inline_empty = false;
+  for (std::string_view raw : ctx.raw_args) {
+    if (raw == "--") break;
+    if (raw == "--check=") check_inline_empty = true;
   }
-  if (ctx.get<bool>("-C", false)) {
+  for (const auto& occurrence : ctx.options.occurrences()) {
+    if (!ctx.metas || occurrence.index >= SORT_OPTIONS.size()) continue;
+    const auto& meta = (*ctx.metas)[occurrence.index];
+    if (option_matches(meta, "-C", "--check-silent")) {
+      want_check_quiet = true;
+      continue;
+    }
+    if (meta.short_name == "-c" && meta.long_name.empty()) {
+      want_check = true;
+      continue;
+    }
+    if (meta.long_name != "--check") continue;
+
+    const auto* value = std::get_if<std::string>(&occurrence.value);
+    const std::string text = value != nullptr ? *value : std::string();
+    if (text.empty()) {
+      if (check_inline_empty) {
+        // Printed specially by the command entry point.
+        return std::unexpected("ambiguous argument '' for '--check'");
+      }
+      want_check = true;
+      continue;
+    }
+    static constexpr std::array<std::string_view, 3> kCheckArgs{
+        "quiet", "silent", "diagnose-first"};
+    std::string_view matched;
+    size_t match_count = 0;
+    for (const auto candidate : kCheckArgs) {
+      if (candidate.starts_with(text)) {
+        matched = candidate;
+        ++match_count;
+      }
+    }
+    if (match_count > 1) {
+      return std::unexpected("ambiguous argument '" + text + "' for '--check'");
+    }
+    if (match_count == 0) {
+      // Printed specially by the command entry point.
+      return std::unexpected("invalid argument '" + text + "' for '--check'");
+    }
+    if (matched == "diagnose-first") {
+      want_check = true;
+    } else {
+      want_check_quiet = true;
+    }
+  }
+  if (want_check && want_check_quiet) {
+    return std::unexpected("options '-cC' are incompatible");
+  }
+  if (want_check) {
+    cfg.mode = OperationMode::Check;
+  } else if (want_check_quiet) {
     cfg.mode = OperationMode::CheckQuiet;
   }
   cfg.delimiter =
@@ -1171,16 +1409,66 @@ auto build_config(const CommandContext<SORT_OPTIONS.size()>& ctx)
           ? '\0'
           : '\n';
 
+  // [GNU] only the last -o would matter, but more than one output file is
+  // rejected outright ("multiple output files specified").
+  if (ctx.count({"-o", "--output"}) > 1) {
+    return std::unexpected("multiple output files specified");
+  }
   cfg.output_file = ctx.get<std::string>("--output", "");
   if (cfg.output_file.empty()) cfg.output_file = ctx.get<std::string>("-o", "");
+  if (cfg.mode != OperationMode::Sort && !cfg.output_file.empty()) {
+    // [GNU] quotes the effective check option letter: "-co" for -c/--check
+    // and "-Co" for -C/--check-silent/--check=quiet|silent.
+    return std::unexpected(
+        std::string("options '-") +
+        (cfg.mode == OperationMode::CheckQuiet ? "Co" : "co") +
+        "' are incompatible");
+  }
+  if (cfg.debug && cfg.mode != OperationMode::Sort) {
+    return std::unexpected(std::string("options '-") +
+                           (cfg.mode == OperationMode::CheckQuiet ? "C" : "c") +
+                           " --debug' are incompatible");
+  }
+  if (cfg.debug && !cfg.output_file.empty()) {
+    return std::unexpected("options '-o --debug' are incompatible");
+  }
   cfg.files0_from = ctx.get<std::string>("--files0-from", "");
+  cfg.batch_size_hint = ctx.get<std::string>("--batch-size", "");
+  cfg.compress_program_hint = ctx.get<std::string>("--compress-program", "");
+  cfg.temporary_directory_hint =
+      ctx.get<std::string>("--temporary-directory", "");
+  if (cfg.temporary_directory_hint.empty()) {
+    cfg.temporary_directory_hint = ctx.get<std::string>("-T", "");
+  }
   cfg.random_source = ctx.get<std::string>("--random-source", "");
+  cfg.parallel_hint = ctx.get<std::string>("--parallel", "");
 
   std::string buffer_size = ctx.get<std::string>("--buffer-size", "");
   if (buffer_size.empty()) buffer_size = ctx.get<std::string>("-S", "");
   if ((ctx.has("--buffer-size") || ctx.has("-S")) &&
       !parse_buffer_size_hint(buffer_size)) {
     return std::unexpected("invalid buffer size");
+  }
+
+  if (ctx.has("--parallel") && !parse_parallel_hint(cfg.parallel_hint)) {
+    // [GNU] reports the rejected operand (uutils #13016)
+    return std::unexpected("invalid --parallel argument '" + cfg.parallel_hint +
+                           "'");
+  }
+
+  if (ctx.has("--batch-size")) {
+    auto batch_error = validate_batch_size_hint(cfg.batch_size_hint);
+    if (!batch_error.empty()) return std::unexpected(batch_error);
+  }
+
+  if (ctx.has("--compress-program") &&
+      !validate_compress_program_hint(cfg.compress_program_hint)) {
+    return std::unexpected("invalid compress program");
+  }
+
+  if ((ctx.has("--temporary-directory") || ctx.has("-T")) &&
+      !validate_temporary_directory_hint(cfg.temporary_directory_hint)) {
+    return std::unexpected("invalid temporary directory");
   }
 
   std::string sep = ctx.get<std::string>("--field-separator", "");
@@ -1241,13 +1529,21 @@ auto build_config(const CommandContext<SORT_OPTIONS.size()>& ctx)
     if (cfg.files.empty()) cfg.files.push_back("-");
   }
 
+  if (cfg.mode != OperationMode::Sort && cfg.files.size() > 1) {
+    // [GNU] reports the extra operand as "not allowed with -c" for every
+    // check-mode variant, including -C and --check=quiet.
+    return std::unexpected("extra operand '" + cfg.files[1] +
+                           "' not allowed with -c");
+  }
+
   return cfg;
 }
 
 auto load_records(const Config& cfg) -> cp::Result<std::vector<std::string>> {
   std::vector<std::string> records;
   for (size_t i = 0; i < cfg.files.size(); ++i) {
-    auto content = read_source(cfg.files[i]);
+    auto content = (cfg.delimiter == '\0') ? read_binary_source(cfg.files[i])
+                                           : read_source(cfg.files[i]);
     if (!content) {
       return std::unexpected(content.error());
     }
@@ -1258,6 +1554,21 @@ auto load_records(const Config& cfg) -> cp::Result<std::vector<std::string>> {
   }
 
   return records;
+}
+
+auto load_record_chunks(const Config& cfg)
+    -> cp::Result<std::vector<std::vector<std::string>>> {
+  std::vector<std::vector<std::string>> chunks;
+  chunks.reserve(cfg.files.size());
+  for (size_t i = 0; i < cfg.files.size(); ++i) {
+    auto content = (cfg.delimiter == '\0') ? read_binary_source(cfg.files[i])
+                                           : read_source(cfg.files[i]);
+    if (!content) {
+      return std::unexpected(content.error());
+    }
+    chunks.push_back(split_records(*content, cfg.delimiter));
+  }
+  return chunks;
 }
 
 auto is_before(const std::string& a, const std::string& b, const Config& cfg)
@@ -1283,22 +1594,370 @@ auto check_sorted(const std::vector<std::string>& records, const Config& cfg)
   return std::nullopt;
 }
 
-auto run(const Config& cfg) -> int {
-  emit_debug_diagnostics(cfg);
+auto can_use_simple_lexical_compare(const Config& cfg) -> bool {
+  return cfg.keys.empty() && !cfg.ignore_leading_blanks &&
+         !cfg.dictionary_order && !cfg.ignore_case && !cfg.ignore_nonprinting &&
+         !cfg.numeric_sort && !cfg.version_sort && !cfg.human_numeric &&
+         !cfg.month_sort && !cfg.general_numeric && !cfg.random_sort;
+}
 
-  auto loaded = load_records(cfg);
-  if (!loaded) {
-    cp::report_custom_error(L"sort", utf8_to_wstring(loaded.error()));
+auto write_records_to_file(std::ostream& out,
+                           const std::vector<std::string>& records,
+                           char delimiter) -> void {
+  std::string output;
+  output.reserve(1024 * 1024);
+
+  auto flush = [&]() {
+    if (output.empty()) return;
+    out.write(output.data(), static_cast<std::streamsize>(output.size()));
+    output.clear();
+  };
+
+  for (const auto& rec : records) {
+    if (output.size() + rec.size() + 1 > output.capacity()) {
+      flush();
+    }
+    output.append(rec);
+    output.push_back(delimiter);
+  }
+  flush();
+  out.flush();
+}
+
+auto write_records_to_stdout(const std::vector<std::string>& records,
+                             char delimiter) -> void {
+  std::string output;
+  output.reserve(1024 * 1024);
+
+  auto flush = [&]() {
+    if (output.empty()) return;
+    safePrint(std::string_view(output.data(), output.size()));
+    output.clear();
+  };
+
+  for (const auto& rec : records) {
+    if (output.size() + rec.size() + 1 > output.capacity()) {
+      flush();
+      if (is_stdout_pipe_closed()) return;
+    }
+    output.append(rec);
+    output.push_back(delimiter);
+  }
+  flush();
+}
+
+auto split_record_views(std::string_view content, char delimiter)
+    -> std::vector<std::string_view> {
+  std::vector<std::string_view> out;
+  out.reserve(content.size() / 20);
+
+  size_t start = 0;
+  for (size_t i = 0; i < content.size(); ++i) {
+    if (content[i] == delimiter) {
+      out.emplace_back(content.substr(start, i - start));
+      start = i + 1;
+    }
+  }
+  if (start < content.size()) {
+    out.emplace_back(content.substr(start));
+  }
+  return out;
+}
+
+void write_record_views_to_file(std::ostream& out,
+                                const std::vector<std::string_view>& records,
+                                char delimiter) {
+  std::string output;
+  output.reserve(1024 * 1024);
+
+  auto flush = [&]() {
+    if (output.empty()) return;
+    out.write(output.data(), static_cast<std::streamsize>(output.size()));
+    output.clear();
+  };
+
+  for (const auto rec : records) {
+    if (output.size() + rec.size() + 1 > output.capacity()) {
+      flush();
+    }
+    output.append(rec);
+    output.push_back(delimiter);
+  }
+  flush();
+  out.flush();
+}
+
+void write_record_views_to_stdout(const std::vector<std::string_view>& records,
+                                  char delimiter) {
+  std::string output;
+  output.reserve(1024 * 1024);
+
+  auto flush = [&]() {
+    if (output.empty()) return;
+    safePrint(std::string_view(output.data(), output.size()));
+    output.clear();
+  };
+
+  for (const auto rec : records) {
+    if (output.size() + rec.size() + 1 > output.capacity()) {
+      flush();
+      if (is_stdout_pipe_closed()) return;
+    }
+    output.append(rec);
+    output.push_back(delimiter);
+  }
+  flush();
+}
+
+auto try_run_simple_lexical_block_sort(const Config& cfg)
+    -> std::optional<int> {
+  if (cfg.mode != OperationMode::Sort || !can_use_simple_lexical_compare(cfg) ||
+      cfg.merge || cfg.stable || cfg.unique || cfg.files.size() != 1) {
+    return std::nullopt;
+  }
+
+  auto content = (cfg.delimiter == '\0')
+                     ? read_binary_source(cfg.files[0])
+                     : read_simple_lexical_source(cfg.files[0]);
+  if (!content) {
+    cp::report_custom_error(L"sort", utf8_to_wstring(content.error()));
     return 2;
   }
 
-  std::vector<std::string> records = std::move(*loaded);
+  auto records = split_record_views(*content, cfg.delimiter);
+  if (cfg.reverse) {
+    std::sort(records.begin(), records.end(), std::greater<>{});
+  } else {
+    std::sort(records.begin(), records.end());
+  }
+
+  std::ofstream file_out;
+  if (!cfg.output_file.empty()) {
+    file_out.open(cfg.output_file, std::ios::binary | std::ios::trunc);
+    if (!file_out.is_open()) {
+      cp::report_custom_error(L"sort", L"cannot open output file");
+      return 2;
+    }
+    write_record_views_to_file(file_out, records, cfg.delimiter);
+  } else {
+    write_record_views_to_stdout(records, cfg.delimiter);
+  }
+  return 0;
+}
+
+struct MergeCursor {
+  size_t chunk_index = 0;
+  size_t record_index = 0;
+};
+
+auto merge_record_chunks(const Config& cfg)
+    -> cp::Result<std::vector<std::string>> {
+  auto loaded_chunks = load_record_chunks(cfg);
+  if (!loaded_chunks) return std::unexpected(loaded_chunks.error());
+
+  auto chunks = std::move(*loaded_chunks);
+  size_t total_records = 0;
+  for (const auto& chunk : chunks) total_records += chunk.size();
+
+  auto better_cursor = [&](const MergeCursor& lhs, const MergeCursor& rhs) {
+    const auto& left = chunks[lhs.chunk_index][lhs.record_index];
+    const auto& right = chunks[rhs.chunk_index][rhs.record_index];
+    if (is_before(left, right, cfg)) return true;
+    if (is_before(right, left, cfg)) return false;
+    if (lhs.chunk_index != rhs.chunk_index) {
+      return lhs.chunk_index < rhs.chunk_index;
+    }
+    return lhs.record_index < rhs.record_index;
+  };
+  auto worse_cursor = [&](const MergeCursor& lhs, const MergeCursor& rhs) {
+    return better_cursor(rhs, lhs);
+  };
+
+  std::priority_queue<MergeCursor, std::vector<MergeCursor>,
+                      decltype(worse_cursor)>
+      queue(worse_cursor);
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    if (!chunks[i].empty()) queue.push(MergeCursor{i, 0});
+  }
+
+  std::vector<std::string> records;
+  records.reserve(total_records);
+  while (!queue.empty()) {
+    auto cursor = queue.top();
+    queue.pop();
+    records.push_back(chunks[cursor.chunk_index][cursor.record_index]);
+    ++cursor.record_index;
+    if (cursor.record_index < chunks[cursor.chunk_index].size()) {
+      queue.push(cursor);
+    }
+  }
+  return records;
+}
+
+struct ExternalRun {
+  std::filesystem::path path;
+  std::ifstream input;
+  std::string current;
+  bool has_current = false;
+};
+
+auto external_sort(const Config& cfg) -> cp::Result<int> {
+  constexpr size_t kChunkBytes = 8 * 1024 * 1024;
+  std::vector<std::filesystem::path> temporary_paths;
+  std::vector<ExternalRun> runs;
+  size_t run_number = 0;
+
+  std::filesystem::path temp_dir =
+      cfg.temporary_directory_hint.empty()
+          ? std::filesystem::temp_directory_path()
+          // Wide form: the narrow path ctor decodes via the system ACP (#88).
+          : std::filesystem::path(
+                utf8_to_wstring(cfg.temporary_directory_hint));
+  auto make_run = [&](std::vector<std::string>& records) -> cp::Result<bool> {
+    if (records.empty()) return true;
+    auto before = [&](const std::string& a, const std::string& b) {
+      return is_before(a, b, cfg);
+    };
+    if (cfg.stable || cfg.unique) {
+      std::stable_sort(records.begin(), records.end(), before);
+    } else {
+      std::sort(records.begin(), records.end(), before);
+    }
+    const auto path =
+        temp_dir / ("winuxcmd-sort-" + std::to_string(GetCurrentProcessId()) +
+                    "-" + std::to_string(run_number++) + ".tmp");
+    auto output = file_io::create_binary_file(wstring_to_utf8(path.wstring()));
+    if (!output.is_open())
+      return std::unexpected("cannot create temporary file");
+    for (const auto& record : records) {
+      output.write(record.data(), static_cast<std::streamsize>(record.size()));
+      output.put(cfg.delimiter);
+    }
+    if (!output) return std::unexpected("cannot write temporary file");
+    output.close();
+    temporary_paths.push_back(path);
+    records.clear();
+    return true;
+  };
+
+  std::vector<std::string> records;
+  size_t bytes = 0;
+  auto consume = [&](std::istream& input) -> cp::Result<bool> {
+    std::string record;
+    while (std::getline(input, record, cfg.delimiter)) {
+      bytes += record.size() + 1;
+      records.push_back(std::move(record));
+      record.clear();
+      if (bytes >= kChunkBytes) {
+        auto result = make_run(records);
+        if (!result) return std::unexpected(result.error());
+        bytes = 0;
+      }
+    }
+    if (input.bad()) return std::unexpected("error reading input");
+    return true;
+  };
+
+  for (const auto& filename : cfg.files) {
+    if (filename == "-") {
+      auto stdin_content = read_source(filename);
+      if (!stdin_content) return std::unexpected(stdin_content.error());
+      std::istringstream decoded_input(*stdin_content);
+      auto result = consume(decoded_input);
+      if (!result) return std::unexpected(result.error());
+    } else {
+      auto input = file_io::open_binary_file(filename);
+      if (!input.is_open()) {
+        return std::unexpected("cannot read: " + filename + ": " +
+                               describe_input_open_failure(filename));
+      }
+      auto result = consume(input);
+      if (!result) return std::unexpected(result.error());
+    }
+  }
+  auto final_run = make_run(records);
+  if (!final_run) return std::unexpected(final_run.error());
+
+  std::ofstream output_file;
+  std::ostream* output = &std::cout;
+  int stdout_mode = -1;
+  if (!cfg.output_file.empty()) {
+    output_file = file_io::create_binary_file(cfg.output_file);
+    if (!output_file.is_open())
+      return std::unexpected("cannot open output file");
+    output = &output_file;
+  } else {
+    stdout_mode = _setmode(_fileno(stdout), _O_BINARY);
+  }
+
+  for (auto& path : temporary_paths) {
+    ExternalRun run{path,
+                    file_io::open_binary_file(wstring_to_utf8(path.wstring()))};
+    if (!run.input.is_open())
+      return std::unexpected("cannot open temporary file");
+    run.has_current =
+        static_cast<bool>(std::getline(run.input, run.current, cfg.delimiter));
+    runs.push_back(std::move(run));
+  }
+  auto less = [&](size_t left, size_t right) {
+    if (is_before(runs[left].current, runs[right].current, cfg)) return false;
+    if (is_before(runs[right].current, runs[left].current, cfg)) return true;
+    return left > right;
+  };
+  std::priority_queue<size_t, std::vector<size_t>, decltype(less)> queue(less);
+  for (size_t i = 0; i < runs.size(); ++i)
+    if (runs[i].has_current) queue.push(i);
+
+  std::string previous;
+  bool have_previous = false;
+  while (!queue.empty()) {
+    const size_t index = queue.top();
+    queue.pop();
+    auto& run = runs[index];
+    const bool duplicate =
+        have_previous &&
+        compare_records_by_sort_key(previous, run.current, cfg) == 0;
+    if (!cfg.unique || !duplicate) {
+      output->write(run.current.data(),
+                    static_cast<std::streamsize>(run.current.size()));
+      output->put(cfg.delimiter);
+      previous = run.current;
+      have_previous = true;
+    }
+    run.current.clear();
+    run.has_current =
+        static_cast<bool>(std::getline(run.input, run.current, cfg.delimiter));
+    if (run.has_current) queue.push(index);
+  }
+  output->flush();
+  runs.clear();
+  for (const auto& path : temporary_paths) std::filesystem::remove(path);
+  if (stdout_mode != -1) _setmode(_fileno(stdout), stdout_mode);
+  return 0;
+}
+
+auto run(const Config& cfg) -> int {
+  emit_debug_diagnostics(cfg);
+
+  const bool simple_lexical = can_use_simple_lexical_compare(cfg);
+  std::vector<std::string> records;
 
   if (cfg.mode != OperationMode::Sort) {
+    auto loaded = load_records(cfg);
+    if (!loaded) {
+      cp::report_custom_error(L"sort", utf8_to_wstring(loaded.error()));
+      return 2;
+    }
+    records = std::move(*loaded);
     auto disorder = check_sorted(records, cfg);
     if (disorder) {
       if (cfg.mode == OperationMode::Check) {
-        cp::report_custom_error(L"sort", L"input is not sorted");
+        const std::string input_name =
+            cfg.files.empty() ? "-" : cfg.files.front();
+        const size_t line_number = *disorder + 1;
+        std::string message = input_name + ":" + std::to_string(line_number) +
+                              ": disorder: " + records[*disorder];
+        cp::report_custom_error(L"sort", utf8_to_wstring(message));
       }
       return 1;
     }
@@ -1306,17 +1965,20 @@ auto run(const Config& cfg) -> int {
   }
 
   if (cfg.merge) {
-    // -m: merge mode. Inputs are assumed pre-sorted; use std::merge to
-    // combine them efficiently rather than a full re-sort.
-    // Since load_records() already concatenated all inputs, we perform
-    // a stable_sort which is O(n) on already-sorted data.
-    std::stable_sort(
-        records.begin(), records.end(),
-        [&](const auto& a, const auto& b) { return is_before(a, b, cfg); });
+    auto merged = merge_record_chunks(cfg);
+    if (!merged) {
+      cp::report_custom_error(L"sort", utf8_to_wstring(merged.error()));
+      return 2;
+    }
+    records = std::move(*merged);
   } else {
-    std::stable_sort(
-        records.begin(), records.end(),
-        [&](const auto& a, const auto& b) { return is_before(a, b, cfg); });
+    // External runs keep ordinary sorts bounded by a fixed memory chunk.
+    auto external = external_sort(cfg);
+    if (!external) {
+      cp::report_custom_error(L"sort", utf8_to_wstring(external.error()));
+      return 2;
+    }
+    return *external;
   }
 
   if (cfg.unique) {
@@ -1327,14 +1989,17 @@ auto run(const Config& cfg) -> int {
         unique_records.push_back(rec);
         continue;
       }
-      if (compare_records_by_sort_key(unique_records.back(), rec, cfg) != 0) {
+      const bool distinct = simple_lexical
+                                ? unique_records.back() != rec
+                                : compare_records_by_sort_key(
+                                      unique_records.back(), rec, cfg) != 0;
+      if (distinct) {
         unique_records.push_back(rec);
       }
     }
     records = std::move(unique_records);
   }
 
-  std::ostream* out = &std::cout;
   std::ofstream file_out;
   if (!cfg.output_file.empty()) {
     file_out.open(cfg.output_file, std::ios::binary | std::ios::trunc);
@@ -1342,14 +2007,10 @@ auto run(const Config& cfg) -> int {
       cp::report_custom_error(L"sort", L"cannot open output file");
       return 2;
     }
-    out = &file_out;
+    write_records_to_file(file_out, records, cfg.delimiter);
+  } else {
+    write_records_to_stdout(records, cfg.delimiter);
   }
-
-  for (const auto& rec : records) {
-    (*out) << rec;
-    (*out) << cfg.delimiter;
-  }
-  out->flush();
   return 0;
 }
 
@@ -1372,6 +2033,21 @@ REGISTER_COMMAND(sort, "sort", "sort [OPTION]... [FILE]...",
 
   auto cfg = build_config(ctx);
   if (!cfg) {
+    // [GNU] argmatch-style diagnostic for a bad --check=ARG: the rejected
+    // value, the valid-arguments list and the help hint. GNU sort exits 1
+    // here (usage(EXIT_FAILURE)), unlike the exit 2 used for other usage
+    // errors.
+    const std::string& err = cfg.error();
+    if ((err.starts_with("invalid argument '") ||
+         err.starts_with("ambiguous argument '")) &&
+        err.ends_with("' for '--check'")) {
+      safeErrorPrintLn("sort: " + err);
+      safeErrorPrintLn("Valid arguments are:");
+      safeErrorPrintLn("  - 'quiet', 'silent'");
+      safeErrorPrintLn("  - 'diagnose-first'");
+      safeErrorPrintLn("Try 'sort --help' for more information.");
+      return 1;
+    }
     cp::report_error(cfg, L"sort");
     return 2;
   }

@@ -30,6 +30,8 @@
 /// @License: MIT
 /// @Copyright: Copyright © 2026 WinuxCmd
 
+#include <clocale>
+
 #include "pch/pch.h"
 // include other header after pch.h
 #include "core/command_macros.h"
@@ -43,27 +45,49 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr SEQ_OPTIONS = std::array{
+    // [GNU]
     OPTION("-f", "--format", "use printf style floating-point FORMAT",
            STRING_TYPE),
+    // [GNU]
     OPTION("-s", "--separator", "use STRING to separate numbers", STRING_TYPE),
+    // [GNU]
+    OPTION("-t", "--terminator",
+           "use STRING to terminate the output instead of newline",
+           STRING_TYPE),
+    // [GNU]
     OPTION("-w", "--equal-width",
            "equalize width by padding with leading zeroes", BOOL_TYPE),
     // The shared option parser runs before seq can inspect operands. These
     // hidden sentinels let negative numeric operands reach seq's parser.
+    // [GNU]
     OPTION("-0", "", "", BOOL_TYPE), OPTION("-1", "", "", BOOL_TYPE),
+    // [GNU]
     OPTION("-2", "", "", BOOL_TYPE), OPTION("-3", "", "", BOOL_TYPE),
+    // [GNU]
     OPTION("-4", "", "", BOOL_TYPE), OPTION("-5", "", "", BOOL_TYPE),
+    // [GNU]
     OPTION("-6", "", "", BOOL_TYPE), OPTION("-7", "", "", BOOL_TYPE),
+    // [GNU]
     OPTION("-8", "", "", BOOL_TYPE), OPTION("-9", "", "", BOOL_TYPE),
+    // [GNU]
     OPTION("-.", "", "", BOOL_TYPE), OPTION("-+", "", "", BOOL_TYPE),
+    // [EXT]
     OPTION("--", "", "", BOOL_TYPE), OPTION("-a", "", "", BOOL_TYPE),
+    // [GNU]
     OPTION("-A", "", "", BOOL_TYPE), OPTION("-e", "", "", BOOL_TYPE),
+    // [GNU]
     OPTION("-E", "", "", BOOL_TYPE), OPTION("-F", "", "", BOOL_TYPE),
+    // [GNU]
     OPTION("-i", "", "", BOOL_TYPE), OPTION("-I", "", "", BOOL_TYPE),
+    // [GNU]
     OPTION("-n", "", "", BOOL_TYPE), OPTION("-N", "", "", BOOL_TYPE),
+    // [GNU]
     OPTION("-inf", "", "", BOOL_TYPE), OPTION("-Inf", "", "", BOOL_TYPE),
+    // [GNU]
     OPTION("-INF", "", "", BOOL_TYPE), OPTION("-infinity", "", "", BOOL_TYPE),
+    // [GNU]
     OPTION("-Infinity", "", "", BOOL_TYPE),
+    // [GNU]
     OPTION("-INFINITY", "", "", BOOL_TYPE)};
 
 namespace seq_pipeline {
@@ -72,34 +96,54 @@ namespace cp = core::pipeline;
 struct Config {
   std::string format;
   std::string separator;
+  std::string terminator;
   bool equal_width = false;
   bool fixed_default_format = true;
   int default_precision = 0;
+  // [GNU] literal text around the single conversion directive of
+  // --format, counted the way long_double_format() does (each '%%' in the
+  // literal text counts once).  Used to strip the number back out of a
+  // formatted line for the end-of-range check.
+  size_t format_prefix_len = 0;
+  size_t format_suffix_len = 0;
   double first = 1.0;
   double increment = 1.0;
   double last = 1.0;
 };
 
-auto set_error(std::string message) -> std::string_view {
-  static thread_local std::string storage;
-  storage = std::move(message);
-  return storage;
-}
-
 template <typename T>
 auto error_result(std::string message) -> cp::Result<T> {
-  return std::unexpected(set_error(std::move(message)));
+  return std::unexpected<cp::Error>(std::move(message));
 }
 
 auto parse_number(std::string_view text) -> cp::Result<double> {
   std::string value(text);
+
+  // Detect inf/infinity before strtod: on Windows/MSVC strtod may set errno
+  // to ERANGE for infinity strings, which would otherwise reject valid
+  // operands.
+  {
+    std::string lower;
+    lower.reserve(value.size());
+    for (char c : value) {
+      lower.push_back(
+          static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    if (lower == "inf" || lower == "infinity") return INFINITY;
+    if (lower == "-inf" || lower == "-infinity") return -INFINITY;
+  }
+
   char* end = nullptr;
   errno = 0;
   double parsed = std::strtod(value.c_str(), &end);
 
   if (end == value.c_str() || *end != '\0' || errno == ERANGE ||
       std::isnan(parsed)) {
-    return error_result<double>("invalid floating point argument '" + value +
+    // [GNU] message uses a colon between the argument kind and the quoted
+    // value ("invalid floating point argument: '4e4000003'"), and strtod
+    // overflow (ERANGE) must be rejected exactly like a malformed operand so
+    // out-of-range exponents never enter the loop below (#958).
+    return error_result<double>("invalid floating point argument: '" + value +
                                 "'");
   }
 
@@ -109,8 +153,37 @@ auto parse_number(std::string_view text) -> cp::Result<double> {
 auto decimal_precision(std::string_view text) -> std::optional<int> {
   if (text.empty()) return std::nullopt;
 
-  if (text.find_first_of("eE") != std::string_view::npos) {
-    return std::nullopt;
+  // [GNU] scientific-notation operands still yield a fixed-point default
+  // format: precision is the mantissa's fractional digit count adjusted by
+  // the exponent (8.0e-1 -> 2, 8e-1 -> 1, 1.0e5 -> 0).
+  if (auto e_pos = text.find_first_of("eE"); e_pos != std::string_view::npos) {
+    std::string_view mantissa = text.substr(0, e_pos);
+    std::string_view exp_part = text.substr(e_pos + 1);
+    long exponent = 0;
+    if (!exp_part.empty()) {
+      // from_chars does not accept a leading '+'; GNU seq does (1.0e+5).
+      if (!exp_part.empty() && exp_part.front() == '+') {
+        exp_part.remove_prefix(1);
+      }
+      if (exp_part.empty()) {
+        return std::nullopt;
+      }
+      auto [ptr, ec] = std::from_chars(
+          exp_part.data(), exp_part.data() + exp_part.size(), exponent);
+      if (ec != std::errc() || ptr != exp_part.data() + exp_part.size()) {
+        return std::nullopt;
+      }
+    } else {
+      return std::nullopt;
+    }
+    auto dot = mantissa.find('.');
+    int frac = dot == std::string_view::npos
+                   ? 0
+                   : static_cast<int>(mantissa.size() - dot - 1);
+    long long adjusted = static_cast<long long>(frac) - exponent;
+    if (adjusted < 0) adjusted = 0;
+    if (adjusted > 400) adjusted = 400;
+    return static_cast<int>(adjusted);
   }
 
   auto first_digit = text.find_first_of("0123456789");
@@ -148,13 +221,13 @@ auto is_floating_conversion(char ch) -> bool {
 
 auto validate_format(std::string_view format) -> cp::Result<bool> {
   int conversions = 0;
+  const std::string fmt(format);
 
   for (size_t i = 0; i < format.size(); ++i) {
     if (format[i] != '%') continue;
     ++i;
     if (i >= format.size()) {
-      return error_result<bool>(
-          "format must contain exactly one floating-point conversion");
+      return error_result<bool>("format '" + fmt + "' ends in %");
     }
     if (format[i] == '%') continue;
 
@@ -177,20 +250,24 @@ auto validate_format(std::string_view format) -> cp::Result<bool> {
     }
 
     if (i >= format.size() || !is_floating_conversion(format[i])) {
-      return error_result<bool>(
-          "format must contain exactly one floating-point conversion");
+      // GNU names the offending conversion: "format 'x' has unknown %d
+      // directive".  A dangling specifier reports like the bare '%' case.
+      if (i >= format.size()) {
+        return error_result<bool>("format '" + fmt + "' ends in %");
+      }
+      return error_result<bool>("format '" + fmt + "' has unknown %" +
+                                std::string(1, format[i]) + " directive");
     }
 
     ++conversions;
     if (conversions > 1) {
-      return error_result<bool>(
-          "format must contain exactly one floating-point conversion");
+      return error_result<bool>("format '" + fmt +
+                                "' has too many % directives");
     }
   }
 
   if (conversions != 1) {
-    return error_result<bool>(
-        "format must contain exactly one floating-point conversion");
+    return error_result<bool>("format '" + fmt + "' has no % directive");
   }
 
   return true;
@@ -212,6 +289,7 @@ auto build_config(const CommandContext<SEQ_OPTIONS.size()>& ctx)
     -> cp::Result<Config> {
   Config cfg;
   cfg.separator = "\n";
+  cfg.terminator = "\n";
   std::vector<std::string_view> operands;
 
   bool parsing_options = true;
@@ -238,12 +316,33 @@ auto build_config(const CommandContext<SEQ_OPTIONS.size()>& ctx)
       }
 
       if (arg.starts_with("-s") && arg.size() > 2) {
-        cfg.separator = std::string(arg.substr(2));
+        // Handle both -sVALUE and -s=VALUE forms.
+        cfg.separator =
+            std::string(arg[2] == '=' ? arg.substr(3) : arg.substr(2));
         continue;
       }
 
       if (arg.starts_with("--separator=")) {
         cfg.separator = std::string(arg.substr(12));
+        continue;
+      }
+
+      if (arg == "-t" || arg == "--terminator") {
+        auto value = read_option_value(ctx.raw_args, i, "", false, arg);
+        if (!value) return std::unexpected(value.error());
+        cfg.terminator = *value;
+        continue;
+      }
+
+      if (arg.starts_with("-t") && arg.size() > 2) {
+        // Handle both -tVALUE and -t=VALUE forms.
+        cfg.terminator =
+            std::string(arg[2] == '=' ? arg.substr(3) : arg.substr(2));
+        continue;
+      }
+
+      if (arg.starts_with("--terminator=")) {
+        cfg.terminator = std::string(arg.substr(13));
         continue;
       }
 
@@ -255,7 +354,8 @@ auto build_config(const CommandContext<SEQ_OPTIONS.size()>& ctx)
       }
 
       if (arg.starts_with("-f") && arg.size() > 2) {
-        cfg.format = std::string(arg.substr(2));
+        // Handle both -fVALUE and -f=VALUE forms.
+        cfg.format = std::string(arg[2] == '=' ? arg.substr(3) : arg.substr(2));
         continue;
       }
 
@@ -267,7 +367,6 @@ auto build_config(const CommandContext<SEQ_OPTIONS.size()>& ctx)
       return error_result<Config>("invalid option '" + std::string(arg) + "'");
     }
 
-    parsing_options = false;
     operands.push_back(arg);
   }
 
@@ -302,28 +401,80 @@ auto build_config(const CommandContext<SEQ_OPTIONS.size()>& ctx)
     cfg.increment = *increment;
     cfg.last = *last;
   } else {
-    return std::unexpected("extra operand");
+    return error_result<Config>("extra operand '" + std::string(operands[3]) +
+                                "'");
   }
 
   if (cfg.increment == 0.0) {
-    return error_result<Config>("invalid zero increment value '" +
+    return error_result<Config>("invalid Zero increment value: '" +
                                 std::string(operands[num_args == 3 ? 1 : 0]) +
                                 "'");
+  }
+
+  // Pre-compute the iteration count to guard against infinite loops caused by
+  // extremely small increments (e.g. seq 0 1e-20 1 would otherwise loop ~10^20
+  // times). Reject sequences with more than ~10^9 iterations.
+  {
+    const double count = (cfg.last - cfg.first) / cfg.increment + 1.0;
+    if (count > 1e9) {
+      return error_result<Config>("too many iterations");
+    }
   }
 
   if (!cfg.format.empty()) {
     auto format = validate_format(cfg.format);
     if (!format) return std::unexpected(format.error());
+
+    // [GNU] record the literal prefix/suffix lengths of the validated
+    // format so the generated text can be split into decoration and the
+    // numeric part again (see print_numbers() in GNU seq.c).
+    const std::string& f = cfg.format;
+    size_t i = 0;
+    for (; i < f.size() && !(f[i] == '%' && f[i + 1] != '%');
+         i += (f[i] == '%') + 1) {
+      ++cfg.format_prefix_len;
+    }
+    ++i;  // skip '%'
+    while (i < f.size() &&
+           std::string_view("-+ #0'").find(f[i]) != std::string_view::npos) {
+      ++i;
+    }
+    while (i < f.size() &&
+           std::isdigit(static_cast<unsigned char>(f[i])) != 0) {
+      ++i;
+    }
+    if (i < f.size() && f[i] == '.') {
+      ++i;
+      while (i < f.size() &&
+             std::isdigit(static_cast<unsigned char>(f[i])) != 0) {
+        ++i;
+      }
+    }
+    ++i;  // skip the conversion character (validate_format ensured it)
+    for (; i < f.size(); i += (f[i] == '%') + 1) {
+      ++cfg.format_suffix_len;
+    }
   }
 
-  for (auto operand : operands) {
-    auto precision = decimal_precision(operand);
+  if (cfg.equal_width && !cfg.format.empty()) {
+    return error_result<Config>(
+        "format string may not be specified when printing equal width strings");
+  }
+
+  // [GNU] get_default_format: the default precision is the maximum of
+  // FIRST's and INCREMENT's precision only; LAST's precision never widens
+  // the output (seq 1.5 prints "1", seq 0.5 1.55 prints "0.5 1.5").
+  // LAST still decides whether the fixed-point default format applies.
+  for (size_t k = 0; k < operands.size(); ++k) {
+    auto precision = decimal_precision(operands[k]);
     if (!precision) {
       cfg.fixed_default_format = false;
       cfg.default_precision = 0;
       break;
     }
-    cfg.default_precision = std::max(cfg.default_precision, *precision);
+    if (k + 1 < operands.size()) {
+      cfg.default_precision = std::max(cfg.default_precision, *precision);
+    }
   }
 
   return cfg;
@@ -365,61 +516,92 @@ auto zero_pad(std::string value, size_t width) -> std::string {
 }
 
 auto run(const Config& cfg) -> int {
-  // Determine direction
-  bool increasing = (cfg.increment > 0);
+  // Ensure C locale for consistent numeric formatting (decimal point '.')
+  setlocale(LC_NUMERIC, "C");
 
-  // Determine if we should output anything
-  bool should_output = false;
-  if (increasing) {
-    should_output = (cfg.first <= cfg.last);
-  } else {
-    should_output = (cfg.first >= cfg.last);
-  }
+  const bool increasing = (cfg.increment > 0);
+  const auto in_range = [&](double x) {
+    return increasing ? x <= cfg.last : x >= cfg.last;
+  };
 
-  if (!should_output) {
+  if (!in_range(cfg.first)) {
     return 0;
   }
 
-  // Generate sequence
-  SmallVector<std::string, 1024> results;
-  double current = cfg.first;
-  int count = 0;
-  const int MAX_COUNT = 1000000;  // Prevent infinite loops
+  // [GNU] The value after LAST is printed anyway when its formatted text
+  // parses back to exactly LAST and differs from the previous item.  This
+  // rescues sequences such as `seq 1 0.1 1.3` where binary rounding pushes
+  // the mathematical endpoint slightly past LAST (uutils #7186).
+  const auto formatted_value = [&](const std::string& text) -> double {
+    std::string_view middle(text);
+    if (cfg.format_prefix_len + cfg.format_suffix_len <= middle.size()) {
+      middle.remove_prefix(cfg.format_prefix_len);
+      middle.remove_suffix(cfg.format_suffix_len);
+    }
+    return std::strtod(std::string(middle).c_str(), nullptr);
+  };
+
+  // Returns true when NEXT is the rescued endpoint that must still print.
+  const auto print_extra_number = [&](double next, double prev) -> bool {
+    const std::string next_str = format_number(next, cfg);
+    if (formatted_value(next_str) != cfg.last) return false;
+    return next_str != format_number(prev, cfg);
+  };
+
+  // For equal-width mode, first pass to find max width (no storage)
   size_t max_width = 0;
-
-  while ((increasing && current <= cfg.last) ||
-         (!increasing && current >= cfg.last)) {
-    if (count >= MAX_COUNT) {
-      break;
-    }
-
-    auto formatted = format_number(current, cfg);
-    max_width = std::max(max_width, formatted.size());
-    results.push_back(std::move(formatted));
-    current += cfg.increment;
-    count++;
-  }
-
   if (cfg.equal_width && cfg.format.empty()) {
-    for (auto& result : results) {
-      result = zero_pad(std::move(result), max_width);
+    double current = cfg.first;
+    for (double i = 1;; ++i) {
+      const double prev = current;
+      max_width = std::max(max_width, format_number(current, cfg).size());
+      const double next = cfg.first + i * cfg.increment;
+      if (!std::isfinite(next) || !in_range(next)) {
+        if (std::isfinite(next) && print_extra_number(next, prev)) {
+          max_width = std::max(max_width, format_number(next, cfg).size());
+        }
+        break;
+      }
+      current = next;
     }
   }
 
-  // Output results
-  for (size_t i = 0; i < results.size(); ++i) {
-    safePrint(results[i]);
-    if (i < results.size() - 1) {
+  // Second pass: generate and output incrementally (streaming, no memory
+  // blowup).  [GNU] iterates x = first + i*step which is mathematically
+  // equivalent to x += step but less subject to accumulated rounding error.
+  bool first_item = true;
+  double current = cfg.first;
+  const auto emit = [&](double x) {
+    std::string formatted = format_number(x, cfg);
+    if (cfg.equal_width && cfg.format.empty()) {
+      formatted = zero_pad(std::move(formatted), max_width);
+    }
+    if (!first_item) {
       safePrint(cfg.separator);
     }
+    safePrint(formatted);
+    first_item = false;
+  };
+
+  for (double i = 1;; ++i) {
+    const double prev = current;
+    emit(current);
+
+    const double next = cfg.first + i * cfg.increment;
+    if (!std::isfinite(next)) {
+      break;
+    }
+    if (!in_range(next)) {
+      if (print_extra_number(next, prev)) {
+        emit(next);
+      }
+      break;
+    }
+    current = next;
   }
 
-  if (!results.empty()) {
-    if (cfg.separator != "\n") {
-      safePrintLn("");
-    } else {
-      safePrintLn("");  // Always add final newline
-    }
+  if (!first_item) {
+    safePrint(cfg.terminator);
   }
 
   return 0;
@@ -443,7 +625,18 @@ REGISTER_COMMAND(seq, "seq",
 
   auto cfg_result = build_config(ctx);
   if (!cfg_result) {
+    if (cfg_result.error() == "missing operand") {
+      safeErrorPrintLn("seq: missing operand");
+      safeErrorPrintLn("Try 'seq --help' for more information.");
+      return 1;
+    }
+    if (cfg_result.error().starts_with("extra operand '")) {
+      cp::report_error(cfg_result, L"seq");
+      safeErrorPrintLn("Try 'seq --help' for more information.");
+      return 1;
+    }
     cp::report_error(cfg_result, L"seq");
+    safeErrorPrintLn("Try 'seq --help' for more information.");
     return 1;
   }
 

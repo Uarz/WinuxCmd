@@ -17,20 +17,39 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr CUT_OPTIONS = std::array{
+    // [GNU]
     OPTION("-b", "--bytes", "select only these bytes", STRING_TYPE),
+    // [GNU]
     OPTION("-c", "--characters", "select only these characters", STRING_TYPE),
+    // [GNU]
     OPTION("-d", "--delimiter", "use DELIM instead of TAB for field delimiter",
            STRING_TYPE),
+    // [GNU]
+    OPTION("-w", "--whitespace-delimited",
+           "use runs of spaces/tabs as field delimiters [=trimmed]",
+           OPTIONAL_STRING_TYPE),
+    // [GNU]
     OPTION("-f", "--fields", "select only these fields", STRING_TYPE),
+    // [GNU]
+    OPTION("-F", "", "like -f, but also implies -w and -O ' '", STRING_TYPE),
+    // [GNU]
     OPTION("", "--complement",
            "complement the set of selected bytes, characters or fields"),
+    // [DIFFERS] GNU: -n is "(ignored)"; WinuxCmd: --no-partial has actual
+    // behavior
     OPTION("-n", "--no-partial",
-           "do not split multibyte characters in byte mode"),
+           "do not split multibyte characters in byte mode [DIFFERS: GNU "
+           "ignores -n]"),
+    // [GNU]
     OPTION("-s", "--only-delimited",
            "do not print lines not containing delimiter"),
+    // [GNU]
     OPTION("-O", "--output-delimiter", "use STRING as the output delimiter",
            STRING_TYPE),
-    OPTION("-z", "--zero-terminated", "line delimiter is NUL, not newline")};
+    // [GNU]
+    OPTION("-z", "--zero-terminated", "line delimiter is NUL, not newline"),
+    // [DIFFERS] GNU has no portable Windows equivalent for this option.
+    OPTION("-M", "", "compatibility option; not supported on Windows")};
 
 namespace cut_pipeline {
 namespace cp = core::pipeline;
@@ -45,6 +64,8 @@ enum class Mode { bytes, characters, fields };
 struct Config {
   Mode mode = Mode::fields;
   char delimiter = '\t';
+  bool whitespace_delimited = false;
+  bool trim_outer_whitespace = false;
   std::string output_delimiter;
   bool output_delimiter_set = false;
   bool complement = false;
@@ -55,13 +76,24 @@ struct Config {
   std::vector<std::string> files;
 };
 
-auto parse_range_token(std::string_view tok) -> cp::Result<Range> {
+auto numbered_from_one_error(Mode mode) -> cp::Error {
+  if (mode == Mode::fields) {
+    return "fields are numbered from 1";
+  }
+  return "byte/character positions are numbered from 1";
+}
+
+auto parse_range_token(std::string_view tok, Mode mode) -> cp::Result<Range> {
+  if (tok.empty()) {
+    return std::unexpected(numbered_from_one_error(mode));
+  }
+
   auto pos = tok.find('-');
   if (pos == std::string_view::npos) {
     int v = 0;
     auto [ptr, ec] = std::from_chars(tok.data(), tok.data() + tok.size(), v);
     if (ec != std::errc() || ptr != tok.data() + tok.size() || v <= 0) {
-      return std::unexpected("invalid range");
+      return std::unexpected(numbered_from_one_error(mode));
     }
     return Range{v, v};
   }
@@ -76,7 +108,7 @@ auto parse_range_token(std::string_view tok) -> cp::Result<Range> {
     auto [ptr, ec] =
         std::from_chars(left.data(), left.data() + left.size(), start);
     if (ec != std::errc() || ptr != left.data() + left.size() || start <= 0) {
-      return std::unexpected("invalid range");
+      return std::unexpected(numbered_from_one_error(mode));
     }
   }
 
@@ -84,7 +116,7 @@ auto parse_range_token(std::string_view tok) -> cp::Result<Range> {
     auto [ptr, ec] =
         std::from_chars(right.data(), right.data() + right.size(), end);
     if (ec != std::errc() || ptr != right.data() + right.size() || end <= 0) {
-      return std::unexpected("invalid range");
+      return std::unexpected(numbered_from_one_error(mode));
     }
   }
 
@@ -92,7 +124,8 @@ auto parse_range_token(std::string_view tok) -> cp::Result<Range> {
   return Range{start, end};
 }
 
-auto parse_fields(std::string_view list) -> cp::Result<std::vector<Range>> {
+auto parse_fields(std::string_view list, Mode mode)
+    -> cp::Result<std::vector<Range>> {
   if (list.empty()) return std::unexpected("missing fields list");
 
   std::vector<Range> ranges;
@@ -102,7 +135,7 @@ auto parse_fields(std::string_view list) -> cp::Result<std::vector<Range>> {
     std::string_view tok = (pos == std::string_view::npos)
                                ? list.substr(start)
                                : list.substr(start, pos - start);
-    auto r = parse_range_token(tok);
+    auto r = parse_range_token(tok, mode);
     if (!r) return std::unexpected(r.error());
     ranges.push_back(*r);
     if (pos == std::string_view::npos) break;
@@ -148,31 +181,86 @@ auto is_whole_span_selected(size_t first_byte, size_t last_byte,
   return false;
 }
 
-auto read_source(std::string_view path) -> cp::Result<std::string> {
-  if (path == "-") {
-    return std::string(std::istreambuf_iterator<char>(std::cin),
-                       std::istreambuf_iterator<char>());
+auto cut_input_open_error(std::string_view input_path) -> std::string {
+  std::error_code ec;
+  if (std::filesystem::is_directory(std::filesystem::u8path(input_path), ec) &&
+      !ec) {
+    return "cannot open '" + std::string(input_path) +
+           "' for reading: Is a directory";
   }
-  std::ifstream in(std::string(path), std::ios::binary);
-  if (!in.is_open()) {
-    return std::unexpected("cannot open '" + std::string(path) + "'");
+
+  return "cannot open '" + std::string(input_path) +
+         "' for reading: No such file or directory";
+}
+
+// Bytes of pending output allowed to accumulate before a flush. Output is
+// emitted in bounded chunks as records are processed, so downstream
+// consumers (e.g. `head`) see data immediately and a closed pipe is
+// detected while the producer may still be streaming input.
+constexpr size_t kOutputFlushThreshold = 64 * 1024;
+
+// Returns the process exit code when output can no longer continue, or
+// std::nullopt while streaming may proceed. A closed downstream pipe is a
+// quiet exit like GNU's SIGPIPE death; any other stdout write failure is a
+// fatal "write error" diagnostic with exit code 1.
+auto stop_status() -> std::optional<int> {
+  if (is_stdout_pipe_closed()) return 0;
+  if (is_stdout_write_failed()) {
+    safeErrorPrintLn("cut: write error");
+    return 1;
   }
-  return std::string(std::istreambuf_iterator<char>(in),
-                     std::istreambuf_iterator<char>());
+  return std::nullopt;
+}
+
+// Emit buffered output through safePrint so daemon capture handles and
+// console conversion keep working, then classify the write result.
+auto flush_output(std::string& output) -> std::optional<int> {
+  if (!output.empty()) {
+    safePrint(std::string_view(output.data(), output.size()));
+    output.clear();
+  }
+  return stop_status();
 }
 
 auto build_config(const CommandContext<CUT_OPTIONS.size()>& ctx)
     -> cp::Result<Config> {
+  if (ctx.has("-M")) {
+    return std::unexpected("option -M is not supported on Windows");
+  }
+
   Config cfg;
-  if (ctx.has("--delimiter")) {
+  const bool whitespace_specified =
+      ctx.has("-w") || ctx.has("--whitespace-delimited");
+  std::string whitespace_mode =
+      ctx.get<std::string>("--whitespace-delimited", "");
+  if (whitespace_mode.empty()) whitespace_mode = ctx.get<std::string>("-w", "");
+  if (!whitespace_mode.empty()) {
+    if (whitespace_mode != "trimmed") {
+      return std::unexpected("invalid whitespace-delimited mode: " +
+                             whitespace_mode);
+    }
+    cfg.trim_outer_whitespace = true;
+  }
+
+  cfg.whitespace_delimited = whitespace_specified;
+  const bool delimiter_specified = ctx.has("--delimiter");
+  if (delimiter_specified && whitespace_specified) {
+    return std::unexpected(
+        "Only one of --delimiter (-d) or -w option can be specified");
+  }
+  if (delimiter_specified) {
     std::string delim = ctx.get<std::string>("--delimiter", "");
-    if (delim.size() > 1) return std::unexpected("delimiter must be one char");
+    if (delim.size() > 1) {
+      return std::unexpected("the delimiter must be a single character");
+    }
     cfg.delimiter = delim.empty() ? '\0' : delim[0];
   }
   cfg.output_delimiter.clear();
   std::string out_delim = ctx.get<std::string>("--output-delimiter", "");
   cfg.output_delimiter_set = ctx.has("--output-delimiter");
-  if (cfg.output_delimiter_set) cfg.output_delimiter = out_delim;
+  if (cfg.output_delimiter_set) {
+    cfg.output_delimiter = out_delim.empty() ? std::string(1, '\0') : out_delim;
+  }
 
   cfg.only_delimited =
       ctx.get<bool>("--only-delimited", false) || ctx.get<bool>("-s", false);
@@ -188,11 +276,13 @@ auto build_config(const CommandContext<CUT_OPTIONS.size()>& ctx)
   if (characters.empty()) characters = ctx.get<std::string>("-c", "");
   std::string fields = ctx.get<std::string>("--fields", "");
   if (fields.empty()) fields = ctx.get<std::string>("-f", "");
+  std::string whitespace_fields = ctx.get<std::string>("-F", "");
 
   int mode_count = 0;
   if (!bytes.empty()) ++mode_count;
   if (!characters.empty()) ++mode_count;
   if (!fields.empty()) ++mode_count;
+  if (!whitespace_fields.empty()) ++mode_count;
   if (mode_count == 0) return std::unexpected("missing list");
   if (mode_count > 1) {
     return std::unexpected("only one of -b, -c or -f may be specified");
@@ -207,6 +297,14 @@ auto build_config(const CommandContext<CUT_OPTIONS.size()>& ctx)
     list = characters;
   } else {
     cfg.mode = Mode::fields;
+    if (!whitespace_fields.empty()) {
+      list = whitespace_fields;
+      cfg.whitespace_delimited = !delimiter_specified;
+      if (!cfg.output_delimiter_set) {
+        cfg.output_delimiter_set = true;
+        cfg.output_delimiter = " ";
+      }
+    }
   }
   if (cfg.mode != Mode::fields &&
       (ctx.has("--delimiter") || cfg.only_delimited)) {
@@ -217,7 +315,7 @@ auto build_config(const CommandContext<CUT_OPTIONS.size()>& ctx)
     return std::unexpected("-n may be specified only when operating on bytes");
   }
 
-  auto ranges = parse_fields(list);
+  auto ranges = parse_fields(list, cfg.mode);
   if (!ranges) return std::unexpected(ranges.error());
   cfg.ranges = *ranges;
 
@@ -241,16 +339,66 @@ auto build_config(const CommandContext<CUT_OPTIONS.size()>& ctx)
 
 auto cut_fields(std::string_view line, const Config& cfg) -> std::string {
   std::vector<std::string_view> fields;
-  size_t start = 0;
   bool has_delim = false;
-  for (size_t i = 0; i < line.size(); ++i) {
-    if (line[i] == cfg.delimiter) {
-      has_delim = true;
-      fields.emplace_back(line.substr(start, i - start));
-      start = i + 1;
+  if (cfg.whitespace_delimited) {
+    auto is_delim = [](char ch) { return ch == ' ' || ch == '\t'; };
+
+    size_t pos = 0;
+    if (cfg.trim_outer_whitespace) {
+      while (pos < line.size() && is_delim(line[pos])) {
+        ++pos;
+      }
+      while (pos < line.size()) {
+        size_t start = pos;
+        while (pos < line.size() && !is_delim(line[pos])) {
+          ++pos;
+        }
+        fields.emplace_back(line.substr(start, pos - start));
+        size_t blank_start = pos;
+        while (pos < line.size() && is_delim(line[pos])) {
+          ++pos;
+        }
+        if (pos >= line.size()) break;
+        if (pos > blank_start) has_delim = true;
+      }
+    } else {
+      if (!line.empty() && is_delim(line.front())) {
+        has_delim = true;
+        fields.emplace_back(line.substr(0, 0));
+        while (pos < line.size() && is_delim(line[pos])) {
+          ++pos;
+        }
+      }
+
+      while (pos < line.size()) {
+        size_t start = pos;
+        while (pos < line.size() && !is_delim(line[pos])) {
+          ++pos;
+        }
+        fields.emplace_back(line.substr(start, pos - start));
+        if (pos >= line.size()) break;
+
+        has_delim = true;
+        while (pos < line.size() && is_delim(line[pos])) {
+          ++pos;
+        }
+        if (pos >= line.size()) {
+          fields.emplace_back(line.substr(line.size(), 0));
+          break;
+        }
+      }
     }
+  } else {
+    size_t start = 0;
+    for (size_t i = 0; i < line.size(); ++i) {
+      if (line[i] == cfg.delimiter) {
+        has_delim = true;
+        fields.emplace_back(line.substr(start, i - start));
+        start = i + 1;
+      }
+    }
+    fields.emplace_back(line.substr(start));
   }
-  fields.emplace_back(line.substr(start));
 
   if (!has_delim) {
     if (cfg.only_delimited) return {};
@@ -259,9 +407,11 @@ auto cut_fields(std::string_view line, const Config& cfg) -> std::string {
 
   std::string out;
   bool first = true;
-  std::string_view delimiter = cfg.output_delimiter_set
-                                   ? std::string_view(cfg.output_delimiter)
-                                   : std::string_view(&cfg.delimiter, 1);
+  std::string_view delimiter =
+      cfg.output_delimiter_set
+          ? std::string_view(cfg.output_delimiter)
+          : (cfg.whitespace_delimited ? std::string_view("\t", 1)
+                                      : std::string_view(&cfg.delimiter, 1));
   for (int idx = 1; idx <= static_cast<int>(fields.size()); ++idx) {
     bool selected = is_selected(idx, cfg.ranges);
     if (cfg.complement) selected = !selected;
@@ -311,41 +461,125 @@ auto cut_line(std::string_view line, const Config& cfg) -> std::string {
   if (cfg.mode == Mode::fields) return cut_fields(line, cfg);
   return cut_bytes_or_characters(line, cfg);
 }
+auto record_has_field_delimiter(std::string_view rec, const Config& cfg)
+    -> bool {
+  if (cfg.whitespace_delimited) {
+    auto is_delim = [](char ch) { return ch == ' ' || ch == '\t'; };
+    size_t pos = 0;
+    if (cfg.trim_outer_whitespace) {
+      while (pos < rec.size() && is_delim(rec[pos])) ++pos;
+      bool seen_field = false;
+      while (pos < rec.size()) {
+        while (pos < rec.size() && !is_delim(rec[pos])) ++pos;
+        seen_field = true;
+        size_t blanks = pos;
+        while (pos < rec.size() && is_delim(rec[pos])) ++pos;
+        if (pos < rec.size() && seen_field && pos > blanks) return true;
+      }
+      return false;
+    }
+    return rec.find_first_of(" \t") != std::string::npos;
+  }
+  return rec.find(cfg.delimiter) != std::string::npos;
+}
 
+auto can_use_fast_field_stream(const Config& cfg) -> bool {
+  const char record_delim = cfg.zero_terminated ? '\0' : '\n';
+  return cfg.mode == Mode::fields && !cfg.whitespace_delimited &&
+         !cfg.complement && !cfg.output_delimiter_set &&
+         cfg.delimiter != record_delim;
+}
+
+auto append_fast_field_record(std::string_view rec, const Config& cfg,
+                              std::string& output) -> bool {
+  if (rec.find(cfg.delimiter) == std::string_view::npos) {
+    if (cfg.only_delimited) return false;
+    output.append(rec);
+    return true;
+  }
+  bool has_delim = false;
+  bool wrote_selected = false;
+  int field_index = 1;
+  size_t field_start = 0;
+
+  for (size_t i = 0; i <= rec.size(); ++i) {
+    if (i != rec.size() && rec[i] != cfg.delimiter) continue;
+
+    if (i != rec.size()) has_delim = true;
+    const bool selected = is_selected(field_index, cfg.ranges);
+    if (selected) {
+      if (wrote_selected) output.push_back(cfg.delimiter);
+      output.append(rec.substr(field_start, i - field_start));
+      wrote_selected = true;
+    }
+
+    ++field_index;
+    field_start = i + 1;
+  }
+
+  return true;
+}
+
+// Stream one record at a time: cut never holds more than the current
+// record plus a bounded output buffer, so `yes | cut -c1- | head -1` emits
+// immediately and exits quietly once the downstream pipe closes.
 auto run_file(const std::string& path, const Config& cfg) -> int {
-  auto content = read_source(path);
-  if (!content) {
-    cp::report_error(content, L"cut");
-    return 1;
-  }
-
-  char record_delim = cfg.zero_terminated ? '\0' : '\n';
-
-  std::vector<std::string> records;
-  size_t start = 0;
-  for (size_t i = 0; i < content->size(); ++i) {
-    if ((*content)[i] == record_delim) {
-      records.push_back(content->substr(start, i - start));
-      start = i + 1;
+  std::ifstream file;
+  std::istream* input = nullptr;
+  if (path == "-") {
+    // [GNU] closed stdin (<&-) errors "cut: -: Bad file descriptor".
+    if (file_io::stdin_is_bad()) {
+      cp::report_custom_error(L"cut", L"-: Bad file descriptor");
+      return 1;
     }
-  }
-  if (start < content->size()) {
-    records.push_back(content->substr(start));
+#ifdef _WIN32
+    // Binary mode keeps '\r', NUL records and 0x1A bytes intact; the
+    // newline path strips a trailing '\r' itself, matching file input.
+    _setmode(_fileno(stdin), _O_BINARY);
+#endif
+    input = &std::cin;
+  } else {
+    file.open(native_path::normalize_api_operand(path), std::ios::binary);
+    if (!file.is_open()) {
+      cp::report_custom_error(L"cut",
+                              utf8_to_wstring(cut_input_open_error(path)));
+      return 1;
+    }
+    input = &file;
   }
 
-  for (const auto& rec : records) {
-    auto out = cut_line(rec, cfg);
-    if (out.empty() && cfg.only_delimited &&
-        rec.find(cfg.delimiter) == std::string::npos) {
-      continue;
+  const char record_delim = cfg.zero_terminated ? '\0' : '\n';
+  const bool fast_fields = can_use_fast_field_stream(cfg);
+  std::string record;
+  std::string output;
+  output.reserve(kOutputFlushThreshold);
+
+  while (std::getline(*input, record, record_delim)) {
+    if (!cfg.zero_terminated && !record.empty() && record.back() == '\r') {
+      record.pop_back();
     }
-    safePrint(out);
-    if (cfg.zero_terminated) {
-      safePrint(char{'\0'});
+
+    bool should_emit = true;
+    if (fast_fields) {
+      should_emit = append_fast_field_record(record, cfg, output);
     } else {
-      safePrint("\n");
+      std::string out = cut_line(record, cfg);
+      if (out.empty() && cfg.only_delimited &&
+          !record_has_field_delimiter(record, cfg)) {
+        should_emit = false;
+      } else {
+        output.append(out);
+      }
+    }
+    if (!should_emit) continue;
+    output.push_back(record_delim);
+
+    if (output.size() >= kOutputFlushThreshold) {
+      if (auto rc = flush_output(output)) return *rc;
     }
   }
+
+  if (auto rc = flush_output(output)) return *rc;
   return 0;
 }
 
@@ -353,6 +587,9 @@ auto run(const Config& cfg) -> int {
   for (const auto& f : cfg.files) {
     int rc = run_file(f, cfg);
     if (rc != 0) return rc;
+    // A dead stdout ends the pipeline: remaining files would only hit the
+    // same failed writer (GNU dies on SIGPIPE mid-stream too).
+    if (auto stop = stop_status()) return *stop;
   }
   return 0;
 }
@@ -371,6 +608,13 @@ REGISTER_COMMAND(cut, "cut", "cut OPTION... [FILE]...",
 
   auto cfg = build_config(ctx);
   if (!cfg) {
+    if (cfg.error() == "the delimiter must be a single character" ||
+        cfg.error() == "fields are numbered from 1" ||
+        cfg.error() == "byte/character positions are numbered from 1") {
+      cp::report_error(cfg, L"cut");
+      safeErrorPrintLn("Try 'cut --help' for more information.");
+      return 1;
+    }
     cp::report_error(cfg, L"cut");
     return 1;
   }

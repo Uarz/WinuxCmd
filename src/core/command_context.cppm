@@ -26,6 +26,40 @@
 export module core:command_context;
 import :opt;
 
+export auto option_policy_for_command(std::string_view command)
+    -> OptionParsePolicy {
+  OptionParsePolicy policy;
+  policy.allow_unknown_short_options_as_positionals =
+      command == "printf" || command == "expr" || command == "test" ||
+      command == "[" || command == "stty" || command == "kill";
+  if (command == "timeout") {
+    policy.stop_options_after_positionals = 2;
+  }
+  if (command == "getopt") {
+    // [util-linux] getopt's own options end at the first operand
+    // (the optstring); everything after it is data to normalize.
+    policy.stop_options_after_positionals = 1;
+  }
+  // [GNU] printf.c and test.c never call getopt: "--help"/"--version" are
+  // honored only as the sole argument (handled by the dispatcher), and
+  // every other token is an operand.  Long-option tokens therefore stay
+  // literal operands instead of producing "unrecognized option" errors,
+  // and for printf everything after the format operand is data — a
+  // trailing "-v", "-5" or "--help" is an argument, not an option.  The
+  // WinuxCmd "-v" extension still parses ahead of the format.
+  if (command == "printf") {
+    policy.allow_long_options = false;
+    policy.stop_options_after_positionals = 1;
+  }
+  if (command == "test" || command == "[") {
+    policy.allow_long_options = false;
+  }
+  // [GNU] fmt's obsolete "-WIDTH" width is argv[1]-only; digit options in
+  // other positions get fmt.c's own diagnostic.
+  policy.obsolete_numeric_width_hint = command == "fmt";
+  return policy;
+}
+
 export struct StringOptionOccurrence {
   std::string_view short_name;
   std::string_view long_name;
@@ -39,6 +73,7 @@ struct CommandContext {
   ParsedOptions<N> options;
   std::vector<std::string_view> raw_args;
   std::vector<std::string_view> positionals;
+  std::string parse_error;
 
   template <typename T>
   T get(std::string_view name, T default_value) const {
@@ -75,6 +110,24 @@ struct CommandContext {
     return {};
   }
 
+  size_t count(std::initializer_list<std::string_view> names) const {
+    if (!metas) return 0;
+
+    size_t total = 0;
+    for (const auto& occurrence : options.occurrences()) {
+      if (occurrence.index >= N) continue;
+      const auto& meta = (*metas)[occurrence.index];
+
+      for (auto name : names) {
+        if (meta.long_name == name || meta.short_name == name) {
+          ++total;
+          break;
+        }
+      }
+    }
+    return total;
+  }
+
   std::vector<StringOptionOccurrence> string_occurrences(
       std::initializer_list<std::string_view> names) const {
     std::vector<StringOptionOccurrence> out;
@@ -105,8 +158,9 @@ struct CommandContext {
 export template <size_t N>
 CommandContext<N> make_context(
     std::span<std::string_view> args,
-    const std::array<cmd::meta::OptionMeta, N>& metas, bool& ok) {
-  auto parsed = parse_command(args, metas);
+    const std::array<cmd::meta::OptionMeta, N>& metas, bool& ok,
+    OptionParsePolicy policy) {
+  auto parsed = parse_command(args, metas, policy);
   ok = parsed.ok;
 
   CommandContext<N> ctx;
@@ -114,6 +168,14 @@ CommandContext<N> make_context(
   ctx.options = std::move(parsed.options);
   ctx.raw_args.assign(args.begin(), args.end());
   ctx.positionals = std::move(parsed.positionals);
+  ctx.parse_error = std::move(parsed.error_message);
 
   return ctx;
+}
+
+export template <size_t N>
+CommandContext<N> make_context(
+    std::span<std::string_view> args,
+    const std::array<cmd::meta::OptionMeta, N>& metas, bool& ok) {
+  return make_context(args, metas, ok, OptionParsePolicy{});
 }

@@ -45,12 +45,27 @@ using cmd::meta::OptionType;
 // ======================================================
 
 auto constexpr CPIO_OPTIONS =
-    std::array{OPTION("-o", "--create", "create archive"),
-               OPTION("-i", "--extract", "extract archive"),
-               OPTION("-t", "--list", "list archive contents"),
-               OPTION("-d", "", "create leading directories where needed"),
-               OPTION("-m", "", "preserve modification time"),
-               OPTION("-v", "--verbose", "verbose output")};
+    // [GNU]
+    std::array{
+        OPTION("-o", "--create", "create archive"),
+        // [GNU]
+        OPTION("-i", "--extract", "extract archive"),
+        // [GNU]
+        OPTION("-t", "--list", "list archive contents"),
+        // [GNU]
+        OPTION("-p", "--pass-through", "run in copy-pass mode"),
+        // [GNU]
+        OPTION("-d", "--make-directories",
+               "create leading directories where needed"),
+        // [GNU]
+        OPTION("-m", "--preserve-modification-time",
+               "preserve modification time"),
+        // [GNU]
+        OPTION("-v", "--verbose", "verbose output"),
+        // [GNU]
+        OPTION("-H", "--format", "use given archive FORMAT", STRING_TYPE),
+        // [GNU]
+        OPTION("-R", "--owner", "set the ownership of all files", STRING_TYPE)};
 
 // ======================================================
 // Helper functions
@@ -84,7 +99,11 @@ unsigned long long hex_to_ull(const char* str, size_t len) {
 
 // Convert number to hex string
 void ull_to_hex(unsigned long long value, char* buffer, size_t len) {
-  sprintf_s(buffer, len + 1, "%08llx", value);
+  static constexpr char kDigits[] = "0123456789abcdef";
+  for (size_t i = 0; i < len; ++i) {
+    buffer[len - 1 - i] = kDigits[value & 0x0fULL];
+    value >>= 4;
+  }
 }
 
 // Read file content
@@ -182,9 +201,12 @@ struct Config {
   bool create = false;
   bool extract = false;
   bool list = false;
+  bool pass_through = false;
   bool make_dirs = false;
   bool preserve_time = false;
   bool verbose = false;
+  std::string format;
+  std::string owner;
 };
 
 auto build_config(const CommandContext<CPIO_OPTIONS.size()>& ctx)
@@ -194,12 +216,29 @@ auto build_config(const CommandContext<CPIO_OPTIONS.size()>& ctx)
   cfg.create = ctx.get<bool>("-o", false) || ctx.get<bool>("--create", false);
   cfg.extract = ctx.get<bool>("-i", false) || ctx.get<bool>("--extract", false);
   cfg.list = ctx.get<bool>("-t", false) || ctx.get<bool>("--list", false);
-  cfg.make_dirs = ctx.get<bool>("-d", false);
-  cfg.preserve_time = ctx.get<bool>("-m", false);
+  cfg.pass_through =
+      ctx.get<bool>("-p", false) || ctx.get<bool>("--pass-through", false);
+  cfg.make_dirs =
+      ctx.get<bool>("-d", false) || ctx.get<bool>("--make-directories", false);
+  cfg.preserve_time = ctx.get<bool>("-m", false) ||
+                      ctx.get<bool>("--preserve-modification-time", false);
   cfg.verbose = ctx.get<bool>("-v", false) || ctx.get<bool>("--verbose", false);
+  cfg.format = ctx.get<std::string>("-H", "");
+  if (cfg.format.empty()) {
+    cfg.format = ctx.get<std::string>("--format", "");
+  }
+  cfg.owner = ctx.get<std::string>("-R", "");
+  if (cfg.owner.empty()) {
+    cfg.owner = ctx.get<std::string>("--owner", "");
+  }
 
-  if (!cfg.create && !cfg.extract && !cfg.list) {
-    return std::unexpected("missing option (-o/-i/-t)");
+  if (!cfg.create && !cfg.extract && !cfg.list && !cfg.pass_through) {
+    return std::unexpected("missing option (-o/-i/-t/-p)");
+  }
+
+  // -H/--format is only valid with -o/--create
+  if (!cfg.create && !cfg.format.empty()) {
+    return std::unexpected("--format is only allowed with --create");
   }
 
   return cfg;
@@ -286,6 +325,11 @@ auto run(const Config& cfg) -> int {
         archive.push_back(0);
       }
 
+      // Print verbose output in create mode
+      if (cfg.verbose) {
+        safePrintLn(line);
+      }
+
       // Add file content to archive
       if (!is_dir) {
         archive.insert(archive.end(), content.begin(), content.end());
@@ -296,24 +340,20 @@ auto run(const Config& cfg) -> int {
     }
 
     // Add end marker
+    static constexpr std::string_view kTrailerName = "TRAILER!!!";
     CpioHeader end_header;
     memcpy(end_header.magic, "070701", 6);
     memset(reinterpret_cast<char*>(&end_header) + 6, 0, sizeof(CpioHeader) - 6);
     ull_to_hex(0, end_header.inode, 8);
     ull_to_hex(0, end_header.mode, 8);
-    ull_to_hex(0, end_header.namesize, 8);
-    ull_to_hex(1, end_header.filesize, 8);  // One null byte for name
+    ull_to_hex(1, end_header.nlink, 8);
+    ull_to_hex(0, end_header.filesize, 8);
+    ull_to_hex(kTrailerName.size() + 1, end_header.namesize, 8);
+    ull_to_hex(0, end_header.check, 8);
 
     archive.insert(archive.end(), reinterpret_cast<char*>(&end_header),
                    reinterpret_cast<char*>(&end_header) + sizeof(CpioHeader));
-    archive.push_back('T');
-    archive.push_back('R');
-    archive.push_back('A');
-    archive.push_back('I');
-    archive.push_back('L');
-    archive.push_back('E');
-    archive.push_back('R');
-    archive.push_back('!');
+    archive.insert(archive.end(), kTrailerName.begin(), kTrailerName.end());
     archive.push_back('\0');
     while (archive.size() % 4 != 0) {
       archive.push_back(0);
@@ -375,10 +415,40 @@ auto run(const Config& cfg) -> int {
           pos++;
         }
 
+        // Create leading directories if -d/--make-directories
+        if (cfg.make_dirs) {
+          auto pos_sep = filename.find_last_of("/\\");
+          if (pos_sep != std::string::npos) {
+            std::string dir = filename.substr(0, pos_sep);
+            // Create directories recursively (best effort)
+            std::wstring wdir = utf8_to_wstring(dir);
+            CreateDirectoryW(wdir.c_str(), nullptr);
+          }
+        }
+
         if (!write_file(filename, content)) {
           safeErrorPrint("cpio: warning: cannot write file '");
           safeErrorPrint(filename);
           safeErrorPrintLn("'");
+        }
+
+        // Preserve modification time if -m/--preserve-modification-time
+        if (cfg.preserve_time) {
+          std::wstring wfile = utf8_to_wstring(filename);
+          HANDLE hFile =
+              CreateFileW(wfile.c_str(), GENERIC_WRITE, 0, nullptr,
+                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+          if (hFile != INVALID_HANDLE_VALUE) {
+            // Convert mtime from hex header to Windows FILETIME
+            unsigned long long mtime_val = hex_to_ull(header->mtime, 8);
+            ULARGE_INTEGER uli;
+            uli.QuadPart = mtime_val * 10000000ULL + 116444736000000000ULL;
+            FILETIME ft;
+            ft.dwLowDateTime = uli.LowPart;
+            ft.dwHighDateTime = uli.HighPart;
+            SetFileTime(hFile, nullptr, nullptr, &ft);
+            CloseHandle(hFile);
+          }
         }
       }
     }
@@ -435,6 +505,12 @@ auto run(const Config& cfg) -> int {
         pos++;
       }
     }
+  } else if (cfg.pass_through) {
+    // Copy-pass mode: read file list from stdin, copy to destination directory
+    // The first positional argument is the destination directory
+    safeErrorPrintLn(
+        "cpio: --pass-through (copy-pass) mode is not yet implemented");
+    return 1;
   }
 
   return 0;
@@ -483,7 +559,7 @@ REGISTER_COMMAND(
   if (!cfg_result) {
     safeErrorPrint("cpio: ");
     safeErrorPrintLn(cfg_result.error());
-    safePrintLn("Usage: cpio -o | cpio -i | cpio -t");
+    safePrintLn("Usage: cpio -o | cpio -i | cpio -t | cpio -p dest");
     return 1;
   }
 

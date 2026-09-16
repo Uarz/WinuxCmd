@@ -64,10 +64,15 @@ using namespace core::pipeline;
  */
 // clang-format off
 auto constexpr MKDIR_OPTIONS =
-    std::array{OPTION("-m", "--mode", "set file mode (as in chmod), not a=rwx - umask", STRING_TYPE),
+    std::array{
+               // [DIFFERS]
+               OPTION("-m", "--mode", "set file mode (as in chmod), not a=rwx - umask", STRING_TYPE),
+               // [GNU]
                OPTION("-p", "--parents", "no error if existing, make parent directories as needed"),
+               // [GNU]
                OPTION("-v", "--verbose", "print a message for each created directory"),
-               OPTION("-Z", "--context", "set SELinux security context of each created directory", OPTIONAL_STRING_TYPE)};
+               // [DIFFERS] SELinux contexts are not available on Windows; accepted as a no-op.
+               OPTION("-Z", "--context", "set SELinux security context of each created directory (ignored on Windows)", OPTIONAL_STRING_TYPE)};
 // clang-format on
 
 // ======================================================
@@ -101,8 +106,12 @@ auto check_paths(const std::vector<std::string>& paths)
  * @return true if directory was created successfully, false on error
  */
 auto create_directory_recursive(const std::wstring& wpath) -> bool {
-  std::string utf8_path = wstring_to_utf8(wpath);
-  return path::create_directories(utf8_path);
+  // [GNU] mkdir -p creates arbitrarily deep trees (GNU mkancesdirs chdirs
+  // into components, so it is not bound by PATH_MAX).  Route through a
+  // \\?\ extended-length path so Windows accepts >MAX_PATH results too
+  // (uutils#11038, issue 297).
+  return native_path::create_directories_w(
+      native_path::to_extended_path(native_path::normalize_separators(wpath)));
 }
 
 auto mode_allows_write(std::string_view mode) -> cp::Result<bool> {
@@ -139,7 +148,9 @@ auto apply_directory_mode(const std::string& path, std::string_view mode)
   auto writable = mode_allows_write(mode);
   if (!writable) return std::unexpected(writable.error());
 
-  std::wstring wpath = utf8_to_wstring(path);
+  // Extended API path so -m works on >MAX_PATH directories too (#1061).
+  const std::wstring wpath = native_path::to_extended_path(
+      native_path::strip_trailing_separators(utf8_to_wstring(path)));
   DWORD attrs = GetFileAttributesW(wpath.c_str());
   if (attrs == INVALID_FILE_ATTRIBUTES) {
     return std::unexpected("cannot read directory attributes");
@@ -162,6 +173,8 @@ auto build_config(const CommandContext<MKDIR_OPTIONS.size()>& ctx)
   cfg.parents = ctx.get<bool>("--parents", false) || ctx.get<bool>("-p", false);
   cfg.verbose = ctx.get<bool>("--verbose", false) || ctx.get<bool>("-v", false);
   if (ctx.has("--mode") || ctx.has("-m")) {
+    // [DIFFERS] - SELinux not available on Windows
+    (void)ctx.has("--context");
     std::string mode = ctx.get<std::string>("--mode", "");
     if (mode.empty()) mode = ctx.get<std::string>("-m", "");
     if (mode.empty()) return std::unexpected("invalid mode");
@@ -172,17 +185,158 @@ auto build_config(const CommandContext<MKDIR_OPTIONS.size()>& ctx)
   return cfg;
 }
 
+auto is_separator(char ch) -> bool { return ch == '\\' || ch == '/'; }
+
+auto progressive_directory_paths(std::string_view path)
+    -> std::vector<std::string>;
+
+/**
+ * @brief True when PATH names an existing non-directory object.
+ */
+auto path_exists_not_directory(const std::string& path) -> bool {
+  const auto operand = native_path::make_api_path_operand(path);
+  DWORD attrs = GetFileAttributesW(operand.extended.c_str());
+  return attrs != INVALID_FILE_ATTRIBUTES &&
+         (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+/**
+ * @brief GNU-style mkdir error for a failed -p creation.  GNU reports
+ * EEXIST ("File exists") when the final component exists as a
+ * non-directory and ENOTDIR naming the offending intermediate component
+ * when a prefix is not a directory (uutils#11038 follow-up, issue 297).
+ */
+auto report_parents_create_failure(const std::string& path) -> void {
+  const auto components = progressive_directory_paths(path);
+  for (size_t i = 0; i < components.size(); ++i) {
+    if (!path_exists_not_directory(components[i])) continue;
+    if (i + 1 == components.size()) {
+      safeErrorPrint("mkdir: cannot create directory '");
+      safeErrorPrint(components[i]);
+      safeErrorPrint("': File exists\n");
+    } else {
+      safeErrorPrint("mkdir: cannot create directory '");
+      safeErrorPrint(components[i]);
+      safeErrorPrint("': Not a directory\n");
+    }
+    return;
+  }
+  safeErrorPrint("mkdir: cannot create directory '");
+  safeErrorPrint(path);
+  safeErrorPrint("': No such file or directory\n");
+}
+
+/**
+ * @brief GNU-style mkdir error for the non -p CreateDirectoryW failure.
+ */
+auto report_create_failure(const std::string& path, DWORD error) -> void {
+  const char* reason;
+  switch (error) {
+    case ERROR_ALREADY_EXISTS:
+      reason = "File exists";
+      break;
+    case ERROR_PATH_NOT_FOUND:
+    case ERROR_FILE_NOT_FOUND:
+      reason = "No such file or directory";
+      break;
+    case ERROR_ACCESS_DENIED:
+    case ERROR_WRITE_PROTECT:
+      reason = "Permission denied";
+      break;
+    case ERROR_DIRECTORY:
+      reason = "Not a directory";
+      break;
+    case ERROR_FILENAME_EXCED_RANGE:
+      reason = "File name too long";
+      break;
+    default:
+      reason = "No such file or directory";
+      break;
+  }
+  safeErrorPrint("mkdir: cannot create directory '");
+  safeErrorPrint(path);
+  safeErrorPrint("': ");
+  safeErrorPrint(reason);
+  safeErrorPrint("\n");
+}
+
+auto directory_exists_utf8(const std::string& path) -> bool {
+  // attributes_w applies the \\?\ extended prefix, so existence checks work
+  // beyond MAX_PATH (#1061).
+  return native_path::is_directory(path);
+}
+
+auto preferred_separator(std::string_view path) -> char {
+  return path.find('/') != std::string_view::npos ? '/' : '\\';
+}
+
+auto progressive_directory_paths(std::string_view path)
+    -> std::vector<std::string> {
+  std::vector<std::string> paths;
+  if (path.empty()) return paths;
+
+  const char sep = preferred_separator(path);
+  std::string current;
+  size_t i = 0;
+
+  if (path.size() >= 2 && path[1] == ':') {
+    current = std::string(path.substr(0, 2));
+    i = 2;
+    if (i < path.size() && is_separator(path[i])) {
+      current += path[i];
+      ++i;
+    }
+  } else if (path.size() >= 2 && is_separator(path[0]) &&
+             is_separator(path[1])) {
+    // UNC path (\\server\share)
+    current = std::string(path.substr(0, 2));
+    i = 2;
+    // Include the server name and share name as part of the base path
+    while (i < path.size() && !is_separator(path[i])) {
+      current += path[i];
+      ++i;
+    }
+    if (i < path.size() && is_separator(path[i])) {
+      current += path[i];
+      ++i;
+    }
+    // Include the share name
+    while (i < path.size() && !is_separator(path[i])) {
+      current += path[i];
+      ++i;
+    }
+    // [GNU] For UNC paths, the share itself is the base directory
+    paths.push_back(current);
+  } else if (is_separator(path[0])) {
+    current = std::string(1, path[0]);
+    while (i < path.size() && is_separator(path[i])) ++i;
+  }
+
+  while (i < path.size()) {
+    while (i < path.size() && is_separator(path[i])) ++i;
+    size_t segment_start = i;
+    while (i < path.size() && !is_separator(path[i])) ++i;
+    if (segment_start == i) break;
+    if (!current.empty() && !is_separator(current.back())) current += sep;
+    current.append(path.substr(segment_start, i - segment_start));
+    paths.push_back(current);
+  }
+
+  return paths;
+}
+
 auto create_directory(const std::string& path, const Config& config) -> bool {
   std::wstring wpath = utf8_to_wstring(path);
-  bool existed_before =
-      std::filesystem::is_directory(std::filesystem::path(path));
+  bool existed_before = directory_exists_utf8(path);
 
   if (config.parents) {
+    std::vector<std::pair<std::string, bool>> creation_state;
+    for (const auto& candidate : progressive_directory_paths(path)) {
+      creation_state.emplace_back(candidate, directory_exists_utf8(candidate));
+    }
+
     if (!create_directory_recursive(wpath)) {
-      // OPTIMIZED: Use string literals instead of wstring concatenation
-      safeErrorPrint("mkdir: cannot create directory '");
-      safeErrorPrint(path);
-      safeErrorPrint("': No such file or directory\n");
+      report_parents_create_failure(path);
       return false;
     }
     if (config.mode && !existed_before) {
@@ -197,24 +351,22 @@ auto create_directory(const std::string& path, const Config& config) -> bool {
       }
     }
     if (config.verbose) {
-      safePrint("mkdir: created directory '");
-      safePrint(path);
-      safePrint("'\n");
+      for (const auto& [candidate, existed] : creation_state) {
+        if (!existed && directory_exists_utf8(candidate)) {
+          safePrint("mkdir: created directory '");
+          safePrint(candidate);
+          safePrint("'\n");
+        }
+      }
     }
   } else {
-    if (!CreateDirectoryW(wpath.c_str(), NULL)) {
-      DWORD error = GetLastError();
-      if (error == ERROR_ALREADY_EXISTS) {
-        safeErrorPrint("mkdir: cannot create directory '");
-        safeErrorPrint(path);
-        safeErrorPrint("': File exists\n");
-        return false;
-      } else {
-        safeErrorPrint("mkdir: cannot create directory '");
-        safeErrorPrint(path);
-        safeErrorPrint("': No such file or directory\n");
-        return false;
-      }
+    // Extended API path for >MAX_PATH operands (#1061); trailing separators
+    // are stripped because the \\?\ namespace rejects them on create.
+    const std::wstring api_path = native_path::to_extended_path(
+        native_path::strip_trailing_separators(std::wstring_view(wpath)));
+    if (!CreateDirectoryW(api_path.c_str(), NULL)) {
+      report_create_failure(path, GetLastError());
+      return false;
     }
     if (config.mode) {
       auto mode_result = apply_directory_mode(path, *config.mode);
@@ -235,7 +387,6 @@ auto create_directory(const std::string& path, const Config& config) -> bool {
   }
   return true;
 }
-
 /**
  * @brief Process all paths
  * @param paths Paths to process
@@ -299,6 +450,11 @@ REGISTER_COMMAND(
 
   auto result = process_command(ctx);
   if (!result) {
+    if (result.error() == "missing operand") {
+      safeErrorPrintLn("mkdir: missing operand");
+      safeErrorPrintLn("Try 'mkdir --help' for more information.");
+      return 1;
+    }
     cp::report_error(result, L"mkdir");
     return 1;
   }

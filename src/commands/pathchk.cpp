@@ -45,8 +45,13 @@ using cmd::meta::OptionType;
 // ======================================================
 
 auto constexpr PATHCHK_OPTIONS = std::array{
-    OPTION("-p", "--portability", "check for all POSIX systems"),
-    OPTION("-P", "--posix", "check for empty names and leading \"-\"")};
+    // [GNU] -p: check for most POSIX systems (no long form in GNU)
+    OPTION("-p", "", "check for most POSIX systems"),
+    // [GNU] -P: check for empty names and leading dash (no long form in GNU)
+    OPTION("-P", "", "check for empty names and leading dash"),
+    // [GNU] --portability: equivalent to -p -P combined (no short form in GNU)
+    OPTION("", "--portability",
+           "check for all POSIX systems (equivalent to -p -P)")};
 
 // ======================================================
 // Helper functions
@@ -78,14 +83,8 @@ bool has_empty_or_leading_dash_component(const std::string& path) {
   if (path.empty()) return true;
 
   auto components = split_components(path, true);
-  for (size_t i = 0; i < components.size(); ++i) {
-    const auto& component = components[i];
-    if (component.empty()) {
-      bool leading_root =
-          i == 0 && !path.empty() && (path[0] == '/' || path[0] == '\\');
-      if (!leading_root) return true;
-      continue;
-    }
+  for (const auto& component : components) {
+    if (component.empty()) continue;
     if (component.front() == '-') return true;
   }
   return false;
@@ -95,9 +94,15 @@ bool has_empty_or_leading_dash_component(const std::string& path) {
 auto windows_path_error(const std::string& path) -> std::optional<std::string> {
   if (path.empty()) return "empty file name";
 
+  bool has_drive_prefix = path.size() >= 2 &&
+                          std::isalpha(static_cast<unsigned char>(path[0])) &&
+                          path[1] == ':';
+
   // Check for invalid characters
   const std::string invalid_chars = "<>:\"|?*";
-  for (char c : path) {
+  for (size_t i = 0; i < path.size(); ++i) {
+    char c = path[i];
+    if (has_drive_prefix && i == 1) continue;
     if (invalid_chars.find(c) != std::string::npos) {
       return "invalid Windows filename";
     }
@@ -172,9 +177,8 @@ REGISTER_COMMAND(
     /* options */ PATHCHK_OPTIONS) {
   bool check_portability =
       ctx.get<bool>("-p", false) || ctx.get<bool>("--portability", false);
-  bool check_leading_dash = ctx.get<bool>("-P", false) ||
-                            ctx.get<bool>("--posix", false) ||
-                            ctx.get<bool>("--portability", false);
+  bool check_leading_dash =
+      ctx.get<bool>("-P", false) || ctx.get<bool>("--portability", false);
   if (!check_portability && !check_leading_dash &&
       std::getenv("POSIXLY_CORRECT") == nullptr) {
     check_leading_dash = true;
@@ -182,7 +186,7 @@ REGISTER_COMMAND(
 
   if (ctx.positionals.empty()) {
     safeErrorPrintLn("pathchk: missing operand");
-    safePrintLn("Try 'pathchk --help' for more information.");
+    safeErrorPrintLn("Try 'pathchk --help' for more information.");
     return 1;
   }
 
@@ -192,7 +196,14 @@ REGISTER_COMMAND(
     std::string path_str(path);
     std::optional<std::string> error_msg;
 
-    if (check_leading_dash && has_empty_or_leading_dash_component(path_str)) {
+    if (path_str.empty() && !check_portability && !ctx.get<bool>("-P", false) &&
+        !ctx.get<bool>("--portability", false) &&
+        std::getenv("POSIXLY_CORRECT") == nullptr) {
+      error_msg = "No such file or directory";
+    }
+
+    if (!error_msg && check_leading_dash &&
+        has_empty_or_leading_dash_component(path_str)) {
       error_msg = "empty file name or leading '-'";
     }
 
@@ -205,7 +216,7 @@ REGISTER_COMMAND(
     }
 
     if (error_msg) {
-      safeErrorPrintLn("pathchk: '" + path_str + "' - " + *error_msg);
+      safeErrorPrintLn("pathchk: '" + path_str + "': " + *error_msg);
       exit_code = 1;
     }
   }

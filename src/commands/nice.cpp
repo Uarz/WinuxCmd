@@ -45,32 +45,11 @@ using cmd::meta::OptionType;
 // ======================================================
 
 auto constexpr NICE_OPTIONS =
-    std::array{OPTION("-n", "--adjustment", "adjust increment", INT_TYPE)};
+    // [DIFFERS]
+    std::array{OPTION("-n", "--adjustment", "adjust increment", STRING_TYPE)};
 
 namespace {
-auto current_niceness() -> int {
-  switch (GetPriorityClass(GetCurrentProcess())) {
-    case HIGH_PRIORITY_CLASS:
-      return -10;
-    case ABOVE_NORMAL_PRIORITY_CLASS:
-      return -5;
-    case BELOW_NORMAL_PRIORITY_CLASS:
-      return 10;
-    case IDLE_PRIORITY_CLASS:
-      return 19;
-    case NORMAL_PRIORITY_CLASS:
-    default:
-      return 0;
-  }
-}
-
-auto priority_class_for_niceness(int niceness) -> DWORD {
-  if (niceness <= -10) return HIGH_PRIORITY_CLASS;
-  if (niceness < 0) return ABOVE_NORMAL_PRIORITY_CLASS;
-  if (niceness >= 19) return IDLE_PRIORITY_CLASS;
-  if (niceness >= 10) return BELOW_NORMAL_PRIORITY_CLASS;
-  return NORMAL_PRIORITY_CLASS;
-}
+constexpr int kNiceNoOverflowBound = 50;
 
 auto nice_command_status_from_create_error(DWORD error) -> int {
   switch (error) {
@@ -80,6 +59,33 @@ auto nice_command_status_from_create_error(DWORD error) -> int {
     default:
       return 126;
   }
+}
+
+auto nice_windows_error_text(DWORD error) -> std::string {
+  return win32_posix_error_text(error);
+}
+
+auto parse_adjustment_value(std::string_view raw) -> std::optional<int> {
+  if (raw.empty()) {
+    return std::nullopt;
+  }
+
+  int value = 0;
+  auto [ptr, ec] = std::from_chars(raw.data(), raw.data() + raw.size(), value);
+  if (ec == std::errc::result_out_of_range) {
+    bool negative = raw.front() == '-';
+    return negative ? -kNiceNoOverflowBound : kNiceNoOverflowBound;
+  }
+  if (ec != std::errc() || ptr != raw.data() + raw.size()) {
+    return std::nullopt;
+  }
+
+  return value;
+}
+
+auto build_command_line(std::span<const std::string_view> args)
+    -> std::wstring {
+  return build_windows_command_line(args);
 }
 }  // namespace
 
@@ -105,46 +111,51 @@ REGISTER_COMMAND(
     /* copyright */ "Copyright © 2026 WinuxCmd",
     /* options */ NICE_OPTIONS) {
   int adjustment = 10;  // Default adjustment
+  bool has_explicit_adjustment = false;
 
   // Parse adjustment option
-  constexpr int kNoAdjustment = std::numeric_limits<int>::min();
-  int parsed_adjustment = ctx.get<int>("-n", kNoAdjustment);
-  if (parsed_adjustment == kNoAdjustment) {
-    parsed_adjustment = ctx.get<int>("--adjustment", kNoAdjustment);
+  std::string parsed_adjustment = ctx.get<std::string>("-n", "");
+  if (parsed_adjustment.empty()) {
+    parsed_adjustment = ctx.get<std::string>("--adjustment", "");
   }
-  if (parsed_adjustment != kNoAdjustment) {
-    adjustment = parsed_adjustment;
+  if (!parsed_adjustment.empty()) {
+    auto adjustment_value = parse_adjustment_value(parsed_adjustment);
+    if (!adjustment_value) {
+      safeErrorPrintLn("nice: invalid adjustment '" + parsed_adjustment + "'");
+      safeErrorPrintLn("Try 'nice --help' for more information.");
+      return 125;
+    }
+    adjustment = *adjustment_value;
+    has_explicit_adjustment = true;
   }
 
   // If no command provided, print current priority
   if (ctx.positionals.empty()) {
-    safePrintLn(std::to_string(current_niceness()));
+    if (has_explicit_adjustment) {
+      safeErrorPrintLn("nice: A command must be given with an adjustment.");
+      safeErrorPrintLn("Try 'nice --help' for more information.");
+      return 125;
+    }
+    safePrintLn(std::to_string(win32_current_niceness()));
     return 0;
-  }
-
-  // Build command string
-  std::string cmd;
-  for (size_t i = 0; i < ctx.positionals.size(); ++i) {
-    if (i > 0) cmd += " ";
-    cmd += ctx.positionals[i];
   }
 
   // Execute command with adjusted priority
   STARTUPINFOW si = {sizeof(si)};
   PROCESS_INFORMATION pi;
-
-  std::wstring wcmd = utf8_to_wstring(cmd);
+  auto cmd_line = build_command_line(ctx.positionals);
 
   // Determine priority class based on adjustment
-  int target_niceness = std::clamp(current_niceness() + adjustment, -20, 19);
-  DWORD priority_class = priority_class_for_niceness(target_niceness);
+  int target_niceness =
+      std::clamp(win32_current_niceness() + adjustment, -20, 19);
+  DWORD priority_class = win32_priority_class_for_niceness(target_niceness);
 
-  if (!CreateProcessW(nullptr, const_cast<wchar_t*>(wcmd.c_str()), nullptr,
-                      nullptr, FALSE, priority_class, nullptr, nullptr, &si,
-                      &pi)) {
+  if (!CreateProcessW(nullptr, cmd_line.data(), nullptr, nullptr, FALSE,
+                      priority_class, nullptr, nullptr, &si, &pi)) {
     DWORD error = GetLastError();
-    safeErrorPrintLn("nice: failed to execute command: " +
-                     std::string(ctx.positionals[0]));
+    safeErrorPrintLn("nice: failed to run command '" +
+                     std::string(ctx.positionals[0]) +
+                     "': " + nice_windows_error_text(error));
     return nice_command_status_from_create_error(error);
   }
 

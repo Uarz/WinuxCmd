@@ -41,16 +41,25 @@
 import std;
 import core;
 import utils;
+import container;
 
 using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr STTY_OPTIONS = std::array{
+    // [DIFFERS] -a, --all
     OPTION("-a", "--all", "print all current settings in human-readable form"),
+    // [DIFFERS] -g, --save
     OPTION("-g", "--save",
            "print all current settings in a stty-readable form"),
+    // [DIFFERS] -F, --file
     OPTION("-F", "--file", "open and use the specified device instead of stdin",
-           STRING_TYPE)};
+           STRING_TYPE),
+    // [GNU] hidden developer option, spelled "---debug" on the command
+    // line (stty.c {"-debug"}). Accepted and ignored: its only effect in
+    // GNU is dumping termios bytes when tcsetattr cannot apply a mode,
+    // which has no Windows console equivalent.
+    OPTION("", "---debug", "", BOOL_TYPE)};
 
 namespace stty_pipeline {
 namespace cp = core::pipeline;
@@ -76,7 +85,6 @@ auto build_config(const CommandContext<STTY_OPTIONS.size()>& ctx)
   for (const auto& pos : ctx.positionals) {
     cfg.settings.push_back(std::string(pos));
   }
-
   return cfg;
 }
 
@@ -152,10 +160,8 @@ void print_console_settings(HANDLE hCon) {
     safePrint(" echo");
   else
     safePrint(" -echo");
-  if (mode & ENABLE_ECHO_INPUT)
-    safePrint(" echoe");
-  else
-    safePrint(" -echoe");
+  // [GNU] echoe is not directly supported on Windows; always show as disabled
+  safePrint(" -echoe");
   if (mode & ENABLE_LINE_INPUT)
     safePrint(" echok");
   else
@@ -189,58 +195,158 @@ void print_machine_readable(HANDLE hCon) {
   // Output in stty-readable format: colon-separated hex values
   // intr:03 quit:1c erase:7f kill:15 eof:04 eol:ff eol2:ff swtch:ff
   // start:13 stop:13 susp:1a rprnt:12 werase:17 lnext:16 discard:0f
-  safePrintLn("00:0:4:7f:11:1:1:0:3:1c:15:12:16:0:f:0:1:0:0:0:0:0:0:"
-              "0:0:0:0:0:0:0:0:0:0:0:0:0");
+  safePrintLn(
+      "00:0:4:7f:11:1:1:0:3:1c:15:12:16:0:f:0:1:0:0:0:0:0:0:"
+      "0:0:0:0:0:0:0:0:0:0:0:0:0");
 }
 
-void apply_sane(HANDLE hCon) {
+bool apply_sane(HANDLE hCon) {
   // Reset to reasonable defaults
   DWORD mode = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT |
                ENABLE_ECHO_NEWLINE;
-  SetConsoleMode(hCon, mode);
-  safePrintLn("stty: 'sane' applied");
+  return SetConsoleMode(hCon, mode) != 0;
 }
 
-void apply_raw(HANDLE hCon) {
+bool apply_raw(HANDLE hCon) {
   // Disable all processing
   DWORD mode = 0;
-  SetConsoleMode(hCon, mode);
-  safePrintLn("stty: 'raw' applied");
+  return SetConsoleMode(hCon, mode) != 0;
 }
 
-void apply_cooked(HANDLE hCon) {
+bool apply_cooked(HANDLE hCon) {
   // Enable standard processing
   DWORD mode = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT;
-  SetConsoleMode(hCon, mode);
-  safePrintLn("stty: 'cooked' applied");
+  return SetConsoleMode(hCon, mode) != 0;
 }
 
-void apply_cbreak(HANDLE hCon) {
+bool apply_cbreak(HANDLE hCon) {
   // Like -icanon with min=1
   DWORD mode = ENABLE_PROCESSED_INPUT | ENABLE_ECHO_INPUT;
-  SetConsoleMode(hCon, mode);
-  safePrintLn("stty: 'cbreak' applied");
+  return SetConsoleMode(hCon, mode) != 0;
 }
 
+void print_try_help() {
+  safeErrorPrint("Try " + std::string(1, static_cast<char>(39)) +
+                 "stty --help" + std::string(1, static_cast<char>(39)) +
+                 " for more information.\n");
+}
+
+auto normalized_setting_name(const std::string& setting) -> std::string {
+  if (setting.starts_with("-") && setting != "-") {
+    return setting.substr(1);
+  }
+  return setting;
+}
+
+auto is_value_setting(const std::string& name) -> bool {
+  static const std::vector<std::string> names = {
+      "intr",    "quit",    "erase",  "kill",  "eof",   "eol",   "eol2",
+      "swtch",   "start",   "stop",   "susp",  "dsusp", "rprnt", "werase",
+      "lnext",   "discard", "status", "min",   "time",  "rows",  "cols",
+      "columns", "line",    "ispeed", "ospeed"};
+  for (const auto& candidate : names) {
+    if (name == candidate) return true;
+  }
+  return false;
+}
+
+auto is_decimal_token(const std::string& setting) -> bool {
+  if (setting.empty()) return false;
+  for (unsigned char ch : setting) {
+    if (!std::isdigit(ch)) return false;
+  }
+  return true;
+}
+
+auto is_known_noarg_setting(const std::string& name) -> bool {
+  static const std::vector<std::string> names = {
+      "sane",    "raw",     "cooked", "cbreak",  "ek",       "evenp",
+      "parity",  "oddp",    "nl",     "pass8",   "litout",   "decctlq",
+      "tabs",    "lcase",   "LCASE",  "crt",     "dec",      "speed",
+      "size",    "parenb",  "parodd", "cs5",     "cs6",      "cs7",
+      "cs8",     "hupcl",   "hup",    "cstopb",  "cread",    "clocal",
+      "crtscts", "ignbrk",  "brkint", "ignpar",  "parmrk",   "inpck",
+      "istrip",  "inlcr",   "igncr",  "icrnl",   "ixon",     "ixoff",
+      "tandem",  "iuclc",   "ixany",  "imaxbel", "iutf8",    "opost",
+      "olcuc",   "ocrnl",   "onlcr",  "onocr",   "onlret",   "ofill",
+      "ofdel",   "nl0",     "nl1",    "cr0",     "cr1",      "cr2",
+      "cr3",     "tab0",    "tab1",   "tab2",    "tab3",     "bs0",
+      "bs1",     "vt0",     "vt1",    "ff0",     "ff1",      "isig",
+      "icanon",  "iexten",  "echo",   "echoe",   "crterase", "echok",
+      "echonl",  "noflsh",  "xcase",  "tostop",  "echoprt",  "prterase",
+      "echoctl", "ctlecho", "echoke", "crtkill", "flusho",   "extproc",
+      "pendin"};
+  for (const auto& candidate : names) {
+    if (name == candidate) return true;
+  }
+  return false;
+}
+
+auto validate_settings(const SmallVector<std::string, 32>& settings) -> bool {
+  for (size_t i = 0; i < settings.size(); ++i) {
+    const auto& setting = settings[i];
+    const auto name = normalized_setting_name(setting);
+    if (is_value_setting(name)) {
+      if (i + 1 >= settings.size()) {
+        safeErrorPrint("stty: missing argument to " +
+                       std::string(1, static_cast<char>(39)));
+        safeErrorPrint(name);
+        safeErrorPrintLn(std::string(1, static_cast<char>(39)));
+        print_try_help();
+        return false;
+      }
+      ++i;
+      continue;
+    }
+    if (is_known_noarg_setting(name) || is_decimal_token(setting)) {
+      continue;
+    }
+    safeErrorPrint("stty: invalid argument " +
+                   std::string(1, static_cast<char>(39)));
+    safeErrorPrint(setting);
+    safeErrorPrintLn(std::string(1, static_cast<char>(39)));
+    print_try_help();
+    return false;
+  }
+  return true;
+}
+
+auto stdin_is_console(HANDLE hCon) -> bool {
+  DWORD mode = 0;
+  return GetConsoleMode(hCon, &mode) != 0;
+}
+
+auto report_inappropriate_ioctl(const Config& cfg) -> int {
+  safeErrorPrint("stty: " + std::string(1, static_cast<char>(39)));
+  if (cfg.device.empty()) {
+    safeErrorPrint("standard input");
+  } else {
+    safeErrorPrint(cfg.device);
+  }
+  safeErrorPrintLn(std::string(1, static_cast<char>(39)) +
+                   ": Inappropriate ioctl for device");
+  return 1;
+}
+
+auto report_missing_device(const std::string& device) -> int {
+  safeErrorPrint("stty: " + device + ": No such file or directory\n");
+  return 1;
+}
 bool apply_setting(HANDLE hCon, const std::string& setting) {
   DWORD mode = 0;
   GetConsoleMode(hCon, &mode);
 
   if (setting == "sane") {
-    apply_sane(hCon);
-    return true;
+    return apply_sane(hCon);
   }
   if (setting == "raw") {
-    apply_raw(hCon);
-    return true;
+    return apply_raw(hCon);
   }
   if (setting == "cooked" || setting == "-raw") {
-    apply_cooked(hCon);
-    return true;
+    return apply_cooked(hCon);
   }
   if (setting == "cbreak") {
-    apply_cbreak(hCon);
-    return true;
+    return apply_cbreak(hCon);
   }
 
   // Boolean settings
@@ -256,42 +362,29 @@ bool apply_setting(HANDLE hCon, const std::string& setting) {
       mode |= ENABLE_ECHO_INPUT;
     else
       mode &= ~ENABLE_ECHO_INPUT;
-    SetConsoleMode(hCon, mode);
-    return true;
+    return SetConsoleMode(hCon, mode) != 0;
   }
   if (name == "icanon") {
     if (value)
       mode |= ENABLE_LINE_INPUT;
     else
       mode &= ~ENABLE_LINE_INPUT;
-    SetConsoleMode(hCon, mode);
-    return true;
+    return SetConsoleMode(hCon, mode) != 0;
   }
   if (name == "isig") {
     if (value)
       mode |= ENABLE_PROCESSED_INPUT;
     else
       mode &= ~ENABLE_PROCESSED_INPUT;
-    SetConsoleMode(hCon, mode);
-    return true;
+    return SetConsoleMode(hCon, mode) != 0;
   }
-  if (name == "echoe") {
-    if (value)
-      mode |= ENABLE_ECHO_NEWLINE;
-    else
-      mode &= ~ENABLE_ECHO_NEWLINE;
-    SetConsoleMode(hCon, mode);
-    return true;
-  }
-
   // Settings that don't map to Windows but we accept silently
   static const std::vector<std::string> accepted = {
-      "ignbrk",  "brkint",  "parmrk", "istrip", "inlcr",  "igncr",
-      "icrnl",   "ixon",    "ixoff",  "iuclc",  "ixany",  "imaxbel",
-      "iutf8",   "opost",   "olcuc",  "ocrnl",  "onlcr",  "onocr",
-      "onlret",  "ofill",   "ofdel",  "echoctl", "echoprt", "echoke",
-      "echok",   "echonl",  "noflsh", "tostop",  "flusho",  "extproc",
-      "pendin",  "echoe"};
+      "ignbrk",  "brkint",  "parmrk", "istrip", "inlcr",   "igncr",  "icrnl",
+      "ixon",    "ixoff",   "iuclc",  "ixany",  "imaxbel", "iutf8",  "opost",
+      "olcuc",   "ocrnl",   "onlcr",  "onocr",  "onlret",  "ofill",  "ofdel",
+      "echoctl", "echoprt", "echoke", "echok",  "echonl",  "noflsh", "tostop",
+      "flusho",  "extproc", "pendin", "echoe"};
 
   for (const auto& a : accepted) {
     if (name == a) return true;
@@ -300,8 +393,8 @@ bool apply_setting(HANDLE hCon, const std::string& setting) {
   // Settings with values
   if (name == "intr" || name == "quit" || name == "erase" || name == "kill" ||
       name == "eof" || name == "eol" || name == "start" || name == "stop" ||
-      name == "susp" || name == "rprnt" || name == "werase" || name == "lnext" ||
-      name == "discard") {
+      name == "susp" || name == "rprnt" || name == "werase" ||
+      name == "lnext" || name == "discard") {
     return true;  // Accept but no-op on Windows
   }
   if (name == "min" || name == "time" || name == "rows" || name == "cols" ||
@@ -309,33 +402,86 @@ bool apply_setting(HANDLE hCon, const std::string& setting) {
     return true;  // Accept but no-op on Windows
   }
 
-  return false;
+  return is_known_noarg_setting(name) || is_value_setting(name) ||
+         is_decimal_token(setting);
 }
 
 auto run(const Config& cfg) -> int {
-  HANDLE hCon = GetStdHandle(STD_INPUT_HANDLE);
+  if (cfg.all && cfg.save) {
+    safeErrorPrintLn(
+        "stty: the options for verbose and stty-readable output styles are");
+    safeErrorPrintLn("mutually exclusive");
+    return 1;
+  }
+  if ((cfg.all || cfg.save) && !cfg.settings.empty()) {
+    safeErrorPrintLn(
+        "stty: when specifying an output style, modes may not be set");
+    return 1;
+  }
+  if (!validate_settings(cfg.settings)) {
+    return 1;
+  }
+
+  HANDLE hCon;
+  bool close_handle = false;
+
+  if (!cfg.device.empty()) {
+    std::error_code ec;
+    if (!std::filesystem::exists(cfg.device, ec)) {
+      return report_missing_device(cfg.device);
+    }
+    std::wstring wdevice = utf8_to_wstring(cfg.device);
+    hCon = CreateFileW(wdevice.c_str(), GENERIC_READ | GENERIC_WRITE,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hCon == INVALID_HANDLE_VALUE) {
+      safeErrorPrint("stty: ");
+      safeErrorPrint(cfg.device);
+      safeErrorPrintLn(": ");
+      safeErrorPrintLn(win32_posix_error_text(GetLastError()));
+      return 1;
+    }
+    close_handle = true;
+  } else {
+    hCon = GetStdHandle(STD_INPUT_HANDLE);
+  }
+
+  if (!stdin_is_console(hCon)) {
+    if (close_handle) CloseHandle(hCon);
+    return report_inappropriate_ioctl(cfg);
+  }
 
   if (!cfg.settings.empty()) {
-    // Apply settings
     bool ok = true;
-    for (const auto& setting : cfg.settings) {
+    for (size_t i = 0; i < cfg.settings.size(); ++i) {
+      const auto& setting = cfg.settings[i];
+      const auto name = normalized_setting_name(setting);
+      if (is_value_setting(name)) {
+        ++i;
+        continue;
+      }
       if (!apply_setting(hCon, setting)) {
-        safeErrorPrint("stty: invalid argument '");
+        safeErrorPrint("stty: invalid argument " +
+                       std::string(1, static_cast<char>(39)));
         safeErrorPrint(setting);
-        safeErrorPrintLn("'");
+        safeErrorPrintLn(std::string(1, static_cast<char>(39)));
+        print_try_help();
         ok = false;
       }
     }
-    return ok ? 0 : 1;
+    int result = ok ? 0 : 1;
+    if (close_handle) CloseHandle(hCon);
+    return result;
   }
 
   if (cfg.save) {
     print_machine_readable(hCon);
+    if (close_handle) CloseHandle(hCon);
     return 0;
   }
 
-  // Default: print all settings (same as -a)
   print_console_settings(hCon);
+  if (close_handle) CloseHandle(hCon);
   return 0;
 }
 

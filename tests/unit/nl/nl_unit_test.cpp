@@ -123,7 +123,7 @@ TEST(nl, nl_join_blank_lines_numbers_only_group_boundary) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_EQ(r.stdout_text, "1:line1\n:\n2:\n:\n3:line2\n");
+  EXPECT_EQ(r.stdout_text, "1:line1\n  \n2:\n  \n3:line2\n");
 }
 
 TEST(nl, nl_pattern_body_numbering) {
@@ -137,7 +137,21 @@ TEST(nl, nl_pattern_body_numbering) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_EQ(r.stdout_text, "1:ERR first\n:ok\n2:ERR second\n");
+  EXPECT_EQ(r.stdout_text, "1:ERR first\n  ok\n2:ERR second\n");
+}
+
+TEST(nl, nl_unnumbered_lines_use_blank_number_field_not_separator) {
+  TempDir tmp;
+  tmp.write("test.txt", "line\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"nl.exe", {L"-b", L"n", L"-w", L"3", L"-s", L"::", L"test.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ(r.stdout_text, "     line\n");
 }
 
 TEST(nl, nl_empty_number_separator) {
@@ -152,4 +166,102 @@ TEST(nl, nl_empty_number_separator) {
 
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_EQ(r.stdout_text, "1line\n");
+}
+
+TEST(nl, nl_newline_mode_trims_trailing_cr_from_crlf_records) {
+  TempDir tmp;
+  tmp.write_bytes("crlf.txt", {'l', 'i', 'n', 'e', '1', '\r', '\n', 'l', 'i',
+                               'n', 'e', '2', '\r', '\n'});
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"nl.exe", {L"-w", L"1", L"crlf.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "1\tline1\n2\tline2\n");
+}
+
+TEST(nl, nl_missing_input_reports_no_such_file) {
+  TempDir tmp;
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"nl.exe", {L"missing.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stderr_text.find(
+                  "nl: cannot open 'missing.txt' for reading: No such file "
+                  "or directory") != std::string::npos);
+}
+
+TEST(nl, nl_directory_input_reports_is_a_directory) {
+  TempDir tmp;
+  tmp.mkdir("indir");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"nl.exe", {L"indir"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stderr_text.find(
+                  "nl: cannot open 'indir' for reading: Is a directory") !=
+              std::string::npos);
+}
+
+// [GNU] nl 9.4 accepts a zero line increment (-i 0, -i +0,
+// --line-increment=0) and repeats the line number; only non-numeric text is
+// rejected with status 1 (#1011).
+TEST(nl, nl_zero_line_increment_repeats_line_number) {
+  TempDir tmp;
+  tmp.write("in.txt", "a\nb\n");
+
+  for (const wchar_t* opt : {L"0", L"+0", L"00"}) {
+    Pipeline p;
+    p.set_cwd(tmp.wpath());
+    p.add(L"nl.exe", {L"-i", opt, L"in.txt"});
+    auto r = p.run();
+
+    EXPECT_EQ(r.exit_code, 0);
+    EXPECT_EQ_TEXT(r.stdout_text, "     1\ta\n     1\tb\n");
+  }
+
+  Pipeline long_opt;
+  long_opt.set_cwd(tmp.wpath());
+  long_opt.add(L"nl.exe", {L"--line-increment=0", L"in.txt"});
+  auto long_result = long_opt.run();
+  EXPECT_EQ(long_result.exit_code, 0);
+  EXPECT_EQ_TEXT(long_result.stdout_text, "     1\ta\n     1\tb\n");
+}
+
+TEST(nl, nl_negative_line_increment_decrements) {
+  TempDir tmp;
+  tmp.write("in.txt", "a\nb\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"nl.exe", {L"-i", L"-2", L"in.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "     1\ta\n    -1\tb\n");
+}
+
+TEST(nl, nl_invalid_line_increment_exits_1) {
+  TempDir tmp;
+  tmp.write("in.txt", "a\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"nl.exe", {L"-i", L"1x", L"in.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stderr_text.find("invalid line number increment: '1x'") !=
+              std::string::npos);
 }

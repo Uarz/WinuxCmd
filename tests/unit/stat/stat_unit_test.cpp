@@ -158,7 +158,7 @@ TEST(stat, stat_format_common_fields) {
   TEST_LOG("stat common fields output", r.stdout_text);
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_TRUE(r.stdout_text.starts_with("regular file|666|-rw-rw-rw-|"));
+  EXPECT_TRUE(r.stdout_text.starts_with("regular file|644|-rw-r--r--|"));
   EXPECT_TRUE(r.stdout_text.ends_with("\n"));
 
   auto last_separator = r.stdout_text.find_last_of('|');
@@ -219,4 +219,133 @@ TEST(stat, stat_printf_interprets_common_backslash_escapes) {
 
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_BYTES(r.stdout_text, "test.txt\t\t\b");
+}
+
+TEST(stat, stat_format_last_occurrence_wins_over_printf) {
+  TempDir tmp;
+  tmp.write("test.txt", "data");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"stat.exe", {L"--printf", L"%n", L"-c", L"%s", L"test.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "4\n");
+}
+
+TEST(stat, stat_printf_last_occurrence_wins_over_format) {
+  TempDir tmp;
+  tmp.write("test.txt", "data");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"stat.exe", {L"-c", L"%s", L"--printf", L"%n", L"test.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "test.txt");
+}
+
+TEST(stat, stat_terse_last_occurrence_wins_over_format) {
+  TempDir tmp;
+  tmp.write("test.txt", "data");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"stat.exe", {L"-c", L"%n", L"-t", L"test.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_NE(r.stdout_text, "test.txt\n");
+  EXPECT_TRUE(r.stdout_text.starts_with("test.txt "));
+}
+
+TEST(stat, stat_format_last_occurrence_wins_over_terse) {
+  TempDir tmp;
+  tmp.write("test.txt", "data");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"stat.exe", {L"-t", L"-c", L"%n", L"test.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "test.txt\n");
+}
+
+TEST(stat, stat_missing_operand_reports_help_hint) {
+  Pipeline p;
+  p.add(L"stat.exe", {});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stdout_text.empty());
+  EXPECT_EQ_TEXT(
+      r.stderr_text,
+      "stat: missing operand\nTry 'stat --help' for more information.\n");
+}
+
+namespace {
+bool stat_test_create_symlink(const std::filesystem::path& link,
+                              const std::filesystem::path& target,
+                              bool target_is_directory = false) {
+  DWORD flags = 0;
+#ifdef SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
+  flags |= SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+#endif
+  if (target_is_directory) {
+    flags |= SYMBOLIC_LINK_FLAG_DIRECTORY;
+  }
+  if (CreateSymbolicLinkW(link.wstring().c_str(), target.wstring().c_str(),
+                          flags)) {
+    return true;
+  }
+  std::cout << "  SKIPPED (CreateSymbolicLinkW failed with error "
+            << GetLastError() << ")\n";
+  return false;
+}
+}  // namespace
+
+TEST(stat, stat_dangling_symlink_lstats_link_successfully) {
+  TempDir tmp;
+
+  std::filesystem::path link = tmp.path / "dang";
+  if (!stat_test_create_symlink(link, std::filesystem::path(L"z_absent_tgt"))) {
+    return;
+  }
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"stat.exe", {L"dang"});
+  auto r = p.run();
+
+  // [GNU] stat (no -L) lstats: a dangling link reports the link's own
+  // metadata, "File: dang -> z_absent_tgt" and "symbolic link" type (#1060).
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stdout_text.find("dang -> z_absent_tgt") != std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("symbolic link") != std::string::npos);
+}
+
+TEST(stat, stat_dereference_dangling_symlink_fails) {
+  TempDir tmp;
+
+  std::filesystem::path link = tmp.path / "dang";
+  if (!stat_test_create_symlink(link, std::filesystem::path(L"z_absent_tgt"))) {
+    return;
+  }
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"stat.exe", {L"-L", L"dang"});
+  auto r = p.run();
+
+  // [GNU] stat -L follows the link; a dangling target fails with rc=1.
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stderr_text.find("cannot stat") != std::string::npos);
 }

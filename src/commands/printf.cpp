@@ -43,13 +43,21 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr PRINTF_OPTIONS =
-    std::array{OPTION("", "", "format and print data", STRING_TYPE)};
+    // [GNU]
+    std::array{// [GNU] -v, --variable: assign the output to shell variable VAR
+               OPTION("-v", "", "assign the output to shell variable VAR",
+                      STRING_TYPE),
+               // [GNU]
+               OPTION("", "", "format and print data", STRING_TYPE)};
 
 namespace {
 
 struct EscapeResult {
   std::string text;
   bool stop_output = false;
+  // Set when a \u/\U escape lacks its required hex digits (GNU parity:
+  // "missing hexadecimal number in escape", exit 1; uutils #14404/#14406).
+  bool bad_unicode = false;
 };
 
 struct FormatSpec {
@@ -61,6 +69,8 @@ struct FormatSpec {
   bool consumes_argument = false;
   bool valid = false;
   bool left_adjust = false;
+  bool dynamic_width = false;
+  bool dynamic_precision = false;
 };
 
 struct RenderResult {
@@ -75,6 +85,13 @@ int hex_value(char c) {
   if (c >= 'a' && c <= 'f') return c - 'a' + 10;
   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
   return -1;
+}
+
+// GNU printf %q is quotearg's shell_escape_quoting_style: arguments that
+// need no quoting stay bare, others get '...' with $'\ooo' escapes for
+// unprintable bytes (and the GNU reprocess quirk when '\'' is present).
+auto shell_quote(std::string_view value) -> std::string {
+  return gnu_quotearg::shell_escape_quote(value);
 }
 
 bool is_octal_digit(char c) { return c >= '0' && c <= '7'; }
@@ -166,6 +183,9 @@ EscapeResult interpret_escape_at(std::string_view input, size_t& i,
     }
     case 'u':
     case 'U': {
+      // GNU requires exactly 4 hex digits for \u and 8 for \U; anything
+      // else is a fatal "missing hexadecimal number in escape" error that
+      // discards the escape and all remaining input.
       int wanted = esc == 'u' ? 4 : 8;
       unsigned int value = 0;
       int digits = 0;
@@ -174,7 +194,11 @@ EscapeResult interpret_escape_at(std::string_view input, size_t& i,
         value = (value * 16) + static_cast<unsigned int>(hex_value(input[++i]));
         ++digits;
       }
-      if (digits == wanted && !(value >= 0xD800 && value <= 0xDFFF)) {
+      if (digits < wanted) {
+        result.bad_unicode = true;
+        return result;
+      }
+      if (!(value >= 0xD800 && value <= 0xDFFF)) {
         append_utf8(result.text, value);
       } else {
         result.text += '\\';
@@ -213,6 +237,10 @@ EscapeResult interpret_escapes(std::string_view input, bool percent_b_mode) {
 
     auto escaped = interpret_escape_at(input, i, percent_b_mode);
     result.text += escaped.text;
+    if (escaped.bad_unicode) {
+      result.bad_unicode = true;
+      return result;  // GNU discards everything after the malformed escape.
+    }
     if (escaped.stop_output) {
       result.stop_output = true;
       return result;
@@ -239,18 +267,26 @@ FormatSpec parse_format_spec(std::string_view format, size_t& pos) {
     }
   }
 
-  while (i < format.size() &&
-         std::isdigit(static_cast<unsigned char>(format[i]))) {
-    spec.width += format[i++];
-  }
+  if (i < format.size() && format[i] == '*') {
+    spec.dynamic_width = true;
+    ++i;
+  } else
+    while (i < format.size() &&
+           std::isdigit(static_cast<unsigned char>(format[i]))) {
+      spec.width += format[i++];
+    }
 
   if (i < format.size() && format[i] == '.') {
     spec.has_precision = true;
     ++i;
-    while (i < format.size() &&
-           std::isdigit(static_cast<unsigned char>(format[i]))) {
-      spec.precision += format[i++];
-    }
+    if (i < format.size() && format[i] == '*') {
+      spec.dynamic_precision = true;
+      ++i;
+    } else
+      while (i < format.size() &&
+             std::isdigit(static_cast<unsigned char>(format[i]))) {
+        spec.precision += format[i++];
+      }
   }
 
   while (i < format.size() &&
@@ -268,7 +304,7 @@ FormatSpec parse_format_spec(std::string_view format, size_t& pos) {
   spec.valid = true;
   pos = i;
   spec.consumes_argument =
-      std::string_view("bcdiuoxXfFeEgGaAs").find(spec.conversion) !=
+      std::string_view("bcdiuoxXfFeEgGaAsq").find(spec.conversion) !=
       std::string_view::npos;
   return spec;
 }
@@ -376,7 +412,7 @@ long long parse_signed_argument(const std::vector<std::string_view>& args,
     return 0;
   }
   if (errno == ERANGE) {
-    warn_numeric(arg, "numerical result out of range", had_error);
+    warn_numeric(arg, "Numerical result out of range", had_error);
   } else if (*end != '\0') {
     warn_numeric(arg, "value not completely converted", had_error);
   }
@@ -402,38 +438,42 @@ unsigned long long parse_unsigned_argument(
     return 0;
   }
   if (errno == ERANGE) {
-    warn_numeric(arg, "numerical result out of range", had_error);
+    warn_numeric(arg, "Numerical result out of range", had_error);
   } else if (*end != '\0') {
     warn_numeric(arg, "value not completely converted", had_error);
   }
   return value;
 }
 
-double parse_float_argument(const std::vector<std::string_view>& args,
-                            size_t& arg_index, bool& had_error) {
-  if (arg_index >= args.size()) return 0.0;
+// GNU printf parses float arguments with strtold() and formats them as
+// long double (80-bit extended on x86-64).  MSVC's long double is a
+// 64-bit double, so the emulated type in utils/gnu_float80.hpp is used;
+// it is what makes e.g. '%.2e' 2.455 print 2.45e+00 like glibc.
+gnu_float80::Ext80 parse_float_argument(
+    const std::vector<std::string_view>& args, size_t& arg_index,
+    bool& had_error) {
+  if (arg_index >= args.size()) return {};
 
   std::string arg(args[arg_index++]);
   long long character_value = 0;
   if (consume_character_constant(arg, character_value, had_error)) {
-    return static_cast<double>(character_value);
+    return gnu_float80::from_i64(character_value);
   }
 
-  errno = 0;
-  char* end = nullptr;
-  double value = std::strtod(arg.c_str(), &end);
+  const char* end = nullptr;
+  bool range_err = false;
+  gnu_float80::Ext80 value = gnu_float80::parse(arg, end, range_err);
   if (end == arg.c_str()) {
     warn_numeric(arg, "expected a numeric value", had_error);
-    return 0.0;
+    return {};
   }
-  if (errno == ERANGE) {
-    warn_numeric(arg, "numerical result out of range", had_error);
+  if (range_err) {
+    warn_numeric(arg, "Numerical result out of range", had_error);
   } else if (*end != '\0') {
     warn_numeric(arg, "value not completely converted", had_error);
   }
   return value;
 }
-
 std::string render_directive(const FormatSpec& spec,
                              const std::vector<std::string_view>& args,
                              size_t& arg_index, bool& had_error,
@@ -447,8 +487,20 @@ std::string render_directive(const FormatSpec& spec,
     case 'b': {
       auto escaped =
           interpret_escapes(consume_string_argument(args, arg_index), true);
-      stop_output = escaped.stop_output;
+      if (escaped.bad_unicode) {
+        had_error = true;
+        stop_output = true;
+        safeErrorPrintLn("printf: missing hexadecimal number in escape");
+      } else {
+        stop_output = escaped.stop_output;
+      }
       return format_string_bytes(std::move(escaped.text), spec);
+    }
+    case 'q': {
+      // GNU %q prints nothing at all when the argument is missing.
+      if (arg_index >= args.size()) return "";
+      auto value = consume_string_argument(args, arg_index);
+      return format_string_bytes(shell_quote(value), spec);
     }
     case 'c': {
       std::string arg = consume_string_argument(args, arg_index);
@@ -474,10 +526,29 @@ std::string render_directive(const FormatSpec& spec,
     case 'g':
     case 'G':
     case 'a':
-    case 'A':
-      return format_with_snprintf(
-          normalized_format(spec, spec.conversion),
-          parse_float_argument(args, arg_index, had_error));
+    case 'A': {
+      gnu_float80::FormatOpts opts;
+      opts.conv = spec.conversion;
+      if (spec.has_precision) {
+        size_t p = parse_count(spec.precision, 0);
+        opts.precision =
+            p > static_cast<size_t>(std::numeric_limits<int>::max())
+                ? std::numeric_limits<int>::max()
+                : static_cast<int>(p);
+      }
+      size_t w = parse_count(spec.width, 0);
+      opts.width = w > static_cast<size_t>(std::numeric_limits<int>::max())
+                       ? std::numeric_limits<int>::max()
+                       : static_cast<int>(w);
+      opts.left = spec.left_adjust;
+      opts.plus = spec.flags.find('+') != std::string_view::npos;
+      opts.space = spec.flags.find(' ') != std::string_view::npos;
+      opts.alt = spec.flags.find('#') != std::string_view::npos;
+      opts.zero_pad =
+          !opts.left && spec.flags.find('0') != std::string_view::npos;
+      return gnu_float80::format(
+          parse_float_argument(args, arg_index, had_error), opts);
+    }
     default:
       return "%" + std::string(1, spec.conversion);
   }
@@ -492,6 +563,12 @@ RenderResult render_once(std::string_view format,
     if (format[i] == '\\') {
       auto escaped = interpret_escape_at(format, i, false);
       result.text += escaped.text;
+      if (escaped.bad_unicode) {
+        had_error = true;
+        result.stop_output = true;
+        safeErrorPrintLn("printf: missing hexadecimal number in escape");
+        return result;
+      }
       if (escaped.stop_output) {
         result.stop_output = true;
         return result;
@@ -508,6 +585,25 @@ RenderResult render_once(std::string_view format,
     if (!spec.valid) {
       result.text += '%';
       continue;
+    }
+
+    if (spec.dynamic_width) {
+      long long width = parse_signed_argument(args, arg_index, had_error);
+      if (width < 0) {
+        spec.left_adjust = true;
+        width = -width;
+      }
+      spec.width = std::to_string(width);
+    }
+    if (spec.dynamic_precision) {
+      long long precision = parse_signed_argument(args, arg_index, had_error);
+      if (precision >= 0) {
+        spec.has_precision = true;
+        spec.precision = std::to_string(precision);
+      } else {
+        spec.has_precision = false;
+        spec.precision.clear();
+      }
     }
 
     if (spec.consumes_argument) {

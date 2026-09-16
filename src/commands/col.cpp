@@ -42,10 +42,15 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr COL_OPTIONS = std::array{
+    // [EXT]
     OPTION("-b", "", "do not output backspaces"),
+    // [EXT]
     OPTION("-f", "", "permit forward half line feeds"),
+    // [EXT]
     OPTION("-p", "", "pass unknown control sequences"),
+    // [EXT]
     OPTION("-x", "", "output spaces instead of tabs"),
+    // [EXT]
     OPTION("-l", "", "buffer at least NUM lines (default 128)", STRING_TYPE)};
 
 namespace col_pipeline {
@@ -70,13 +75,14 @@ auto build_config(const CommandContext<COL_OPTIONS.size()>& ctx)
 
   auto lines_opt = ctx.get<std::string>("-l", "");
   if (!lines_opt.empty()) {
-    try {
-      int val = std::stoi(lines_opt);
-      if (val < 1) return std::unexpected("invalid line count");
-      cfg.buffer_lines = static_cast<size_t>(val);
-    } catch (...) {
+    int val = 0;
+    auto [ptr, ec] = std::from_chars(lines_opt.data(),
+                                     lines_opt.data() + lines_opt.size(), val);
+    if (ec != std::errc() || ptr != lines_opt.data() + lines_opt.size() ||
+        val < 1) {
       return std::unexpected("invalid line count");
     }
+    cfg.buffer_lines = static_cast<size_t>(val);
   }
 
   return cfg;
@@ -104,9 +110,7 @@ auto run(const Config& cfg) -> int {
 
     switch (ch) {
       case '\b':  // Backspace
-        if (cfg.no_backspaces) {
-          // Skip backspace
-        } else if (current_col > 0) {
+        if (current_col > 0) {
           current_col--;
         }
         break;
@@ -163,9 +167,14 @@ auto run(const Config& cfg) -> int {
     }
   }
 
-  // Output processed lines
-  for (const auto& line : lines) {
-    safePrintLn(line);
+  // Output processed lines. A trailing empty buffer is an artifact of an
+  // input newline, not an extra output line.
+  size_t output_count = lines.size();
+  if (output_count > 1 && lines.back().empty()) {
+    --output_count;
+  }
+  for (size_t i = 0; i < output_count; ++i) {
+    safePrintLn(lines[i]);
   }
 
   return 0;
@@ -174,8 +183,7 @@ auto run(const Config& cfg) -> int {
 }  // namespace col_pipeline
 
 REGISTER_COMMAND(
-    col, "col",
-    "col [OPTION]...",
+    col, "col", "col [OPTION]...",
     "Filter reverse line feeds from standard input.\n"
     "\n"
     "col filters out reverse (and half-reverse) line feeds so that the output\n"

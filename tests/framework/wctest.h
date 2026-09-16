@@ -27,6 +27,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifdef _WIN32
@@ -119,6 +120,7 @@ struct Registrar {
 // ============================
 
 inline int failures = 0;
+inline int failed_tests = 0;
 inline int current_test_failed = 0;
 
 inline void fail(const char *file, int line, const std::string &msg) {
@@ -127,6 +129,7 @@ inline void fail(const char *file, int line, const std::string &msg) {
     std::cerr << "  FAILED\n";
     reset_color();
     current_test_failed = 1;
+    ++failed_tests;
   }
 
   std::cerr << "    " << file << ":" << line << "\n";
@@ -244,6 +247,22 @@ inline void expect_eq_impl(const std::string &a, const std::string &b,
     }                                                                  \
   } while (0)
 
+#define ASSERT_TRUE(x)                                                \
+  do {                                                                \
+    if (!(x)) {                                                       \
+      wctest::fail(__FILE__, __LINE__, "ASSERT_TRUE(" #x ") failed"); \
+      return;                                                         \
+    }                                                                 \
+  } while (0)
+
+#define ASSERT_FALSE(x)                                                \
+  do {                                                                 \
+    if (x) {                                                           \
+      wctest::fail(__FILE__, __LINE__, "ASSERT_FALSE(" #x ") failed"); \
+      return;                                                          \
+    }                                                                  \
+  } while (0)
+
 /**
  * @brief Generic EXPECT_EQ implementation for streamable types
  *
@@ -267,6 +286,23 @@ inline void expect_eq_impl(const A &a, const B &b, const char *file, int line,
     oss << "EXPECT_EQ(" << exprA << ", " << exprB << ") failed\n"
         << "      lhs: [" << a << "]\n"
         << "      rhs: [" << b << "]";
+    fail(file, line, oss.str());
+  }
+}
+
+inline void expect_contains_impl(std::string_view haystack,
+                                 std::string_view needle, const char *file,
+                                 int line, const char *exprA, const char *exprB,
+                                 bool negate) {
+  bool found = haystack.find(needle) != std::string_view::npos;
+  if (found == negate) {
+    std::ostringstream oss;
+    oss << (negate ? "EXPECT_NOT_CONTAINS" : "EXPECT_CONTAINS") << "(" << exprA
+        << ", " << exprB << ") failed\n"
+        << "      haystack (visible): [" << to_visible(std::string(haystack))
+        << "]\n"
+        << "      needle (visible): [" << to_visible(std::string(needle))
+        << "]";
     fail(file, line, oss.str());
   }
 }
@@ -316,6 +352,50 @@ inline std::string normalize_newlines(std::string s) {
     }                                                                       \
   } while (0)
 
+#define ASSERT_EQ(a, b)                                             \
+  do {                                                              \
+    if (!((a) == (b))) {                                            \
+      wctest::expect_eq_impl((a), (b), __FILE__, __LINE__, #a, #b); \
+      return;                                                       \
+    }                                                               \
+  } while (0)
+
+#define ASSERT_NE(a, b)                                                     \
+  do {                                                                      \
+    if ((a) == (b)) {                                                       \
+      wctest::fail(__FILE__, __LINE__, "ASSERT_NE(" #a ", " #b ") failed"); \
+      return;                                                               \
+    }                                                                       \
+  } while (0)
+
+#define ASSERT_CONTAINS(haystack, needle)                                    \
+  do {                                                                       \
+    if (std::string_view(haystack).find(std::string_view(needle)) ==         \
+        std::string_view::npos) {                                            \
+      wctest::expect_contains_impl((haystack), (needle), __FILE__, __LINE__, \
+                                   #haystack, #needle, false);               \
+      return;                                                                \
+    }                                                                        \
+  } while (0)
+
+#define ASSERT_NOT_CONTAINS(haystack, needle)                                \
+  do {                                                                       \
+    if (std::string_view(haystack).find(std::string_view(needle)) !=         \
+        std::string_view::npos) {                                            \
+      wctest::expect_contains_impl((haystack), (needle), __FILE__, __LINE__, \
+                                   #haystack, #needle, true);                \
+      return;                                                                \
+    }                                                                        \
+  } while (0)
+
+#define EXPECT_CONTAINS(haystack, needle)                                \
+  wctest::expect_contains_impl((haystack), (needle), __FILE__, __LINE__, \
+                               #haystack, #needle, false)
+
+#define EXPECT_NOT_CONTAINS(haystack, needle)                            \
+  wctest::expect_contains_impl((haystack), (needle), __FILE__, __LINE__, \
+                               #haystack, #needle, true)
+
 /**
  * @brief Assert that first value is less than second
  *
@@ -348,6 +428,52 @@ inline std::string normalize_newlines(std::string s) {
     }                                              \
   } while (0)
 
+#define EXPECT_LE(a, b)                            \
+  do {                                             \
+    if (!((a) <= (b))) {                           \
+      std::ostringstream oss;                      \
+      oss << "EXPECT_LE(" #a ", " #b ") failed\n"  \
+          << "      lhs: [" << (a) << "]\n"        \
+          << "      rhs: [" << (b) << "]";         \
+      wctest::fail(__FILE__, __LINE__, oss.str()); \
+    }                                              \
+  } while (0)
+
+#define EXPECT_GE(a, b)                            \
+  do {                                             \
+    if (!((a) >= (b))) {                           \
+      std::ostringstream oss;                      \
+      oss << "EXPECT_GE(" #a ", " #b ") failed\n"  \
+          << "      lhs: [" << (a) << "]\n"        \
+          << "      rhs: [" << (b) << "]";         \
+      wctest::fail(__FILE__, __LINE__, oss.str()); \
+    }                                              \
+  } while (0)
+
+#define ASSERT_LE(a, b)                            \
+  do {                                             \
+    if (!((a) <= (b))) {                           \
+      std::ostringstream oss;                      \
+      oss << "ASSERT_LE(" #a ", " #b ") failed\n"  \
+          << "      lhs: [" << (a) << "]\n"        \
+          << "      rhs: [" << (b) << "]";         \
+      wctest::fail(__FILE__, __LINE__, oss.str()); \
+      return;                                      \
+    }                                              \
+  } while (0)
+
+#define ASSERT_GE(a, b)                            \
+  do {                                             \
+    if (!((a) >= (b))) {                           \
+      std::ostringstream oss;                      \
+      oss << "ASSERT_GE(" #a ", " #b ") failed\n"  \
+          << "      lhs: [" << (a) << "]\n"        \
+          << "      rhs: [" << (b) << "]";         \
+      wctest::fail(__FILE__, __LINE__, oss.str()); \
+      return;                                      \
+    }                                              \
+  } while (0)
+
 /**
  * @brief Assert equality of text content with newline normalization
  *
@@ -358,6 +484,17 @@ inline std::string normalize_newlines(std::string s) {
   wctest::expect_eq_impl(wctest::normalize_newlines(a),                     \
                          wctest::normalize_newlines(b), __FILE__, __LINE__, \
                          #a, #b)
+
+#define ASSERT_EQ_TEXT(a, b)                                                 \
+  do {                                                                       \
+    auto wctest_lhs = wctest::normalize_newlines(a);                         \
+    auto wctest_rhs = wctest::normalize_newlines(b);                         \
+    if (!(wctest_lhs == wctest_rhs)) {                                       \
+      wctest::expect_eq_impl(wctest_lhs, wctest_rhs, __FILE__, __LINE__, #a, \
+                             #b);                                            \
+      return;                                                                \
+    }                                                                        \
+  } while (0)
 
 /**
  * @brief Assert equality of binary data
@@ -552,32 +689,47 @@ inline std::string normalize_newlines(std::string s) {
  * @param group Test group/category name
  * @param test_name Individual test name
  */
-#define TEST(group, test_name)                                                 \
-  static void test_fn_##group##_##test_name();                                 \
-  /**                                                                          \
-   * @brief Test runner function with hook integration                         \
-   *                                                                           \
-   * Executes before hooks, runs the test function, executes after hooks,      \
-   * and reports pass/fail status with colored output.                         \
-   */                                                                          \
-  static void test_runner_##group##_##test_name() {                            \
-    for (auto h : wctest::before_hooks()) h(#group, #test_name);               \
-    wctest::current_test_failed = 0;                                           \
-    test_fn_##group##_##test_name();                                           \
-    for (auto h : wctest::after_hooks()) h(#group, #test_name);                \
-    if (!wctest::current_test_failed) {                                        \
-      wctest::set_color(wctest::Color::Green);                                 \
-      std::cout << "  PASSED\n";                                               \
-      wctest::reset_color();                                                   \
-    }                                                                          \
-  }                                                                            \
-  /**                                                                          \
-   * @brief Automatic test registration                                        \
-   *                                                                           \
-   * Registers the test with the global registry during static initialization. \
-   */                                                                          \
-  static wctest::Registrar reg_##group##_##test_name(                          \
-      #group, #test_name, (void (*)()) & test_runner_##group##_##test_name);   \
+#define TEST(group, test_name)                                                       \
+  static void test_fn_##group##_##test_name();                                       \
+  /** \                                                                          \ \ \
+   * @brief Test runner function with hook integration \ \ \                         \
+   *                                                                           \     \
+   * \                                                                               \
+   * \ \                                                                             \
+   * Executes before hooks, runs the test function, executes after hooks, \ \        \
+   * \                                                                               \
+   * and reports pass/fail status with colored output. \ \ \                         \
+   */                                                                                \
+  static void test_runner_##group##_##test_name() {                                  \
+    for (auto h : wctest::before_hooks()) h(#group, #test_name);                     \
+    wctest::current_test_failed = 0;                                                 \
+    try {                                                                            \
+      test_fn_##group##_##test_name();                                               \
+    } catch (const std::exception &e) {                                              \
+      wctest::fail(__FILE__, __LINE__,                                               \
+                   std::string("Unhandled exception: ") + e.what());                 \
+    } catch (...) {                                                                  \
+      wctest::fail(__FILE__, __LINE__, "Unhandled unknown exception");               \
+    }                                                                                \
+    for (auto h : wctest::after_hooks()) h(#group, #test_name);                      \
+    if (!wctest::current_test_failed) {                                              \
+      wctest::set_color(wctest::Color::Green);                                       \
+      std::cout << "  PASSED\n";                                                     \
+      wctest::reset_color();                                                         \
+    }                                                                                \
+  }                                                                                  \
+  /** \                                                                          \ \ \
+   * @brief Automatic test registration \ \ \                                        \
+   *                                                                           \     \
+   * \                                                                               \
+   * \ \                                                                             \
+   * Registers the test with the global registry during static initialization.       \
+   * \                                                                               \
+   * \ \                                                                             \
+   * \ \ \                                                                           \
+   */                                                                                \
+  static wctest::Registrar reg_##group##_##test_name(                                \
+      #group, #test_name, (void (*)()) & test_runner_##group##_##test_name);         \
   static void test_fn_##group##_##test_name()
 
 // ============================
@@ -594,7 +746,7 @@ inline std::string normalize_newlines(std::string s) {
  */
 inline int run_all() {
   int total = registry().size();
-  int failed_before = failures;
+  int failed_tests_before = failed_tests;
 
   set_color(Color::Cyan);
   std::cout << "[==========] Running " << total << " tests\n";
@@ -607,7 +759,7 @@ inline int run_all() {
     t.fn();
   }
 
-  int failed = failures - failed_before;
+  int failed = failed_tests - failed_tests_before;
 
   std::cout << "\n";
   set_color(failed ? Color::Red : Color::Green);
@@ -619,7 +771,7 @@ inline int run_all() {
 }
 
 inline int run_single(const char *group, const char *name) {
-  int failed_before = failures;
+  int failed_tests_before = failed_tests;
 
   set_color(Color::Cyan);
   std::cout << "[==========] Running single test: " << group << "." << name
@@ -646,7 +798,7 @@ inline int run_single(const char *group, const char *name) {
     return 1;
   }
 
-  int failed = failures - failed_before;
+  int failed = failed_tests - failed_tests_before;
 
   std::cout << "\n";
   set_color(failed ? Color::Red : Color::Green);
@@ -659,7 +811,7 @@ inline int run_single(const char *group, const char *name) {
 
 inline int run_group(const char *group) {
   int total = 0;
-  int failed_before = failures;
+  int failed_tests_before = failed_tests;
 
   set_color(Color::Cyan);
   std::cout << "[==========] Running all tests in group: " << group << "\n";
@@ -682,7 +834,7 @@ inline int run_group(const char *group) {
     return 1;
   }
 
-  int failed = failures - failed_before;
+  int failed = failed_tests - failed_tests_before;
 
   std::cout << "\n";
   set_color(failed ? Color::Red : Color::Green);
@@ -757,16 +909,47 @@ inline bool test_matches_filter(const TestCase &test, const char *filter) {
   return pattern_matches(filter, full_name.c_str());
 }
 
+inline std::vector<std::string> split_filter_patterns(const char *filter) {
+  std::vector<std::string> patterns;
+  if (filter == nullptr || filter[0] == '\0') return patterns;
+
+  const char *start = filter;
+  for (const char *p = filter;; ++p) {
+    if (*p == ':' || *p == '\0') {
+      if (p != start) patterns.emplace_back(start, p - start);
+      if (*p == '\0') break;
+      start = p + 1;
+    }
+  }
+  return patterns;
+}
+
+inline bool test_matches_any_filter(const TestCase &test,
+                                    const std::vector<std::string> &filters) {
+  if (filters.empty()) return false;
+  for (const auto &filter : filters) {
+    if (test_matches_filter(test, filter.c_str())) return true;
+  }
+  return false;
+}
+
+inline bool test_matches_positive_filter(
+    const TestCase &test, const std::vector<std::string> &filters) {
+  if (filters.empty()) return true;
+  return test_matches_any_filter(test, filters);
+}
+
 inline int run_with_filter(const char *filter) {
   int total = 0;
-  int failed_before = failures;
+  int failed_tests_before = failed_tests;
+  auto positive_filters = split_filter_patterns(filter);
 
   set_color(Color::Cyan);
   std::cout << "[==========] Running tests with filter: " << filter << "\n";
   reset_color();
 
   for (auto &t : registry()) {
-    if (test_matches_filter(t, filter)) {
+    if (test_matches_positive_filter(t, positive_filters)) {
       total++;
       set_color(Color::Cyan);
       std::cout << "[ RUN      ] " << t.group << "." << t.name << "\n";
@@ -781,7 +964,7 @@ inline int run_with_filter(const char *filter) {
     reset_color();
   }
 
-  int failed = failures - failed_before;
+  int failed = failed_tests - failed_tests_before;
 
   std::cout << "\n";
   set_color(failed ? Color::Red : Color::Green);
@@ -799,16 +982,18 @@ inline int run_with_posneg_filter(const char *filter) {
   }
   const char *minus_pos = strchr(filter, '-');
 
-  if (minus_pos == nullptr || minus_pos == filter) {
+  if (minus_pos == nullptr) {
     return run_with_filter(filter);
   }
 
   std::string positive(filter, minus_pos - filter);
   const char *negative = minus_pos + 1;
+  auto positive_filters = split_filter_patterns(positive.c_str());
+  auto negative_filters = split_filter_patterns(negative);
 
   std::vector<const TestCase *> matched_tests;
   for (auto &t : registry()) {
-    if (test_matches_filter(t, positive.c_str())) {
+    if (test_matches_positive_filter(t, positive_filters)) {
       matched_tests.push_back(&t);
     }
   }
@@ -822,14 +1007,14 @@ inline int run_with_posneg_filter(const char *filter) {
   }
 
   int total = 0;
-  int failed_before = failures;
+  int failed_tests_before = failed_tests;
 
   set_color(Color::Cyan);
   std::cout << "[==========] Running tests with filter: " << filter << "\n";
   reset_color();
 
   for (const TestCase *t : matched_tests) {
-    if (!test_matches_filter(*t, negative)) {
+    if (!test_matches_any_filter(*t, negative_filters)) {
       total++;
       set_color(Color::Cyan);
       std::cout << "[ RUN      ] " << t->group << "." << t->name << "\n";
@@ -838,7 +1023,7 @@ inline int run_with_posneg_filter(const char *filter) {
     }
   }
 
-  int failed = failures - failed_before;
+  int failed = failed_tests - failed_tests_before;
 
   std::cout << "\n";
   set_color(failed ? Color::Red : Color::Green);

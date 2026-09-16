@@ -86,6 +86,7 @@
       return make_option_array_impl(__VA_ARGS__);                              \
     }();                                                                       \
     constexpr size_t option_count = options.size();                            \
+    constexpr auto command_name = std::string_view(cmd_name);                  \
     static_assert(option_count > 0, "No options registered!");                 \
     constexpr auto meta = cmd::meta::CommandMeta<option_count>(                \
         std::string_view(cmd_name), std::string_view(cmd_synopsis),            \
@@ -97,12 +98,33 @@
   template <size_t N>                                                          \
   int execute##name(CommandContext<N>& ctx) noexcept;                          \
                                                                                \
+  namespace command_##name##_internal {                                        \
+    inline int invoke(std::span<std::string_view> args) noexcept {             \
+      constexpr size_t N = option_count;                                       \
+      bool ok = true;                                                          \
+      auto ctx = make_context<N>(args, meta.options(), ok,                     \
+                                 option_policy_for_command(cmd_name));         \
+      if (!ok) {                                                               \
+        if (!ctx.parse_error.empty()) {                                        \
+          safeErrorPrintLn(std::string(command_name) + ": " +                  \
+                           winux::i18n::translate_error(ctx.parse_error));     \
+          safeErrorPrintLn(winux::i18n::format(                                \
+              "common.try_help", "Try '{} --help' for more information.",      \
+              command_name));                                                  \
+        }                                                                      \
+        return CommandRegistry::parseErrorExitCode(command_name);              \
+      }                                                                        \
+      return ::execute##name<N>(ctx);                                          \
+    }                                                                          \
+  }                                                                            \
+                                                                               \
   namespace {                                                                  \
   struct _Registrar_##name {                                                   \
     _Registrar_##name() {                                                      \
       constexpr size_t N = command_##name##_internal::option_count;            \
-      CommandRegistry::registerCommand<N>(                                     \
-          cmd_name, command_##name##_internal::meta, execute##name<N>);        \
+      CommandRegistry::registerCommand<N>(cmd_name,                            \
+                                          command_##name##_internal::meta,     \
+                                          command_##name##_internal::invoke);  \
     }                                                                          \
   };                                                                           \
   _Registrar_##name _registrar_instance_##name;                                \

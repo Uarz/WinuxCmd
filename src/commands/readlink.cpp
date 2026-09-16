@@ -83,17 +83,25 @@ struct ReparseDataBuffer {
 }  // namespace readlink_win32_compat
 
 auto constexpr READLINK_OPTIONS = std::array{
+    // [DIFFERS]
     OPTION("-f", "--canonicalize", "canonicalize by following every symlink",
            BOOL_TYPE),
+    // [DIFFERS]
     OPTION("-e", "--canonicalize-existing",
            "canonicalize by following symlinks (must exist)", BOOL_TYPE),
+    // [DIFFERS]
     OPTION("-m", "--canonicalize-missing",
            "canonicalize by following symlinks (may not exist)", BOOL_TYPE),
+    // [DIFFERS]
     OPTION("-n", "--no-newline", "do not output the trailing delimiter",
            BOOL_TYPE),
+    // [DIFFERS]
     OPTION("-q", "--quiet", "suppress most error messages", BOOL_TYPE),
+    // [DIFFERS]
     OPTION("-s", "--silent", "suppress most error messages", BOOL_TYPE),
+    // [DIFFERS]
     OPTION("-v", "--verbose", "report error message", BOOL_TYPE),
+    // [DIFFERS]
     OPTION("-z", "--zero", "end each output line with NUL", BOOL_TYPE)};
 
 namespace readlink_pipeline {
@@ -114,53 +122,6 @@ struct Config {
   bool zero_terminated = false;
   SmallVector<std::string, 64> files;
 };
-
-struct Handle {
-  HANDLE value = INVALID_HANDLE_VALUE;
-
-  Handle() = default;
-  explicit Handle(HANDLE h) : value(h) {}
-  ~Handle() {
-    if (value != INVALID_HANDLE_VALUE && value != nullptr) {
-      CloseHandle(value);
-    }
-  }
-
-  Handle(const Handle&) = delete;
-  Handle& operator=(const Handle&) = delete;
-
-  Handle(Handle&& other) noexcept
-      : value(std::exchange(other.value, INVALID_HANDLE_VALUE)) {}
-  Handle& operator=(Handle&& other) noexcept {
-    if (this != &other) {
-      if (value != INVALID_HANDLE_VALUE && value != nullptr) {
-        CloseHandle(value);
-      }
-      value = std::exchange(other.value, INVALID_HANDLE_VALUE);
-    }
-    return *this;
-  }
-
-  [[nodiscard]] explicit operator bool() const {
-    return value != INVALID_HANDLE_VALUE && value != nullptr;
-  }
-
-  [[nodiscard]] HANDLE get() const { return value; }
-};
-
-auto windows_error_text(DWORD error) -> std::string {
-  switch (error) {
-    case ERROR_FILE_NOT_FOUND:
-    case ERROR_PATH_NOT_FOUND:
-      return "No such file or directory";
-    case ERROR_ACCESS_DENIED:
-      return "Permission denied";
-    case ERROR_INVALID_PARAMETER:
-      return "Invalid argument";
-    default:
-      return std::system_category().message(static_cast<int>(error));
-  }
-}
 
 auto readlink_error(const std::string& file, std::string_view reason)
     -> std::string {
@@ -184,180 +145,66 @@ auto strip_extended_prefix(std::wstring path) -> std::wstring {
   return path;
 }
 
-auto get_full_path(const std::wstring& path)
-    -> std::expected<std::wstring, std::string> {
-  DWORD required = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
-  if (required == 0) {
-    return std::unexpected(windows_error_text(GetLastError()));
-  }
-
-  std::wstring buffer(required, L'\0');
-  DWORD written =
-      GetFullPathNameW(path.c_str(), required, buffer.data(), nullptr);
-  if (written == 0 || written >= required) {
-    return std::unexpected(windows_error_text(GetLastError()));
-  }
-
-  buffer.resize(written);
-  return strip_extended_prefix(std::move(buffer));
-}
-
-auto open_path_handle(const std::wstring& path, bool follow_reparse) -> Handle {
+auto open_path_handle(const std::wstring& path, bool follow_reparse)
+    -> UniqueHandle {
   DWORD flags = FILE_FLAG_BACKUP_SEMANTICS;
   if (!follow_reparse) {
     flags |= FILE_FLAG_OPEN_REPARSE_POINT;
   }
 
-  return Handle(
+  return UniqueHandle(
       CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                   nullptr, OPEN_EXISTING, flags, nullptr));
 }
 
-auto path_from_handle(HANDLE handle)
-    -> std::expected<std::wstring, std::string> {
-  DWORD required = GetFinalPathNameByHandleW(
-      handle, nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-  if (required == 0) {
-    return std::unexpected(windows_error_text(GetLastError()));
-  }
-
-  std::wstring buffer(required, L'\0');
-  DWORD written = GetFinalPathNameByHandleW(
-      handle, buffer.data(), required, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-  if (written == 0 || written >= required) {
-    return std::unexpected(windows_error_text(GetLastError()));
-  }
-
-  buffer.resize(written);
-  return strip_extended_prefix(std::move(buffer));
-}
-
-auto path_suffix(const std::filesystem::path& full,
-                 const std::filesystem::path& prefix) -> std::filesystem::path {
-  auto full_it = full.begin();
-  auto prefix_it = prefix.begin();
-  while (full_it != full.end() && prefix_it != prefix.end() &&
-         *full_it == *prefix_it) {
-    ++full_it;
-    ++prefix_it;
-  }
-
-  std::filesystem::path suffix;
-  for (; full_it != full.end(); ++full_it) {
-    suffix /= *full_it;
-  }
-  return suffix;
-}
-
-auto find_existing_prefix(const std::filesystem::path& absolute)
-    -> std::filesystem::path {
-  std::error_code ec;
-  auto current = absolute;
-  while (!current.empty()) {
-    if (std::filesystem::exists(current, ec) && !ec) {
-      return current;
-    }
-
-    auto parent = current.parent_path();
-    if (parent == current) {
-      break;
-    }
-    current = parent;
-  }
-
-  return {};
-}
-
-auto canonicalize_existing(const std::filesystem::path& absolute)
-    -> std::expected<std::wstring, std::string> {
-  Handle handle = open_path_handle(absolute.wstring(), true);
-  if (!handle) {
-    return std::unexpected(windows_error_text(GetLastError()));
-  }
-
-  return path_from_handle(handle.get());
-}
-
+// [GNU] -f, -e and -m are canonicalize_filename_mode() CAN_ALL_BUT_LAST,
+// CAN_EXISTING and CAN_MISSING: every component is resolved and symlink
+// targets are substituted as they are found, so "ldir/f" resolves through
+// the intermediate link and a dangling leaf still prints its target's path
+// under -f/-m (uutils #10249).
 auto canonicalize_path(const std::wstring& original, Mode mode)
     -> std::expected<std::wstring, std::string> {
-  auto full_path_result = get_full_path(original);
-  if (!full_path_result) {
-    return std::unexpected(full_path_result.error());
-  }
-
-  std::filesystem::path absolute(*full_path_result);
-  std::error_code ec;
-  bool exists = std::filesystem::exists(absolute, ec) && !ec;
-
+  native_path::CanonMode canon_mode = native_path::CanonMode::all_but_last;
   if (mode == Mode::canonicalize_existing) {
-    if (!exists) {
-      return std::unexpected("No such file or directory");
-    }
-    return canonicalize_existing(absolute);
+    canon_mode = native_path::CanonMode::existing;
+  } else if (mode == Mode::canonicalize_missing) {
+    canon_mode = native_path::CanonMode::missing;
   }
 
-  if (mode == Mode::canonicalize) {
-    if (exists) {
-      return canonicalize_existing(absolute);
-    }
-
-    auto parent = absolute.parent_path();
-    std::error_code parent_ec;
-    if (parent.empty() || !std::filesystem::exists(parent, parent_ec) ||
-        parent_ec || !std::filesystem::is_directory(parent, parent_ec) ||
-        parent_ec) {
-      return std::unexpected("No such file or directory");
-    }
-
-    auto parent_resolved = canonicalize_existing(parent);
-    if (!parent_resolved) {
-      return parent_resolved;
-    }
-
-    auto suffix = path_suffix(absolute, parent);
-    return (std::filesystem::path(*parent_resolved) / suffix).wstring();
-  }
-
-  if (exists) {
-    return canonicalize_existing(absolute);
-  }
-
-  auto prefix = find_existing_prefix(absolute);
-  if (prefix.empty()) {
-    return std::unexpected("No such file or directory");
-  }
-
-  auto suffix = path_suffix(absolute, prefix);
-  if (!suffix.empty()) {
-    std::error_code dir_ec;
-    if (!std::filesystem::is_directory(prefix, dir_ec) || dir_ec) {
-      return std::unexpected("No such file or directory");
+  auto resolved = native_path::canonicalize_path_w(original, canon_mode);
+  if (!resolved) {
+    switch (resolved.error()) {
+      case ELOOP:
+        return std::unexpected(
+            winux::i18n::format("command.readlink.error.too_many_symlinks",
+                                "Too many levels of symbolic links"));
+      case ENOTDIR:
+        return std::unexpected("Not a directory");
+      case ENAMETOOLONG:
+        return std::unexpected(winux::i18n::format(
+            "command.readlink.error.file_name_too_long", "File name too long"));
+      default:
+        return std::unexpected("No such file or directory");
     }
   }
-
-  auto prefix_resolved = canonicalize_existing(prefix);
-  if (!prefix_resolved) {
-    return prefix_resolved;
-  }
-
-  return (std::filesystem::path(*prefix_resolved) / suffix).wstring();
+  return *resolved;
 }
 
 auto read_link_target(const std::wstring& path)
     -> std::expected<std::wstring, std::string> {
   DWORD attrs = GetFileAttributesW(path.c_str());
   if (attrs == INVALID_FILE_ATTRIBUTES) {
-    return std::unexpected(windows_error_text(GetLastError()));
+    return std::unexpected(win32_posix_error_text(GetLastError()));
   }
 
   if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0) {
     return std::unexpected("Invalid argument");
   }
 
-  Handle handle = open_path_handle(path, false);
+  UniqueHandle handle = open_path_handle(path, false);
   if (!handle) {
-    return std::unexpected(windows_error_text(GetLastError()));
+    return std::unexpected(win32_posix_error_text(GetLastError()));
   }
 
   std::array<std::byte, MAXIMUM_REPARSE_DATA_BUFFER_SIZE> buffer{};
@@ -365,7 +212,7 @@ auto read_link_target(const std::wstring& path)
   if (!DeviceIoControl(handle.get(), FSCTL_GET_REPARSE_POINT, nullptr, 0,
                        buffer.data(), static_cast<DWORD>(buffer.size()),
                        &returned, nullptr)) {
-    return std::unexpected(windows_error_text(GetLastError()));
+    return std::unexpected(win32_posix_error_text(GetLastError()));
   }
 
   auto* reparse = reinterpret_cast<readlink_win32_compat::ReparseDataBuffer*>(
@@ -404,23 +251,49 @@ auto read_link_target(const std::wstring& path)
 auto build_config(const CommandContext<READLINK_OPTIONS.size()>& ctx)
     -> cp::Result<Config> {
   Config cfg;
+  bool posixly_correct = posixly_correct_is_set();
   cfg.mode = Mode::link_target;
-  if (ctx.get<bool>("--canonicalize-missing", false) ||
-      ctx.get<bool>("-m", false)) {
-    cfg.mode = Mode::canonicalize_missing;
-  } else if (ctx.get<bool>("--canonicalize-existing", false) ||
-             ctx.get<bool>("-e", false)) {
-    cfg.mode = Mode::canonicalize_existing;
-  } else if (ctx.get<bool>("--canonicalize", false) ||
-             ctx.get<bool>("-f", false)) {
-    cfg.mode = Mode::canonicalize;
-  }
   cfg.no_newline =
       ctx.get<bool>("--no-newline", false) || ctx.get<bool>("-n", false);
-  cfg.verbose = ctx.get<bool>("--verbose", false) || ctx.get<bool>("-v", false);
-  cfg.quiet = ctx.get<bool>("--quiet", false) || ctx.get<bool>("-q", false) ||
-              ctx.get<bool>("-s", false) ||
-              (!cfg.verbose && !posixly_correct_is_set());
+  cfg.verbose = false;
+  cfg.quiet = !posixly_correct;
+  for (const auto& occurrence : ctx.options.occurrences()) {
+    if (!ctx.metas || occurrence.index >= READLINK_OPTIONS.size()) {
+      continue;
+    }
+
+    const auto& meta = (*ctx.metas)[occurrence.index];
+    if (meta.long_name == "--canonicalize-missing" || meta.short_name == "-m") {
+      cfg.mode = Mode::canonicalize_missing;
+      continue;
+    }
+
+    if (meta.long_name == "--canonicalize-existing" ||
+        meta.short_name == "-e") {
+      cfg.mode = Mode::canonicalize_existing;
+      continue;
+    }
+
+    if (meta.long_name == "--canonicalize" || meta.short_name == "-f") {
+      cfg.mode = Mode::canonicalize;
+      continue;
+    }
+
+    if (meta.long_name == "--verbose" || meta.short_name == "-v") {
+      cfg.verbose = true;
+      cfg.quiet = false;
+      continue;
+    }
+
+    if (meta.long_name == "--quiet" || meta.short_name == "-q" ||
+        meta.long_name == "--silent" || meta.short_name == "-s") {
+      if (posixly_correct) {
+        continue;
+      }
+      cfg.verbose = false;
+      cfg.quiet = true;
+    }
+  }
   cfg.zero_terminated =
       ctx.get<bool>("--zero", false) || ctx.get<bool>("-z", false);
 
@@ -502,6 +375,12 @@ REGISTER_COMMAND(
 
   auto cfg_result = build_config(ctx);
   if (!cfg_result) {
+    if (cfg_result.error() == "missing operand") {
+      safeErrorPrintLn("readlink: missing operand");
+      safeErrorPrintLn("Try 'readlink --help' for more information.");
+      return 1;
+    }
+
     cp::report_error(cfg_result, L"readlink");
     return 1;
   }

@@ -42,8 +42,10 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr TTY_OPTIONS =
+    // [GNU] option
     std::array{OPTION("-s", "--silent",
                       "print nothing, just return exit status", BOOL_TYPE),
+               // [GNU] option
                OPTION("", "--quiet", "same as --silent", BOOL_TYPE)};
 
 REGISTER_COMMAND(
@@ -65,11 +67,14 @@ REGISTER_COMMAND(
 
     /* see also */
     "isatty(3)", "WinuxCmd", "Copyright © 2026 WinuxCmd", TTY_OPTIONS) {
+  clear_pipe_closed_flags();
+
   namespace cp = core::pipeline;
 
   if (!ctx.positionals.empty()) {
-    safeErrorPrintLn("tty: extra operand");
-    safePrintLn("Try 'tty --help' for more information.");
+    safeErrorPrintLn("tty: extra operand '" +
+                     std::string(ctx.positionals.front()) + "'");
+    safeErrorPrintLn("Try 'tty --help' for more information.");
     return 2;
   }
 
@@ -86,9 +91,13 @@ REGISTER_COMMAND(
 
   if (is_console) {
     safePrintLn("con");
-    return 0;
   } else {
     safePrintLn("not a tty");
-    return 1;
   }
+
+  if (is_stdout_pipe_closed()) {
+    return 3;
+  }
+
+  return is_console ? 0 : 1;
 }

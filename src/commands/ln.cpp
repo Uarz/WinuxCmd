@@ -59,36 +59,91 @@ using cmd::meta::OptionType;
  * symbolic link to a directory [NOT SUPPORT]
  */
 auto constexpr LN_OPTIONS = std::array{
+    // [GNU]
     OPTION("-s", "--symbolic", "make symbolic links instead of hard links"),
+    // [GNU]
     OPTION("-f", "--force", "remove existing destination files"),
+    // [GNU]
     OPTION("-v", "--verbose", "print name of each linked file"),
+    // [DIFFERS] -n: on Windows, directory-symlink target detection uses
+    // GetFileAttributesW; behaviour differs from GNU.
     OPTION("-n", "--no-dereference",
            "treat LINK_NAME as a normal file if it is a symbolic link to a "
            "directory"),
-    OPTION("-i", "--interactive",
-           "prompt whether to remove destinations"),
-    OPTION("-L", "--logical",
-           "dereference TARGETs that are symbolic links"),
-    OPTION("-P", "--physical",
-           "make hard links directly to symbolic links"),
-    OPTION("", "--dereference",
-           "dereference TARGETs that are symbolic links"),
-    OPTION("-b", "--backup",
-           "make a backup of each existing destination file"),
-    OPTION("-S", "--suffix",
-           "override the usual backup suffix", STRING_TYPE),
+    // [GNU]
+    OPTION("-i", "--interactive", "prompt whether to remove destinations"),
+    // [DIFFERS] -L/--logical: on Windows, CreateHardLinkW and the default
+    // file-open behaviour already dereference symlinks, making this flag
+    // effectively a no-op for hard links.
+    OPTION("-L", "--logical", "dereference TARGETs that are symbolic links"),
+    // [DIFFERS] -P/--physical: on Windows, hard links are always created
+    // directly to the target (symlinks are not followed); this is the
+    // default behaviour.
+    OPTION("-P", "--physical", "make hard links directly to symbolic links"),
+    // [DIFFERS] --dereference: alias for -L; same Windows caveats apply.
+    OPTION("", "--dereference", "dereference TARGETs that are symbolic links"),
+    // [GNU]
+    OPTION("-b", "--backup", "make a backup of each existing destination file"),
+    // [GNU]
+    OPTION("-S", "--suffix", "override the usual backup suffix", STRING_TYPE),
+    // [DIFFERS] -r/--relative: on Windows, relative symlink targets are
+    // computed using std::filesystem::relative which may differ from POSIX
+    // path resolution.
     OPTION("-r", "--relative",
            "with -s, create links relative to link location"),
+    // [GNU]
     OPTION("-t", "--target-directory",
            "specify the DIRECTORY in which to create the links", STRING_TYPE),
+    // [GNU]
     OPTION("-T", "--no-target-directory",
            "treat LINK_NAME as a normal file always"),
+    // [DIFFERS] -d/--directory: hard links to directories are not supported
+    // on Windows; an error is reported at runtime.
     OPTION("-d", "--directory",
            "allow the hard link to be a directory (privileged)"),
+    // [DIFFERS] -F: alias for -d; same Windows limitation applies.
     OPTION("-F", "", "allow hard link to directory (alias for -d)")};
 
 namespace ln_pipeline {
 namespace cp = core::pipeline;
+
+auto join_target_path(const std::string &directory, const std::string &source)
+    -> std::string {
+  std::string filename = source;
+  size_t sep = filename.find_last_of("/\\");
+  if (sep != std::string::npos) {
+    filename = filename.substr(sep + 1);
+  }
+  return directory + "\\" + filename;
+}
+
+// [GNU] -r/--relative: symbolic-link targets are relative to the link.
+auto relative_symlink_target(const std::string &source,
+                             const std::string &target) -> std::string {
+  std::error_code ec;
+  // Build paths from the wide form: the narrow path ctor decodes via the
+  // system ACP, which mangles non-ASCII UTF-8 sources/targets (#88).
+  auto source_path = std::filesystem::absolute(utf8_to_wstring(source), ec);
+  if (ec) return source;
+  auto target_path = std::filesystem::absolute(utf8_to_wstring(target), ec);
+  if (ec) return source;
+  auto relative =
+      std::filesystem::relative(source_path, target_path.parent_path(), ec);
+  return ec ? source : wstring_to_utf8(relative.wstring());
+}
+
+auto ln_windows_error_text(DWORD error) -> std::string {
+  Win32ErrorTextOptions options;
+  options.file_exists = true;
+  options.privilege_not_held_as_not_permitted = true;
+  return win32_posix_error_text(error, options);
+}
+
+auto ln_creation_failure_prefix(bool symbolic, const std::string &target)
+    -> std::string {
+  return symbolic ? "failed to create symbolic link '" + target + "'"
+                  : "failed to create hard link '" + target + "'";
+}
 
 /**
  * @brief Create a hard link
@@ -106,7 +161,7 @@ auto create_hardlink(const std::string &source, const std::string &target,
     if (verbose) {
       safePrint("'");
       safePrint(target);
-      safePrint("' -> '");
+      safePrint("' => '");
       safePrint(source);
       safePrint("'\n");
     }
@@ -115,7 +170,7 @@ auto create_hardlink(const std::string &source, const std::string &target,
 
   DWORD error = GetLastError();
   return std::unexpected("failed to create hard link '" + target +
-                         "': " + std::to_string(error));
+                         "': " + ln_windows_error_text(error));
 }
 
 /**
@@ -132,18 +187,17 @@ auto create_symlink(const std::string &source, const std::string &target,
 
   // Check if source is a directory
   DWORD attrs = GetFileAttributesW(wsource.c_str());
-  if (attrs == INVALID_FILE_ATTRIBUTES) {
-    return std::unexpected("failed to access '" + source + "'");
-  }
-
-  bool is_directory = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+  bool is_directory = attrs != INVALID_FILE_ATTRIBUTES &&
+                      (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
   DWORD flags = is_directory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
+  // [GNU] a symlink source may be dangling; creation must not fail when the
+  // source does not exist (uutils #13667)
 
   if (CreateSymbolicLinkW(wtarget.c_str(), wsource.c_str(), flags)) {
     if (verbose) {
       safePrint("'");
       safePrint(target);
-      safePrint("' -> '");
+      safePrint("' => '");
       safePrint(source);
       safePrint("'\n");
     }
@@ -152,7 +206,7 @@ auto create_symlink(const std::string &source, const std::string &target,
 
   DWORD error = GetLastError();
   return std::unexpected("failed to create symbolic link '" + target +
-                         "': " + std::to_string(error));
+                         "': " + ln_windows_error_text(error));
 }
 
 /**
@@ -191,7 +245,7 @@ auto remove_existing(const std::string &path) -> cp::Result<void> {
 
   DWORD error = GetLastError();
   return std::unexpected("failed to remove '" + path +
-                         "': " + std::to_string(error));
+                         "': " + ln_windows_error_text(error));
 }
 
 }  // namespace ln_pipeline
@@ -234,58 +288,167 @@ REGISTER_COMMAND(
   if (backup && backup_suffix.empty()) backup_suffix = "~";
   std::string target_dir = ctx.get<std::string>("--target-directory", "");
   if (target_dir.empty()) target_dir = ctx.get<std::string>("-t", "");
-  bool no_target_dir =
-      ctx.get<bool>("-T", false) || ctx.get<bool>("--no-target-directory", false);
+  bool no_target_dir = ctx.get<bool>("-T", false) ||
+                       ctx.get<bool>("--no-target-directory", false);
+  // [DIFFERS] -n/--no-dereference: on Windows, directory-symlink target
+  // detection uses GetFileAttributesW, which may differ from POSIX
+  // lstat() behaviour.
+  bool no_dereference =
+      ctx.get<bool>("-n", false) || ctx.get<bool>("--no-dereference", false);
+  // [DIFFERS] -L/--logical/--dereference: on Windows, CreateHardLinkW
+  // already dereferences symlinks transparently, so this flag is
+  // effectively a no-op for hard links.
+  bool logical = ctx.get<bool>("-L", false) ||
+                 ctx.get<bool>("--logical", false) ||
+                 ctx.get<bool>("--dereference", false);
+  // [DIFFERS] -P/--physical: on Windows, hard links are always created
+  // directly to the target without following symlinks (the default).
+  bool physical =
+      ctx.get<bool>("-P", false) || ctx.get<bool>("--physical", false);
+  // [DIFFERS] -d/--directory/-F: hard links to directories are not
+  // supported on Windows.
+  bool directory_link = ctx.get<bool>("-d", false) ||
+                        ctx.get<bool>("--directory", false) ||
+                        ctx.get<bool>("-F", false);
+  // [DIFFERS] -r/--relative: on Windows, relative symlink targets are
+  // computed using std::filesystem::relative, which may differ from POSIX
+  // path resolution.
+  bool relative =
+      ctx.get<bool>("-r", false) || ctx.get<bool>("--relative", false);
 
-  // Determine source and targets
-  std::string source;
-  std::vector<std::string> targets;
+  // [DIFFERS] -d/--directory/-F: not supported on Windows.
+  if (directory_link) {
+    safeErrorPrintLn(winux::i18n::translate(
+        "command.ln.error.directory-hardlink-unsupported",
+        "ln: hard links to directories are not supported on Windows"));
+    return 1;
+  }
+  if (logical && physical) {
+    safeErrorPrintLn(
+        "ln: options --logical and --physical are mutually exclusive");
+    return 1;
+  }
+
+  if (!target_dir.empty() && no_target_dir) {
+    // GNU 9.11 ln.c: "cannot combine --target-directory and
+    // --no-target-directory"
+    safeErrorPrint(
+        "ln: cannot combine --target-directory "
+        "and --no-target-directory\n");
+    return 1;
+  }
+
+  std::vector<std::pair<std::string, std::string>> link_jobs;
 
   if (!target_dir.empty()) {
-    // -t mode: all positionals are sources, target_dir is the destination
     if (ctx.positionals.empty()) {
-      safeErrorPrint("ln: missing operand\n");
+      safeErrorPrint("ln: missing file operand\n");
       safeErrorPrint("Try 'ln --help' for more information.\n");
       return 1;
     }
-    // Check if target_dir exists and is a directory
+    // GNU 9.11 ln.c: missing -t dir reports "failed to access"; an
+    // existing non-directory reports "target 'x' is not a directory".
     std::wstring wtd = utf8_to_wstring(target_dir);
     DWORD td_attrs = GetFileAttributesW(wtd.c_str());
-    if (td_attrs == INVALID_FILE_ATTRIBUTES ||
-        !(td_attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+    if (td_attrs == INVALID_FILE_ATTRIBUTES) {
+      safeErrorPrint("ln: failed to access '" + target_dir +
+                     "': No such file or directory\n");
+      return 1;
+    }
+    if (!(td_attrs & FILE_ATTRIBUTE_DIRECTORY)) {
       safeErrorPrint("ln: target '" + target_dir + "' is not a directory\n");
       return 1;
     }
     for (auto arg : ctx.positionals) {
-      std::string s(arg);
-      // Extract filename from source path
-      std::string filename = s;
-      size_t sep = filename.find_last_of("/\\");
-      if (sep != std::string::npos) filename = filename.substr(sep + 1);
-      targets.push_back(target_dir + "\\" + filename);
+      std::string source(arg);
+      link_jobs.emplace_back(source, join_target_path(target_dir, source));
     }
-    source = std::string(ctx.positionals[0]);
-  } else if (ctx.positionals.size() < 2) {
-    safeErrorPrint("ln: missing operand\n");
+  } else if (ctx.positionals.empty()) {
+    safeErrorPrint("ln: missing file operand\n");
     safeErrorPrint("Try 'ln --help' for more information.\n");
     return 1;
+  } else if (no_target_dir && ctx.positionals.size() == 1) {
+    // GNU: -T requires exactly two operands.
+    safeErrorPrint("ln: missing destination file operand after '" +
+                   std::string(ctx.positionals[0]) + "'\n");
+    safeErrorPrint("Try 'ln --help' for more information.\n");
+    return 1;
+  } else if (ctx.positionals.size() == 1) {
+    std::string source(std::string(ctx.positionals[0]));
+    link_jobs.emplace_back(source, join_target_path(".", source));
+  } else if (no_target_dir) {
+    if (ctx.positionals.size() > 2) {
+      safeErrorPrint("ln: extra operand '" + std::string(ctx.positionals[2]) +
+                     "'\n");
+      safeErrorPrint("Try 'ln --help' for more information.\n");
+      return 1;
+    }
+    link_jobs.emplace_back(std::string(ctx.positionals[0]),
+                           std::string(ctx.positionals[1]));
+  } else if (ctx.positionals.size() == 2) {
+    std::string source(std::string(ctx.positionals[0]));
+    std::string target(std::string(ctx.positionals[1]));
+    std::wstring wtarget = utf8_to_wstring(target);
+    DWORD target_attrs = GetFileAttributesW(wtarget.c_str());
+    std::error_code target_ec;
+    const bool target_is_symlink = std::filesystem::is_symlink(
+        std::filesystem::symlink_status(target, target_ec));
+    if (target_attrs != INVALID_FILE_ATTRIBUTES &&
+        (target_attrs & FILE_ATTRIBUTE_DIRECTORY) &&
+        !(no_dereference && target_is_symlink)) {
+      link_jobs.emplace_back(source, join_target_path(target, source));
+    } else {
+      link_jobs.emplace_back(source, target);
+    }
   } else {
-    source = std::string(ctx.positionals[0]);
-    for (size_t i = 1; i < ctx.positionals.size(); ++i) {
-      targets.push_back(std::string(ctx.positionals[i]));
+    target_dir = std::string(ctx.positionals.back());
+    std::wstring wtd = utf8_to_wstring(target_dir);
+    DWORD td_attrs = GetFileAttributesW(wtd.c_str());
+    if (td_attrs == INVALID_FILE_ATTRIBUTES ||
+        !(td_attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+      // GNU 9.11 ln.c: errno-style "target 'x': <reason>".
+      safeErrorPrint("ln: target '" + target_dir +
+                     (td_attrs == INVALID_FILE_ATTRIBUTES
+                          ? "': No such file or directory\n"
+                          : "': Not a directory\n"));
+      return 1;
+    }
+
+    for (size_t i = 0; i + 1 < ctx.positionals.size(); ++i) {
+      std::string source(ctx.positionals[i]);
+      link_jobs.emplace_back(source, join_target_path(target_dir, source));
     }
   }
 
-  size_t target_count = targets.size();
+  size_t target_count = link_jobs.size();
   size_t success_count = 0;
   size_t error_count = 0;
 
-  if (verbose && target_count > 1) {
-    safePrint("ln: creating " + std::to_string(target_count) + " links from '" +
-              source + "'...\n");
-  }
+  for (const auto &[job_source, target] : link_jobs) {
+    std::string source = job_source;
+    if (!symbolic && logical) {
+      std::error_code source_ec;
+      auto resolved =
+          std::filesystem::canonical(utf8_to_wstring(source), source_ec);
+      if (!source_ec) source = wstring_to_utf8(resolved.wstring());
+    }
+    if (symbolic && relative) source = relative_symlink_target(source, target);
 
-  for (const auto& target : targets) {
+    // [GNU] For hard links, ln stats the source first so a missing TARGET
+    // reports "failed to access 'src'".  FindFirstFileW is the lstat
+    // equivalent here: a dangling symlink still counts as existing.
+    if (!symbolic) {
+      WIN32_FIND_DATAW sfd{};
+      HANDLE sh = FindFirstFileW(utf8_to_wstring(source).c_str(), &sfd);
+      if (sh == INVALID_HANDLE_VALUE) {
+        safeErrorPrint("ln: failed to access '" + source +
+                       "': No such file or directory\n");
+        error_count++;
+        continue;
+      }
+      FindClose(sh);
+    }
+
     // Check if target exists
     std::wstring wtarget = utf8_to_wstring(target);
     DWORD target_attrs = GetFileAttributesW(wtarget.c_str());
@@ -329,9 +492,9 @@ REGISTER_COMMAND(
         }
       } else if (!backup) {
         // No force, no backup, no interactive - error
-        if (!no_target_dir ||
-            (target_attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-          safeErrorPrint("ln: '" + target + "' exists\n");
+        if (!no_target_dir || (target_attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+          safeErrorPrint("ln: " + ln_creation_failure_prefix(symbolic, target) +
+                         ": File exists\n");
           error_count++;
           continue;
         }
@@ -359,11 +522,6 @@ REGISTER_COMMAND(
     } else {
       success_count++;
     }
-  }
-
-  if (verbose) {
-    safePrint("ln: " + std::to_string(success_count) + " links created, " +
-              std::to_string(error_count) + " errors\n");
   }
 
   return (error_count > 0) ? 1 : 0;

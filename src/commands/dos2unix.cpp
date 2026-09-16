@@ -42,6 +42,7 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr DOS2UNIX_OPTIONS = std::array{
+    // [EXT]
     OPTION("-v", "--verbose", "print a message for each file", BOOL_TYPE)};
 
 REGISTER_COMMAND(dos2unix,
@@ -72,7 +73,8 @@ REGISTER_COMMAND(dos2unix,
   auto process_file = [&](const std::string& filename,
                           bool modify_in_place) -> bool {
     std::wstring wfilename = utf8_to_wstring(filename);
-    std::ifstream input(wfilename, std::ios::binary);
+    std::ifstream input(native_path::normalize_api_operand_w(wfilename),
+                        std::ios::binary);
     if (!input) {
       safeErrorPrintLn("dos2unix: cannot open '" + filename +
                        "': No such file or directory");
@@ -112,23 +114,14 @@ REGISTER_COMMAND(dos2unix,
   };
 
   if (ctx.positionals.empty()) {
-    // Read from stdin, write to stdout
-    std::string line;
-    bool first = true;
-    while (std::getline(std::cin, line)) {
-      // Remove trailing \r if present
-      if (!line.empty() && line.back() == '\r') {
-        line.pop_back();
-      }
-      if (!first) {
-        safePrint("\n");
-      }
-      safePrint(line);
-      first = false;
+    // Preserve stdin byte-for-byte except for CRLF pairs. getline() would
+    // manufacture a final newline for input that does not have one.
+    std::string content((std::istreambuf_iterator<char>(std::cin)), {});
+    size_t pos = 0;
+    while ((pos = content.find("\r\n", pos)) != std::string::npos) {
+      content.erase(pos, 1);
     }
-    if (!first) {
-      safePrint("\n");
-    }
+    safePrint(content);
   } else {
     // Process each file in place
     bool all_ok = true;

@@ -53,3 +53,22 @@ TEST(watch, watch_no_title) {
 
   EXPECT_EQ(r.exit_code, 0);
 }
+
+TEST(watch, watch_finite_run_returns_child_status) {
+  Pipeline p;
+  p.add(L"watch.exe",
+        {L"-n", L"0", L"-c", L"1", L"-t", L"cmd", L"/c", L"exit", L"7"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 7);
+}
+
+TEST(watch, watch_differences_option) {
+  Pipeline p;
+  p.add(L"watch.exe",
+        {L"--differences", L"-n", L"0", L"-c", L"1", L"-t", L"echo", L"test"});
+  auto r = p.run();
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_NE(r.stdout_text.find("test"), std::string::npos);
+}

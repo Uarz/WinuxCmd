@@ -43,17 +43,29 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr UNAME_OPTIONS = std::array{
+    // [DIFFERS] option
     OPTION("-a", "--all", "print all information", BOOL_TYPE),
+    // [DIFFERS] option
     OPTION("-s", "--kernel-name", "print the kernel name", BOOL_TYPE),
+    // [DIFFERS] option
     OPTION("-n", "--nodename", "print the network node hostname", BOOL_TYPE),
+    // [DIFFERS] option
     OPTION("-r", "--kernel-release", "print the kernel release", BOOL_TYPE),
+    // [DIFFERS] option
     OPTION("-v", "--kernel-version", "print the kernel version", BOOL_TYPE),
+    // [DIFFERS] option
     OPTION("-m", "--machine", "print the machine hardware name", BOOL_TYPE),
+    // [DIFFERS] option
     OPTION("-p", "--processor", "print the processor type", BOOL_TYPE),
+    // [DIFFERS] option
     OPTION("-i", "--hardware-platform", "print the hardware platform",
            BOOL_TYPE),
-    OPTION("-o", "--operating-system", "print the operating system",
-           BOOL_TYPE)};
+    // [DIFFERS] option
+    OPTION("-o", "--operating-system", "print the operating system", BOOL_TYPE),
+    // [GNU] --sysname: obsolescent alias for -s/--kernel-name; hidden
+    OPTION("", "--sysname", "", BOOL_TYPE),
+    // [GNU] --release: obsolescent alias for -r/--kernel-release; hidden
+    OPTION("", "--release", "", BOOL_TYPE)};
 
 namespace uname_pipeline {
 namespace cp = core::pipeline;
@@ -74,12 +86,14 @@ auto build_config(const CommandContext<UNAME_OPTIONS.size()>& ctx)
     -> cp::Result<Config> {
   Config cfg;
   cfg.all = ctx.get<bool>("--all", false) || ctx.get<bool>("-a", false);
-  cfg.kernel_name =
-      ctx.get<bool>("--kernel-name", false) || ctx.get<bool>("-s", false);
+  cfg.kernel_name = ctx.get<bool>("--kernel-name", false) ||
+                    ctx.get<bool>("-s", false) ||
+                    ctx.get<bool>("--sysname", false);
   cfg.nodename =
       ctx.get<bool>("--nodename", false) || ctx.get<bool>("-n", false);
-  cfg.kernel_release =
-      ctx.get<bool>("--kernel-release", false) || ctx.get<bool>("-r", false);
+  cfg.kernel_release = ctx.get<bool>("--kernel-release", false) ||
+                       ctx.get<bool>("-r", false) ||
+                       ctx.get<bool>("--release", false);
   cfg.kernel_version =
       ctx.get<bool>("--kernel-version", false) || ctx.get<bool>("-v", false);
   cfg.machine = ctx.get<bool>("--machine", false) || ctx.get<bool>("-m", false);
@@ -130,7 +144,7 @@ auto run(const Config& cfg) -> int {
     DWORD size = 256;
     if (GetComputerNameW(hostname, &size)) {
       std::wstring ws(hostname);
-      std::string host(ws.begin(), ws.end());
+      std::string host = wstring_to_utf8(ws);
       outputs.push_back(host);
     } else {
       outputs.push_back("unknown");

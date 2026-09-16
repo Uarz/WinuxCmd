@@ -43,9 +43,12 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr TAC_OPTIONS = std::array{
+    // [GNU] -b, --before
     OPTION("-b", "--before",
            "attach the separator before instead of after each record"),
+    // [GNU] -r, --regex
     OPTION("-r", "--regex", "treat the separator as a regular expression"),
+    // [GNU] -s, --separator
     OPTION("-s", "--separator", "use STRING as the record separator",
            STRING_TYPE),
 };
@@ -93,23 +96,26 @@ auto build_config(const CommandContext<TAC_OPTIONS.size()>& ctx)
 }
 
 auto read_source(const std::string& file) -> cp::Result<std::string> {
-  if (file == "-") {
-    std::string content;
-    content.assign(std::istreambuf_iterator<char>(std::cin),
-                   std::istreambuf_iterator<char>());
-    return content;
+  return file_io::read_all_input(file);
+}
+
+auto normalize_newline_delimited_text(std::string_view content) -> std::string {
+  std::string normalized;
+  normalized.reserve(content.size());
+
+  for (size_t i = 0; i < content.size(); ++i) {
+    if (content[i] == '\r') {
+      if (i + 1 == content.size()) {
+        continue;
+      }
+      if (content[i + 1] == '\n') {
+        continue;
+      }
+    }
+    normalized.push_back(content[i]);
   }
 
-  std::ifstream f(file, std::ios::binary);
-  if (!f) {
-    return std::unexpected(std::string("cannot open '") + file +
-                           "' for reading");
-  }
-  std::string content;
-  content.assign(std::istreambuf_iterator<char>(f),
-                 std::istreambuf_iterator<char>());
-  if (f.fail() && !f.eof()) return std::unexpected("error reading from file");
-  return content;
+  return normalized;
 }
 
 auto split_literal_records(std::string_view content, std::string_view separator,
@@ -145,32 +151,31 @@ auto split_literal_records(std::string_view content, std::string_view separator,
 auto split_regex_records(std::string_view content, const std::string& separator,
                          bool before) -> cp::Result<std::vector<std::string>> {
   std::vector<std::string> records;
-  try {
-    std::regex sep(separator);
-    std::string text(content);
-    size_t record_start = 0;
-    for (auto it = std::sregex_iterator(text.begin(), text.end(), sep);
-         it != std::sregex_iterator(); ++it) {
-      size_t pos = static_cast<size_t>(it->position());
-      size_t len = static_cast<size_t>(it->length());
-      if (len == 0)
-        return std::unexpected("separator regex matches empty string");
-      if (before) {
-        records.emplace_back(text.substr(record_start, pos - record_start));
-        record_start = pos;
-      } else {
-        size_t record_end = pos + len;
-        records.emplace_back(
-            text.substr(record_start, record_end - record_start));
-        record_start = record_end;
-      }
-    }
-    if (record_start < text.size())
-      records.emplace_back(text.substr(record_start));
-    return records;
-  } catch (const std::regex_error&) {
+  auto sep =
+      portable_regex::compile(portable_regex::Syntax::Extended, separator);
+  if (!sep) {
     return std::unexpected("invalid regular expression");
   }
+
+  size_t record_start = 0;
+  for (const auto& match : sep.pattern.find_all(content)) {
+    size_t pos = match.begin;
+    size_t len = match.end - match.begin;
+    if (len == 0)
+      return std::unexpected("separator regex matches empty string");
+    if (before) {
+      records.emplace_back(content.substr(record_start, pos - record_start));
+      record_start = pos;
+    } else {
+      size_t record_end = pos + len;
+      records.emplace_back(
+          content.substr(record_start, record_end - record_start));
+      record_start = record_end;
+    }
+  }
+  if (record_start < content.size())
+    records.emplace_back(content.substr(record_start));
+  return records;
 }
 
 auto output_reversed_records(const std::vector<std::string>& records) -> void {
@@ -180,11 +185,16 @@ auto output_reversed_records(const std::vector<std::string>& records) -> void {
 }
 
 auto run(const Config& cfg) -> int {
+  // [GNU] tac.c: an unreadable operand is diagnosed but does not stop the
+  // remaining files; the exit status only turns nonzero once every operand
+  // has been processed.
+  bool any_error = false;
   for (const auto& file : cfg.files) {
     auto content = read_source(file);
     if (!content) {
       cp::report_error(content, L"tac");
-      return 1;
+      any_error = true;
+      continue;
     }
 
     cp::Result<std::vector<std::string>> records =
@@ -193,12 +203,13 @@ auto run(const Config& cfg) -> int {
                         *content, cfg.separator, cfg.before)};
     if (!records) {
       cp::report_error(records, L"tac");
-      return 1;
+      any_error = true;
+      continue;
     }
     output_reversed_records(*records);
   }
 
-  return 0;
+  return any_error ? 1 : 0;
 }
 
 }  // namespace tac_pipeline

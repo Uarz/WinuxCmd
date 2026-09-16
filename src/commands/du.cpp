@@ -70,52 +70,77 @@ using cmd::meta::OptionType;
  * - @a --exclude=PATTERN: exclude files matching shell pattern [IMPLEMENTED]
  */
 auto constexpr DU_OPTIONS = std::array{
+    // [GNU]
     OPTION("-a", "--all", "write counts for all files, not just directories"),
+    // [GNU]
     OPTION("-A", "--apparent-size", "print apparent sizes"),
+    // [GNU]
     OPTION("-B", "--block-size", "scale sizes by SIZE before printing them",
            STRING_TYPE),
+    // [GNU]
     OPTION("-b", "--bytes", "equivalent to '--apparent-size --block-size=1'"),
+    // [GNU]
     OPTION("-c", "--total", "produce a grand total"),
+    // [GNU]
     OPTION(
         "-d", "--max-depth",
         "print the total for a directory only if it is N or fewer levels below",
         INT_TYPE),
+    // [GNU]
     OPTION("-h", "--human-readable",
            "print sizes in powers of 1024 (e.g., 1023M)"),
+    // [GNU]
     OPTION("-H", "--dereference-args",
            "dereference only symlinks that are command line arguments"),
+    // [GNU]
     OPTION("", "--si", "print sizes in powers of 1000 (e.g., 1.1G)"),
+    // [GNU]
     OPTION("-k", "", "like --block-size=1K"),
-    OPTION("-L", "--dereference",
-           "dereference all symbolic links"),
+    // [GNU]
+    OPTION("-L", "--dereference", "dereference all symbolic links"),
+    // [GNU]
     OPTION("-P", "--no-dereference",
            "don't follow any symbolic links (default)"),
+    // [GNU]
     OPTION("-s", "--summarize", "display only a total for each argument"),
+    // [GNU]
     OPTION("-t", "--threshold", "exclude entries smaller/greater than SIZE",
            STRING_TYPE),
+    // [GNU]
     OPTION("", "--exclude", "exclude files that match PATTERN", STRING_TYPE),
+    // [GNU]
     OPTION("-x", "--one-file-system",
            "skip directories on different file systems"),
+    // [GNU]
     OPTION("", "--inodes",
            "list inode usage information instead of block usage"),
+    // [GNU]
     OPTION("", "--time",
            "show time of the last modification of any file in the directory; "
            "see --time-style",
-           STRING_TYPE),
+           OPTIONAL_STRING_TYPE),
+    // [GNU]
+    OPTION("", "--time-style", "show timestamps using STYLE", STRING_TYPE),
+    // [GNU]
     OPTION("-0", "--null", "end each output line with NUL, not newline"),
+    // [GNU]
     OPTION("-D", "--dereference-args",
            "dereference only symlinks that are command line arguments"),
+    // [GNU]
     OPTION("", "--files0-from",
-           "summarize disk usage of the NUL-terminated file names specified in file F",
+           "summarize disk usage of the NUL-terminated file names specified in "
+           "file F",
            STRING_TYPE),
-    OPTION("-l", "--count-links",
-           "count sizes many times if hard linked"),
+    // [GNU]
+    OPTION("-l", "--count-links", "count sizes many times if hard linked"),
+    // [GNU]
     OPTION("-m", "", "like --block-size=1M"),
+    // [GNU]
     OPTION("-S", "--separate-dirs",
            "for directories, do not include size of subdirectories"),
+    // [GNU]
     OPTION("-X", "--exclude-from",
-           "exclude files that match any pattern in FILE",
-           STRING_TYPE)};
+           "exclude files that match any pattern in FILE", STRING_TYPE)};
 
 // ======================================================
 // Pipeline components
@@ -125,32 +150,54 @@ namespace cp = core::pipeline;
 
 /**
  * @brief Format size to human-readable string
+ *
+ * [GNU] Mirrors coreutils human_readable(): values round UP (ceiling) and
+ * roll over to the next unit when the ceiling reaches the base (1537B ->
+ * 1.6K, 1048575B -> 1.0M; Savannah #1154).
+ *
  * @param size Size in bytes
  * @param si Use 1000-based units instead of 1024-based
  * @return Formatted string
  */
 auto format_size(uint64_t size, bool si) -> std::string {
-  const char* units = si ? const_cast<char*>("BKMGTPE")  // 1000-based
-                         : const_cast<char*>("BKMGTP");  // 1024-based
+  const char* units = si ? "BKMGTPE"  // 1000-based
+                         : "BKMGTP";  // 1024-based
+  const uint64_t base = si ? 1000 : 1024;
 
-  double base = si ? 1000.0 : 1024.0;
-  int unit_index = 0;
-  double size_d = static_cast<double>(size);
+  if (size < base) {
+    return std::to_string(size);
+  }
 
-  while (size_d >= base && unit_index < 6) {
-    size_d /= base;
-    unit_index++;
+  // Smallest unit index (1 = K) with size in [base^idx, base^(idx+1)).
+  int idx = 0;
+  uint64_t unit = base;
+  while (idx < 6 && size / unit >= base) {
+    unit *= base;
+    ++idx;
+  }
+  ++idx;
+
+  // Ceiling in tenths of the selected unit (exact integer math; the
+  // remainder-based form avoids overflow for exabyte-scale sizes).
+  const uint64_t q = size / unit;
+  const uint64_t r = size % unit;
+  uint64_t tenths = q * 10 + (r * 10 + unit - 1) / unit;
+
+  // Rollover: 1024.0K displays as 1.0M.
+  while (tenths >= base * 10 && idx < 6) {
+    tenths = (tenths + base - 1) / base;
+    ++idx;
   }
 
   char buf[32];
-  if (unit_index == 0) {
-    snprintf(buf, sizeof(buf), "%.0f", size_d);
-  } else if (size_d < 10.0) {
-    snprintf(buf, sizeof(buf), "%.1f%c", size_d, units[unit_index]);
+  if (tenths < 100) {  // value < 10 units: one decimal digit
+    snprintf(buf, sizeof(buf), "%llu.%llu%c",
+             static_cast<unsigned long long>(tenths / 10),
+             static_cast<unsigned long long>(tenths % 10), units[idx]);
   } else {
-    snprintf(buf, sizeof(buf), "%.0f%c", size_d, units[unit_index]);
+    snprintf(buf, sizeof(buf), "%llu%c",
+             static_cast<unsigned long long>((tenths + 9) / 10), units[idx]);
   }
-
   return std::string(buf);
 }
 
@@ -165,7 +212,14 @@ auto pow_u64(uint64_t base, int exponent) -> std::optional<uint64_t> {
   return value;
 }
 
-auto parse_block_size(std::string_view text) -> std::optional<uint64_t> {
+// Parses a GNU-style block size spec. When |display_suffix| is non-null and
+// the spec is a bare suffix without a leading integer (e.g. "M", "kB", "MiB"),
+// the suffix text is stored there: GNU appends it to output sizes in that case
+// ("--block-size=kB" displays 3000 as "3kB"), while an integer-prefixed spec
+// ("1M") scales silently.
+auto parse_block_size(std::string_view text,
+                      std::string* display_suffix = nullptr)
+    -> std::optional<uint64_t> {
   if (text.empty()) {
     return std::nullopt;
   }
@@ -217,12 +271,14 @@ auto parse_block_size(std::string_view text) -> std::optional<uint64_t> {
   uint64_t multiplier = 1;
   std::string_view number = text;
   bool suffix_matched = false;
+  std::string_view matched_suffix;
   for (const auto& unit : units) {
     if (text.size() >= unit.suffix.size() &&
         text.substr(text.size() - unit.suffix.size()) == unit.suffix) {
       multiplier = unit.multiplier;
       number = text.substr(0, text.size() - unit.suffix.size());
       suffix_matched = true;
+      matched_suffix = unit.suffix;
       break;
     }
   }
@@ -240,6 +296,11 @@ auto parse_block_size(std::string_view text) -> std::optional<uint64_t> {
 
   if (value == 0 || value > std::numeric_limits<uint64_t>::max() / multiplier) {
     return std::nullopt;
+  }
+  if (display_suffix != nullptr) {
+    *display_suffix = (suffix_matched && number.empty())
+                          ? std::string(matched_suffix)
+                          : std::string();
   }
   return value * multiplier;
 }
@@ -269,6 +330,63 @@ auto parse_threshold_size(std::string_view text) -> std::optional<int64_t> {
   return negative ? -value : value;
 }
 
+auto load_exclude_patterns_from_file(const std::string& path)
+    -> cp::Result<std::vector<std::string>> {
+  std::ifstream in(path, std::ios::binary);
+  if (!in.is_open()) {
+    return std::unexpected("cannot open exclude file '" + path + "'");
+  }
+
+  std::string buf((std::istreambuf_iterator<char>(in)),
+                  std::istreambuf_iterator<char>());
+  if (buf.empty()) {
+    return std::vector<std::string>{};
+  }
+
+  std::vector<std::string> lines;
+  size_t start = 0;
+  while (start < buf.size()) {
+    size_t pos = buf.find('\n', start);
+    if (pos == std::string::npos) {
+      lines.emplace_back(buf.substr(start));
+      break;
+    }
+    lines.emplace_back(buf.substr(start, pos - start));
+    start = pos + 1;
+  }
+
+  for (auto& line : lines) {
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+  }
+  return lines;
+}
+
+auto read_files0_from(const std::string& path)
+    -> cp::Result<std::vector<std::string>> {
+  std::istream* input = nullptr;
+  std::ifstream file;
+  if (path == "-") {
+    input = &std::cin;
+  } else {
+    file.open(path, std::ios::binary);
+    if (!file.is_open()) {
+      return std::unexpected("cannot open file list '" + path + "'");
+    }
+    input = &file;
+  }
+
+  std::vector<std::string> paths;
+  std::string name;
+  while (std::getline(*input, name, '\0')) {
+    if (!name.empty()) {
+      paths.push_back(name);
+    }
+  }
+  return paths;
+}
+
 auto ceil_div(uint64_t value, uint64_t divisor) -> uint64_t {
   if (value == 0) {
     return 0;
@@ -276,22 +394,51 @@ auto ceil_div(uint64_t value, uint64_t divisor) -> uint64_t {
   return 1 + ((value - 1) / divisor);
 }
 
+// [GNU] Canonical, case-insensitive key used to detect directories that were
+// already traversed earlier in this invocation. GNU du skips such arguments
+// entirely and lets already-traversed subtrees contribute nothing to later
+// parent arguments (Savannah #10397).
+auto du_dir_key(const std::wstring& path) -> std::wstring {
+  std::error_code ec;
+  std::filesystem::path canon =
+      std::filesystem::weakly_canonical(std::filesystem::path(path), ec);
+  std::wstring key = ec ? path : canon.wstring();
+  std::transform(key.begin(), key.end(), key.begin(), ::towupper);
+  return key;
+}
+
 struct OutputConfig {
   bool human = false;
   bool si = false;
   uint64_t block_size = 1024;
+  // Set when a command-line option selected the size mode; environment
+  // block-size variables apply only when no option did (uutils #8916).
+  bool size_explicit = false;
+  // Suffix appended to scaled output (set when --block-size used a bare
+  // unit suffix such as "M", e.g. "du -BM" prints "1M").
+  std::string display_suffix;
 };
 
 enum class ThresholdMode { None, Minimum, Maximum };
+enum class DuTimeMode { Modification, Access, Status };
 
 struct DuConfig {
   bool count_all = false;
   bool total = false;
   bool summarize = false;
   bool dereference = false;       // -L
+  bool dereference_args = false;  // -H/-D / --dereference-args
+  bool apparent_size = false;     // -A / --apparent-size [DIFFERS]
+  bool no_dereference = false;    // -P / --no-dereference [DIFFERS]
+  bool count_links = false;       // -l / --count-links
   bool one_file_system = false;   // -x
   bool show_inodes = false;       // --inodes
-  std::string time_word;          // --time
+  bool null_terminated = false;   // -0
+  bool separate_dirs = false;     // -S
+  bool show_time = false;         // --time
+  DuTimeMode time_mode = DuTimeMode::Modification;
+  std::string time_word;   // --time
+  std::string time_style;  // --time-style
   int max_depth = -1;
   ThresholdMode threshold_mode = ThresholdMode::None;
   uint64_t threshold_size = 0;
@@ -299,16 +446,146 @@ struct DuConfig {
   OutputConfig output;
 };
 
+struct UsageSummary {
+  uint64_t size = 0;
+  FILETIME latest_time{};
+  bool has_time = false;
+};
+
+auto print_record_terminator(bool null_terminated) -> void {
+  if (null_terminated) {
+    safePrint(char{'\0'});
+  } else {
+    safePrint("\n");
+  }
+}
+
 auto print_scaled_size(uint64_t size, const OutputConfig& cfg) -> void {
   if (cfg.human || cfg.si) {
     safePrint(format_size(size, cfg.si));
     return;
   }
 
+  safePrint(std::to_string(ceil_div(size, cfg.block_size)) +
+            cfg.display_suffix);
+}
+
+auto parse_du_time_mode(std::string_view value) -> std::optional<DuTimeMode> {
+  if (value.empty() || value == "mtime" || value == "modification" ||
+      value == "modified") {
+    return DuTimeMode::Modification;
+  }
+  if (value == "atime" || value == "access" || value == "use") {
+    return DuTimeMode::Access;
+  }
+  if (value == "ctime" || value == "status") {
+    return DuTimeMode::Status;
+  }
+  return std::nullopt;
+}
+
+auto get_selected_time(const WIN32_FILE_ATTRIBUTE_DATA& data, DuTimeMode mode)
+    -> FILETIME {
+  switch (mode) {
+    case DuTimeMode::Modification:
+      return data.ftLastWriteTime;
+    case DuTimeMode::Access:
+      return data.ftLastAccessTime;
+    case DuTimeMode::Status:
+      return data.ftCreationTime;
+  }
+  return data.ftLastWriteTime;
+}
+
+auto is_later_filetime(const FILETIME& lhs, const FILETIME& rhs) -> bool {
+  return CompareFileTime(&lhs, &rhs) > 0;
+}
+
+auto update_latest_time(UsageSummary& summary, const FILETIME& candidate)
+    -> void {
+  if (!summary.has_time || is_later_filetime(candidate, summary.latest_time)) {
+    summary.latest_time = candidate;
+    summary.has_time = true;
+  }
+}
+
+auto format_time_long_iso(FILETIME file_time,
+                          std::string_view style = "long-iso") -> std::string {
+  FILETIME local_ft{};
+  if (!FileTimeToLocalFileTime(&file_time, &local_ft)) {
+    local_ft = file_time;
+  }
+
+  SYSTEMTIME st{};
+  if (!FileTimeToSystemTime(&local_ft, &st)) {
+    if (style == "full-iso") {
+      return "0000-01-01 00:00:00.000000000 +0000";
+    }
+    return "0000-00-00 00:00";
+  }
+
+  if (style == "full-iso") {
+    // full-iso: "2025-01-01 12:34:56.789012345 +0800"
+    TIME_ZONE_INFORMATION tzi{};
+    GetTimeZoneInformation(&tzi);
+    int tz_offset = -tzi.Bias;
+    char buf[64];
+    snprintf(buf, sizeof(buf),
+             "%04d-%02d-%02d %02d:%02d:%02d.000000000 %+03d%02d", st.wYear,
+             st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+             tz_offset / 60, std::abs(tz_offset % 60));
+    return std::string(buf);
+  }
+
+  if (style == "iso" || style == "posix") {
+    // iso: "01-01 12:34" (same year) or "2025-01-01 12:34" (different year)
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    char buf[32];
+    if (st.wYear == now.wYear) {
+      snprintf(buf, sizeof(buf), "%02d-%02d %02d:%02d", st.wMonth, st.wDay,
+               st.wHour, st.wMinute);
+    } else {
+      snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d", st.wYear,
+               st.wMonth, st.wDay, st.wHour, st.wMinute);
+    }
+    return std::string(buf);
+  }
+
+  if (style.starts_with("+")) {
+    // Custom strftime format via +FORMAT
+    // Map SYSTEMTIME fields to struct tm for strftime
+    struct tm tm_val{};
+    tm_val.tm_year = st.wYear - 1900;
+    tm_val.tm_mon = st.wMonth - 1;
+    tm_val.tm_mday = st.wDay;
+    tm_val.tm_hour = st.wHour;
+    tm_val.tm_min = st.wMinute;
+    tm_val.tm_sec = st.wSecond;
+    tm_val.tm_isdst = -1;
+    std::string fmt(style.substr(1));
+    char buf[128];
+    size_t count = std::strftime(buf, sizeof(buf), fmt.c_str(), &tm_val);
+    if (count > 0) {
+      return std::string(buf);
+    }
+  }
+
+  // default: long-iso style "2025-01-01 12:34"
   char buf[32];
-  snprintf(buf, sizeof(buf), "%16ju",
-           static_cast<uintmax_t>(ceil_div(size, cfg.block_size)));
-  safePrint(buf);
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d", st.wYear, st.wMonth,
+           st.wDay, st.wHour, st.wMinute);
+  return std::string(buf);
+}
+
+auto print_time_if_requested(const UsageSummary& summary, const DuConfig& cfg)
+    -> void {
+  if (!cfg.show_time || !summary.has_time) {
+    return;
+  }
+  // [GNU] size and time are tab-separated (uutils #13267)
+  safePrint("\t");
+  safePrint(format_time_long_iso(summary.latest_time, cfg.time_style));
 }
 
 auto configure_output(const CommandContext<DU_OPTIONS.size()>& ctx)
@@ -325,6 +602,8 @@ auto configure_output(const CommandContext<DU_OPTIONS.size()>& ctx)
       output.human = false;
       output.si = false;
       output.block_size = 1;
+      output.size_explicit = true;
+      output.display_suffix.clear();
       continue;
     }
 
@@ -332,44 +611,99 @@ auto configure_output(const CommandContext<DU_OPTIONS.size()>& ctx)
       output.human = false;
       output.si = false;
       output.block_size = 1024;
+      output.size_explicit = true;
+      output.display_suffix.clear();
+      continue;
+    }
+
+    if (meta.short_name == "-m") {
+      output.human = false;
+      output.si = false;
+      output.block_size = 1024 * 1024;
+      output.size_explicit = true;
+      output.display_suffix.clear();
       continue;
     }
 
     if (meta.short_name == "-h" || meta.long_name == "--human-readable") {
       output.human = true;
       output.si = false;
+      output.size_explicit = true;
+      output.display_suffix.clear();
       continue;
     }
 
     if (meta.long_name == "--si") {
       output.human = false;
       output.si = true;
+      output.size_explicit = true;
+      output.display_suffix.clear();
       continue;
     }
 
     if (meta.short_name == "-B" || meta.long_name == "--block-size") {
       auto value = std::get_if<std::string>(&occurrence.value);
+      const char* opt_name = meta.short_name == "-B" ? "-B" : "--block-size";
+      auto bad = [&]() {
+        return std::unexpected(std::string("invalid ") + opt_name +
+                               " argument '" +
+                               (value ? *value : std::string()) + "'");
+      };
       if (!value) {
-        return std::unexpected("invalid block size");
+        return bad();
       }
       if (*value == "human-readable") {
         output.human = true;
         output.si = false;
+        output.size_explicit = true;
+        output.display_suffix.clear();
         continue;
       }
       if (*value == "si") {
         output.human = false;
         output.si = true;
+        output.size_explicit = true;
+        output.display_suffix.clear();
         continue;
       }
 
-      auto parsed = parse_block_size(*value);
+      auto parsed = parse_block_size(*value, &output.display_suffix);
       if (!parsed) {
-        return std::unexpected("invalid block size");
+        return bad();
       }
       output.human = false;
       output.si = false;
       output.block_size = *parsed;
+      output.size_explicit = true;
+    }
+  }
+
+  // [GNU] With no size option, du reads its block size from the first set of
+  // DU_BLOCK_SIZE, BLOCK_SIZE, BLOCKSIZE; "human-readable"/"si" select those
+  // modes and an unparseable or zero value is ignored (uutils #8916).
+  if (!output.size_explicit) {
+    bool env_applied = false;
+    for (const char* name : {"DU_BLOCK_SIZE", "BLOCK_SIZE", "BLOCKSIZE"}) {
+      const char* value = std::getenv(name);
+      if (value == nullptr) continue;
+      const std::string spec(value);
+      if (spec == "human-readable") {
+        output.human = true;
+        env_applied = true;
+      } else if (spec == "si") {
+        output.si = true;
+        env_applied = true;
+      } else if (auto parsed = parse_block_size(spec)) {
+        output.block_size = *parsed;
+        env_applied = true;
+      }
+      break;  // the first set variable wins even when unparseable
+    }
+
+    // [GNU] POSIXLY_CORRECT changes the default block size to 512B only when
+    // neither an option nor an environment variable selected a size.
+    if (!env_applied && std::getenv("POSIXLY_CORRECT") != nullptr) {
+      output.block_size = 512;
     }
   }
 
@@ -385,6 +719,9 @@ auto configure_du(const CommandContext<DU_OPTIONS.size()>& ctx)
       ctx.get<bool>("--summarize", false) || ctx.get<bool>("-s", false);
 
   cfg.max_depth = ctx.get<int>("--max-depth", -1);
+  if (cfg.count_all && cfg.summarize) {
+    return std::unexpected("cannot both summarize and show all");
+  }
   if (ctx.get<int>("-d", -1) != -1) {
     cfg.max_depth = ctx.get<int>("-d", -1);
   }
@@ -414,12 +751,62 @@ auto configure_du(const CommandContext<DU_OPTIONS.size()>& ctx)
     cfg.exclude_patterns.push_back(pattern);
   }
 
-  cfg.dereference = ctx.get<bool>("--dereference", false) ||
-                    ctx.get<bool>("-L", false);
-  cfg.one_file_system = ctx.get<bool>("--one-file-system", false) ||
-                        ctx.get<bool>("-x", false);
+  for (const auto& occurrence :
+       ctx.string_occurrences({"--exclude", "--exclude-from", "-X"})) {
+    if (occurrence.long_name == "--exclude") {
+      continue;
+    }
+
+    auto patterns = load_exclude_patterns_from_file(occurrence.value);
+    if (!patterns) {
+      return std::unexpected(patterns.error());
+    }
+    for (const auto& pattern : *patterns) {
+      if (!pattern.empty()) {
+        cfg.exclude_patterns.push_back(pattern);
+      }
+    }
+  }
+
+  cfg.dereference =
+      ctx.get<bool>("--dereference", false) || ctx.get<bool>("-L", false);
+  // -A / --apparent-size selects logical lengths; without it du counts
+  // allocated blocks (see get_file_size). -b/--bytes implies apparent size.
+  cfg.apparent_size =
+      ctx.get<bool>("--apparent-size", false) || ctx.get<bool>("-A", false) ||
+      ctx.get<bool>("--bytes", false) || ctx.get<bool>("-b", false);
+  // -P / --no-dereference: Default behavior on Windows. [DIFFERS]
+  cfg.no_dereference =
+      ctx.get<bool>("--no-dereference", false) || ctx.get<bool>("-P", false);
+  // -H / -D / --dereference-args: dereference only command-line symlink
+  // operands.  Needed to report dangling link operands like GNU does.
+  cfg.dereference_args = ctx.get<bool>("--dereference-args", false) ||
+                         ctx.get<bool>("-H", false) ||
+                         ctx.get<bool>("-D", false);
+  // -l / --count-links: count sizes many times if hard linked
+  cfg.count_links =
+      ctx.get<bool>("--count-links", false) || ctx.get<bool>("-l", false);
+  cfg.one_file_system =
+      ctx.get<bool>("--one-file-system", false) || ctx.get<bool>("-x", false);
   cfg.show_inodes = ctx.get<bool>("--inodes", false);
-  cfg.time_word = ctx.get<std::string>("--time", "");
+  cfg.null_terminated =
+      ctx.get<bool>("--null", false) || ctx.get<bool>("-0", false);
+  cfg.separate_dirs =
+      ctx.get<bool>("--separate-dirs", false) || ctx.get<bool>("-S", false);
+  for (const auto& occurrence : ctx.string_occurrences({"--time"})) {
+    auto parsed = parse_du_time_mode(occurrence.value);
+    if (!parsed) {
+      return std::unexpected("invalid time value");
+    }
+    cfg.show_time = true;
+    cfg.time_word = occurrence.value;
+    cfg.time_mode = *parsed;
+  }
+
+  // --time-style: format for time display
+  for (const auto& occurrence : ctx.string_occurrences({"--time-style"})) {
+    cfg.time_style = occurrence.value;
+  }
 
   return cfg;
 }
@@ -483,11 +870,119 @@ auto passes_threshold(const DuConfig& cfg, uint64_t size) -> bool {
 }
 
 /**
+ * @brief Get hard link count for a file (Windows API)
+ * @param path File path
+ * @return Number of hard links, or 1 if unable to determine
+ */
+auto get_hard_link_count(const std::wstring& path) -> DWORD {
+  HANDLE hFile = CreateFileW(
+      path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (hFile == INVALID_HANDLE_VALUE) {
+    return 1;
+  }
+  BY_HANDLE_FILE_INFORMATION info{};
+  DWORD result = 1;
+  if (GetFileInformationByHandle(hFile, &info)) {
+    result = info.nNumberOfLinks;
+  }
+  CloseHandle(hFile);
+  return result;
+}
+
+/**
+ * @brief Get a stable per-inode key (volume serial + file index)
+ * @param path File path
+ * @return L"<volume>:<index>" or empty if unavailable
+ */
+auto get_inode_key(const std::wstring& path) -> std::wstring {
+  HANDLE hFile = CreateFileW(
+      path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (hFile == INVALID_HANDLE_VALUE) {
+    return L"";
+  }
+  BY_HANDLE_FILE_INFORMATION info{};
+  std::wstring key;
+  if (GetFileInformationByHandle(hFile, &info)) {
+    const uint64_t index =
+        (static_cast<uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
+    key = std::to_wstring(info.dwVolumeSerialNumber) + L":" +
+          std::to_wstring(index);
+  }
+  CloseHandle(hFile);
+  return key;
+}
+
+/**
+ * @brief Get the allocation cluster size of the volume containing |path|.
+ * @param path File path
+ * @return Bytes per cluster, or 0 when it cannot be determined
+ */
+auto get_volume_cluster_size(const std::wstring& path) -> uint64_t {
+  // Cache per volume root: du walks many files on the same volume.
+  static std::unordered_map<std::wstring, uint64_t> cache;
+
+  std::wstring root;
+  if (path.size() >= 2 && path[1] == L':') {
+    root = path.substr(0, 2) + L"\\";
+  } else if (path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\') {
+    // UNC \\server\share\... -> root is \\server\share + backslash
+    size_t server_end = path.find(L'\\', 2);
+    if (server_end != std::wstring::npos) {
+      size_t share_end = path.find(L'\\', server_end + 1);
+      if (share_end != std::wstring::npos) {
+        root = path.substr(0, share_end + 1);
+      }
+    }
+  }
+  if (root.empty()) {
+    // Relative path: resolve against the current drive.
+    wchar_t cwd[MAX_PATH];
+    if (GetCurrentDirectoryW(MAX_PATH, cwd) == 0 || cwd[1] != L':') {
+      return 0;
+    }
+    root = std::wstring(cwd, 2) + L"\\";
+  }
+
+  if (auto it = cache.find(root); it != cache.end()) {
+    return it->second;
+  }
+  DWORD sectors_per_cluster = 0;
+  DWORD bytes_per_sector = 0;
+  DWORD unused = 0;
+  uint64_t cluster = 0;
+  if (GetDiskFreeSpaceW(root.c_str(), &sectors_per_cluster, &bytes_per_sector,
+                        &unused, &unused)) {
+    cluster = static_cast<uint64_t>(sectors_per_cluster) * bytes_per_sector;
+  }
+  cache[root] = cluster;
+  return cluster;
+}
+
+/**
  * @brief Get file size
  * @param path File path
+ * @param apparent When true return the logical size; otherwise return the
+ *                 on-disk allocated size like GNU du's st_blocks accounting
  * @return File size or 0 if error
  */
-auto get_file_size(const std::wstring& path) -> uint64_t {
+auto get_file_size(const std::wstring& path, bool apparent) -> uint64_t {
+  if (!apparent) {
+    // [GNU] du counts allocated blocks (st_blocks), not the logical length.
+    // GetCompressedFileSizeW accounts for compression and sparse regions;
+    // round up to the volume cluster to model block allocation.
+    ULARGE_INTEGER allocated{};
+    allocated.LowPart =
+        GetCompressedFileSizeW(path.c_str(), &allocated.HighPart);
+    if (allocated.LowPart != INVALID_FILE_SIZE || GetLastError() == NO_ERROR) {
+      const uint64_t cluster = get_volume_cluster_size(path);
+      if (cluster > 0) {
+        return (allocated.QuadPart + cluster - 1) / cluster * cluster;
+      }
+      return allocated.QuadPart;
+    }
+  }
   WIN32_FILE_ATTRIBUTE_DATA data;
   if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) {
     return 0;
@@ -508,14 +1003,22 @@ auto get_file_size(const std::wstring& path) -> uint64_t {
  */
 auto calculate_dir_size(const std::wstring& path,
                         std::unordered_map<std::wstring, uint64_t>& sizes,
+                        std::unordered_map<std::wstring, FILETIME>& times,
                         int current_depth, const DuConfig& cfg,
-                        const std::wstring& root_drive = L"") -> uint64_t {
+                        std::unordered_set<std::wstring>& seen_inodes,
+                        std::unordered_set<std::wstring>& visited_dirs,
+                        const std::wstring& root_drive = L"",
+                        // [GNU] Entries are printed in traversal post-order:
+                        // a directory line follows its subtree, so the operand
+                        // directory prints last (Savannah #13956).
+                        std::vector<std::wstring>* print_order = nullptr)
+    -> UsageSummary {
   WIN32_FIND_DATAW find_data;
   std::wstring search_path = path + L"\\*";
   HANDLE hFind = FindFirstFileW(search_path.c_str(), &find_data);
 
   if (hFind == INVALID_HANDLE_VALUE) {
-    return 0;
+    return {};
   }
 
   // Determine root drive for --one-file-system
@@ -524,7 +1027,11 @@ auto calculate_dir_size(const std::wstring& path,
     drive = path.substr(0, 2);
   }
 
-  uint64_t total_size = 0;
+  UsageSummary summary;
+  WIN32_FILE_ATTRIBUTE_DATA path_data{};
+  const bool have_path_data =
+      cfg.show_time &&
+      GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &path_data);
 
   do {
     std::wstring filename = find_data.cFileName;
@@ -552,22 +1059,71 @@ auto calculate_dir_size(const std::wstring& path,
     const int child_depth = current_depth + 1;
 
     if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+      // [GNU] Subtrees already traversed under an earlier argument contribute
+      // nothing to this parent (Savannah #10397).
+      const std::wstring child_key = du_dir_key(full_path);
+      if (visited_dirs.count(child_key) != 0) {
+        continue;
+      }
+      visited_dirs.insert(child_key);
       // --dereference: on Windows, follow junction points
       // (FindFirstFile already handles this for most cases)
 
       // Recursively calculate subdirectory size
-      uint64_t dir_size =
-          calculate_dir_size(full_path, sizes, child_depth, cfg, drive);
-      total_size += dir_size;
+      UsageSummary child_summary =
+          calculate_dir_size(full_path, sizes, times, child_depth, cfg,
+                             seen_inodes, visited_dirs, drive, print_order);
+      if (!cfg.separate_dirs) {
+        summary.size += child_summary.size;
+      }
+      if (child_summary.has_time) {
+        update_latest_time(summary, child_summary.latest_time);
+      }
     } else {
       // It's a file
-      uint64_t file_size = get_file_size(full_path);
-      total_size += file_size;
+      uint64_t file_size = get_file_size(full_path, cfg.apparent_size);
+      // [GNU] Hard-linked files are counted once per invocation; later
+      // occurrences of the same inode contribute nothing (uutils #9202
+      // #10241 #10312 #9871). --count-links opts out.
+      bool counted = true;
+      if (!cfg.count_links) {
+        const DWORD nlinks = get_hard_link_count(full_path);
+        if (nlinks > 1) {
+          const std::wstring inode_key = get_inode_key(full_path);
+          if (!inode_key.empty()) {
+            if (!seen_inodes.insert(inode_key).second) {
+              counted = false;
+              file_size = 0;
+            }
+          }
+        }
+      } else {
+        const DWORD nlinks = get_hard_link_count(full_path);
+        if (nlinks > 1) {
+          file_size *= nlinks;
+        }
+      }
+      summary.size += file_size;
+      if (cfg.show_time) {
+        WIN32_FILE_ATTRIBUTE_DATA file_data{};
+        if (GetFileAttributesExW(full_path.c_str(), GetFileExInfoStandard,
+                                 &file_data)) {
+          FILETIME file_time = get_selected_time(file_data, cfg.time_mode);
+          update_latest_time(summary, file_time);
+          if (cfg.count_all && counted &&
+              (cfg.max_depth < 0 || child_depth <= cfg.max_depth)) {
+            times[full_path] = file_time;
+          }
+        }
+      }
 
       // Count individual files if requested
-      if (cfg.count_all &&
+      if (counted && cfg.count_all &&
           (cfg.max_depth < 0 || child_depth <= cfg.max_depth)) {
         sizes[full_path] = file_size;
+        if (print_order != nullptr) {
+          print_order->push_back(full_path);
+        }
       }
     }
   } while (FindNextFileW(hFind, &find_data) != 0);
@@ -575,10 +1131,23 @@ auto calculate_dir_size(const std::wstring& path,
   FindClose(hFind);
 
   if (cfg.max_depth < 0 || current_depth <= cfg.max_depth) {
-    sizes[path] = total_size;
+    sizes[path] = summary.size;
+    if (print_order != nullptr) {
+      print_order->push_back(path);
+    }
+    if (cfg.show_time && summary.has_time) {
+      times[path] = summary.latest_time;
+    }
   }
 
-  return total_size;
+  if (cfg.show_time && !summary.has_time && have_path_data) {
+    update_latest_time(summary, get_selected_time(path_data, cfg.time_mode));
+    if (cfg.max_depth < 0 || current_depth <= cfg.max_depth) {
+      times[path] = summary.latest_time;
+    }
+  }
+
+  return summary;
 }
 
 /**
@@ -591,7 +1160,20 @@ auto print_disk_usage(const CommandContext<DU_OPTIONS.size()>& ctx)
   // Use SmallVector for file paths (max 32 paths) - all stack-allocated
   SmallVector<std::string, 32> paths{};
 
-  if (ctx.positionals.empty()) {
+  const std::string files0_from = ctx.get<std::string>("--files0-from", "");
+  if (!files0_from.empty()) {
+    if (!ctx.positionals.empty()) {
+      return std::unexpected(
+          "--files0-from disallows processing paths named on the command line");
+    }
+    auto file_list = read_files0_from(files0_from);
+    if (!file_list) {
+      return std::unexpected(file_list.error());
+    }
+    for (const auto& path : *file_list) {
+      paths.push_back(path);
+    }
+  } else if (ctx.positionals.empty()) {
     paths.push_back(".");
   } else {
     for (const auto& arg : ctx.positionals) {
@@ -617,19 +1199,63 @@ auto print_disk_usage(const CommandContext<DU_OPTIONS.size()>& ctx)
 
   bool all_ok = true;
   uint64_t grand_total = 0;
+  // [GNU] Hard-link dedup spans all arguments of one invocation.
+  std::unordered_set<std::wstring> seen_inodes;
+  // [GNU] Directory arguments already traversed earlier in this invocation
+  // are skipped entirely: no print, no recount (Savannah #10397).
+  std::unordered_set<std::wstring> visited_dirs;
+
+  // [GNU] du prints operand paths and their descendants with forward
+  // slashes (Savannah #13956).
+  const auto display_path = [](const std::wstring& p) -> std::string {
+    std::string display = wstring_to_utf8(p);
+    std::replace(display.begin(), display.end(), '\\', '/');
+    return display;
+  };
 
   for (size_t i = 0; i < paths.size(); ++i) {
     const auto& path = paths[i];
     std::wstring wpath = utf8_to_wstring(path);
 
-    // Check if path exists
+    // [GNU] Under -L/-H a symlink operand that does not resolve (dangling
+    // link) is reported and the run fails; GNU prints no errno text for the
+    // dangling case but "No such file or directory" for a missing path.
+    if (cfg.dereference || cfg.dereference_args) {
+      std::error_code ec;
+      (void)std::filesystem::status(std::filesystem::path(wpath), ec);
+      if (ec) {
+        std::error_code lec;
+        const bool operand_exists = std::filesystem::exists(
+            std::filesystem::symlink_status(std::filesystem::path(wpath), lec));
+        safeErrorPrint("du: cannot access '");
+        safeErrorPrint(path);
+        if (!lec && operand_exists) {
+          safeErrorPrint("'\n");
+        } else {
+          safeErrorPrint("': No such file or directory\n");
+        }
+        all_ok = false;
+        continue;
+      }
+    }
+
+    // Check if path exists.  Without -L/-H du lstats the operand, so a
+    // dangling symlink still counts (as a zero-size entry) like GNU -P.
     DWORD attrs = GetFileAttributesW(wpath.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES) {
-      safeErrorPrint("du: cannot access '");
-      safeErrorPrint(path);
-      safeErrorPrint("': No such file or directory\n");
-      all_ok = false;
-      continue;
+      std::error_code lec;
+      const auto link_status =
+          std::filesystem::symlink_status(std::filesystem::path(wpath), lec);
+      if (!lec && std::filesystem::is_symlink(link_status) &&
+          !cfg.dereference && !cfg.dereference_args) {
+        attrs = FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_REPARSE_POINT;
+      } else {
+        safeErrorPrint("du: cannot access '");
+        safeErrorPrint(path);
+        safeErrorPrint("': No such file or directory\n");
+        all_ok = false;
+        continue;
+      }
     }
 
     if (should_exclude(cfg, wpath,
@@ -638,59 +1264,112 @@ auto print_disk_usage(const CommandContext<DU_OPTIONS.size()>& ctx)
     }
 
     std::unordered_map<std::wstring, uint64_t> sizes;
+    std::unordered_map<std::wstring, FILETIME> times;
 
     if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+      // [GNU] Skip an argument directory that was already traversed under an
+      // earlier argument (Savannah #10397).
+      const std::wstring arg_key = du_dir_key(wpath);
+      if (!visited_dirs.insert(arg_key).second) {
+        continue;
+      }
+      // [GNU] Entries print in traversal post-order: every directory line
+      // follows its subtree, so the operand directory prints last
+      // (Savannah #13956).
+      std::vector<std::wstring> order;
       // Calculate directory size
-      calculate_dir_size(wpath, sizes, 0, cfg);
+      UsageSummary dir_summary = calculate_dir_size(
+          wpath, sizes, times, 0, cfg, seen_inodes, visited_dirs, L"", &order);
 
       // Print directory size
       uint64_t dir_size = sizes[wpath];
       grand_total += dir_size;
 
-      if (passes_threshold(cfg, dir_size)) {
+      auto print_entry = [&](const std::wstring& entry_path, uint64_t size,
+                             bool is_operand_root) {
         safePrint(L"");
         if (cfg.show_inodes) {
-          // Show inode count (approximated as file count)
-          safePrint(std::to_string(sizes.size()));
+          // Show inode count (approximated as file count) for the operand
+          // root; each listed entry counts as 1 inode.
+          safePrint(is_operand_root ? std::to_string(sizes.size()) : "1");
         } else {
-          print_scaled_size(dir_size, cfg.output);
+          print_scaled_size(size, cfg.output);
         }
-        safePrint(L"  ");
-        safePrintLn(wpath);
-      }
+        if (cfg.show_time) {
+          UsageSummary entry_summary;
+          auto time_it = times.find(entry_path);
+          if (time_it != times.end()) {
+            entry_summary.latest_time = time_it->second;
+            entry_summary.has_time = true;
+          }
+          if (is_operand_root && dir_summary.has_time) {
+            entry_summary.latest_time = dir_summary.latest_time;
+            entry_summary.has_time = true;
+          }
+          print_time_if_requested(entry_summary, cfg);
+        }
+        safePrint("\t");
+        safePrint(display_path(entry_path));
+        print_record_terminator(cfg.null_terminated);
+      };
 
-      // Print subdirectories/files if not summarize mode
-      if (!cfg.summarize) {
-        for (const auto& [subpath, size] : sizes) {
-          if (subpath != wpath) {  // Skip the root directory itself
-            if (!passes_threshold(cfg, size)) {
-              continue;
-            }
-            safePrint(L"");
-            if (cfg.show_inodes) {
-              safePrint("1");  // Each entry counts as 1 inode
-            } else {
-              print_scaled_size(size, cfg.output);
-            }
-            safePrint(L"  ");
-            safePrintLn(subpath);
+      if (cfg.summarize) {
+        // -s: print only the operand total.
+        if (passes_threshold(cfg, dir_size)) {
+          print_entry(wpath, dir_size, true);
+        }
+      } else {
+        for (const auto& subpath : order) {
+          auto size_it = sizes.find(subpath);
+          if (size_it == sizes.end()) {
+            continue;
+          }
+          if (!passes_threshold(cfg, size_it->second)) {
+            continue;
+          }
+          print_entry(subpath, size_it->second, subpath == wpath);
+        }
+        // Fallback safety: the operand root always prints.
+        if (order.empty() ||
+            std::find(order.begin(), order.end(), wpath) == order.end()) {
+          if (passes_threshold(cfg, dir_size)) {
+            print_entry(wpath, dir_size, true);
           }
         }
       }
     } else {
       // It's a file
-      uint64_t file_size = get_file_size(wpath);
+      uint64_t file_size = get_file_size(wpath, cfg.apparent_size);
+      // --count-links: multiply by hard link count [DIFFERS]
+      if (cfg.count_links) {
+        DWORD nlinks = get_hard_link_count(wpath);
+        if (nlinks > 1) {
+          file_size *= nlinks;
+        }
+      }
       grand_total += file_size;
 
       if (passes_threshold(cfg, file_size)) {
+        UsageSummary file_summary;
+        if (cfg.show_time) {
+          WIN32_FILE_ATTRIBUTE_DATA file_data{};
+          if (GetFileAttributesExW(wpath.c_str(), GetFileExInfoStandard,
+                                   &file_data)) {
+            file_summary.latest_time =
+                get_selected_time(file_data, cfg.time_mode);
+            file_summary.has_time = true;
+          }
+        }
         safePrint(L"");
         if (cfg.show_inodes) {
           safePrint("1");  // Each file is 1 inode
         } else {
           print_scaled_size(file_size, cfg.output);
         }
-        safePrint(L"  ");
-        safePrintLn(wpath);
+        print_time_if_requested(file_summary, cfg);
+        safePrint("\t");
+        safePrint(display_path(wpath));
+        print_record_terminator(cfg.null_terminated);
       }
     }
   }
@@ -698,7 +1377,8 @@ auto print_disk_usage(const CommandContext<DU_OPTIONS.size()>& ctx)
   if (cfg.total && passes_threshold(cfg, grand_total)) {
     safePrint(L"");
     print_scaled_size(grand_total, cfg.output);
-    safePrintLn(L"  total");
+    safePrint("\ttotal");
+    print_record_terminator(cfg.null_terminated);
   }
 
   return all_ok;

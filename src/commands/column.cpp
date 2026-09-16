@@ -43,33 +43,118 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr COLUMN_OPTIONS = std::array{
+    // [EXT]
     OPTION("-c", "--columns", "output is formatted for a display width",
            INT_TYPE),
+    // [EXT]
     OPTION("-t", "--table",
            "determine the number of columns the input contains", BOOL_TYPE),
+    // [EXT]
     OPTION("-s", "--separator", "specify the possible input item delimiters",
            STRING_TYPE),
-    OPTION("-o", "output-separator",
+    // [EXT]
+    OPTION("", "--output-separator",
            "specify the columns separator for table output", STRING_TYPE),
-    OPTION("-n", "table-name", "specify the table name for JSON or XML output",
+    // [EXT]
+    OPTION("-o", "--output-separator",
+           "specify the columns separator for table output", STRING_TYPE),
+    // [EXT]
+    OPTION("", "--table-name", "specify the table name for JSON or XML output",
            STRING_TYPE),
-    OPTION("-x", "output-fields",
+    // [EXT]
+    OPTION("-n", "--table-name",
+           "specify the table name for JSON or XML output", STRING_TYPE),
+    // [EXT]
+    OPTION("", "--output-fields",
            "specify which columns to include in JSON or XML output",
            STRING_TYPE),
-    OPTION("-r", "table-right", "right align text in table columns", BOOL_TYPE),
-    OPTION("-R", "table-right-columns",
+    // [EXT]
+    OPTION("-x", "--output-fields",
+           "specify which columns to include in JSON or XML output",
+           STRING_TYPE),
+    // [EXT]
+    OPTION("", "--table-right", "columns to right align in table output",
+           STRING_TYPE),
+    // [EXT]
+    // [DIFFERS] WinuxCmd previously mapped -r to --table-right (BOOL); GNU uses
+    // -r for --tree
+    // [EXT]
+    OPTION("-R", "--table-right-columns",
            "columns to right align in table output", STRING_TYPE),
-    OPTION("-H", "table-hide", "don't print header in table output", BOOL_TYPE),
-    OPTION("-e", "table-empty", "don't use empty lines in table output",
+    // [EXT]
+    // [GNU] -H/--table-hide: columns to hide in table output (STRING_TYPE per
+    // GNU)
+    OPTION("", "--table-hide", "columns to hide in table output", STRING_TYPE),
+    // [GNU]
+    OPTION("-H", "--table-hide", "columns to hide in table output",
+           STRING_TYPE),
+    // [EXT]
+    OPTION("", "--table-empty", "don't use empty lines in table output",
            BOOL_TYPE),
-    OPTION("-N", "table-no-trunc", "don't truncate text in table output",
+    // [EXT]
+    OPTION("-e", "--table-empty", "don't use empty lines in table output",
            BOOL_TYPE),
-    OPTION("-E", "table-noescape",
+    // [EXT]
+    OPTION("", "--table-no-trunc", "don't truncate text in table output",
+           BOOL_TYPE),
+    // [EXT]
+    // [DIFFERS] WinuxCmd previously mapped -N to --table-no-trunc (BOOL); GNU
+    // uses -N for --table-columns
+    // [EXT]
+    OPTION("", "--table-noescape",
            "don't escape newline, tab, backslash in table output", BOOL_TYPE),
-    OPTION("-J", "json", "use JSON output format for table", BOOL_TYPE),
-    OPTION("-O", "output-width", "maximum display width", INT_TYPE),
-    OPTION("-V", "version", "output version information and exit", BOOL_TYPE),
-    OPTION("-h", "help", "display this help and exit", BOOL_TYPE)};
+    // [EXT]
+    OPTION("-E", "--table-noescape",
+           "don't escape newline, tab, backslash in table output", BOOL_TYPE),
+    // [EXT]
+    OPTION("", "--json", "use JSON output format for table", BOOL_TYPE),
+    // [EXT]
+    OPTION("-J", "--json", "use JSON output format for table", BOOL_TYPE),
+    // [EXT]
+    OPTION("", "--output-width", "maximum display width", INT_TYPE),
+    // [EXT]
+    // [DIFFERS] WinuxCmd previously mapped -O to --output-width (INT); GNU uses
+    // -O for --table-order
+    // [EXT]
+    OPTION("", "--version", "output version information and exit", BOOL_TYPE),
+    // [EXT]
+    OPTION("-V", "--version", "output version information and exit", BOOL_TYPE),
+    // [GNU] -d: suppress header printing
+    OPTION("-d", "--table-noheadings", "don't print header in table output",
+           BOOL_TYPE),
+    // [GNU] -l: maximal number of input columns
+    OPTION("-l", "--table-columns-limit", "maximal number of input columns",
+           STRING_TYPE),
+    // [GNU] -m: fill all available space
+    OPTION("-m", "--table-maxout", "fill all available space", BOOL_TYPE),
+    // [GNU] -T: truncate text in the columns when necessary
+    OPTION("-T", "--table-truncate",
+           "truncate text in the columns when necessary", STRING_TYPE),
+    // [GNU] -W: wrap text in the columns when necessary
+    OPTION("-W", "--table-wrap", "wrap text in the columns when necessary",
+           STRING_TYPE),
+    // [GNU] -L: don't ignore empty lines
+    OPTION("-L", "--keep-empty-lines", "don't ignore empty lines", BOOL_TYPE),
+    // [GNU] -C: define column properties
+    OPTION("-C", "--table-column", "define column properties", STRING_TYPE),
+    // [GNU] -r: column to use tree-like output for the table [DIFFERS: also
+    // used as --table-right above]
+    OPTION("-r", "--tree", "column to use tree-like output for the table",
+           STRING_TYPE),
+    // [GNU] -i: line ID to specify child-parent relation
+    OPTION("-i", "--tree-id", "line ID to specify child-parent relation",
+           STRING_TYPE),
+    // [GNU] -p: parent to specify child-parent relation
+    OPTION("-p", "--tree-parent", "parent to specify child-parent relation",
+           STRING_TYPE),
+    // [GNU] -O: specify order of output columns
+    OPTION("-O", "--table-order", "specify order of output columns",
+           STRING_TYPE),
+    // [GNU] -N: comma separated column names
+    OPTION("-N", "--table-columns", "comma separated column names",
+           STRING_TYPE),
+    // [EXT]
+    OPTION("", "--help", "display this help and exit", BOOL_TYPE)};
 
 namespace column_pipeline {
 namespace cp = core::pipeline;
@@ -81,11 +166,9 @@ struct Config {
   std::string output_separator;
   std::string table_name;
   std::string output_fields;
-  bool table_right = false;
   std::string table_right_columns;
-  bool table_hide = false;
+  std::string table_hide_columns;  // [GNU] -H/--table-hide: columns to hide
   bool table_empty = false;
-  bool table_no_trunc = false;
   bool table_noescape = false;
   bool json_output = false;
   int output_width = 0;
@@ -99,17 +182,40 @@ auto build_config(const CommandContext<COLUMN_OPTIONS.size()>& ctx)
   cfg.table_mode =
       ctx.get<bool>("--table", false) || ctx.get<bool>("-t", false);
   cfg.separator = ctx.get<std::string>("--separator", "");
-  cfg.output_separator = ctx.get<std::string>("-o", "");
-  cfg.table_name = ctx.get<std::string>("-n", "");
-  cfg.output_fields = ctx.get<std::string>("-x", "");
-  cfg.table_right = ctx.get<bool>("-r", false);
-  cfg.table_right_columns = ctx.get<std::string>("-R", "");
-  cfg.table_hide = ctx.get<bool>("-H", false);
-  cfg.table_empty = ctx.get<bool>("-e", false);
-  cfg.table_no_trunc = ctx.get<bool>("-N", false);
-  cfg.table_noescape = ctx.get<bool>("-E", false);
-  cfg.json_output = ctx.get<bool>("-J", false);
-  cfg.output_width = ctx.get<int>("-O", 0);
+  if (cfg.separator.empty()) cfg.separator = ctx.get<std::string>("-s", "");
+  cfg.output_separator = ctx.get<std::string>("--output-separator", "");
+  if (cfg.output_separator.empty()) {
+    cfg.output_separator = ctx.get<std::string>("-o", "");
+  }
+
+  cfg.table_name = ctx.get<std::string>("--table-name", "");
+  if (cfg.table_name.empty()) {
+    cfg.table_name = ctx.get<std::string>("-n", "");
+  }
+
+  cfg.output_fields = ctx.get<std::string>("--output-fields", "");
+  if (cfg.output_fields.empty()) {
+    cfg.output_fields = ctx.get<std::string>("-x", "");
+  }
+
+  // [GNU] -r/--tree is read via raw_args in run() for tree-like output
+  // [DIFFERS]
+  cfg.table_right_columns = ctx.get<std::string>("--table-right", "");
+  if (cfg.table_right_columns.empty()) {
+    cfg.table_right_columns = ctx.get<std::string>("-R", "");
+  }
+  // [GNU] -H/--table-hide: read as STRING (column list) per GNU
+  cfg.table_hide_columns = ctx.get<std::string>("--table-hide", "");
+  if (cfg.table_hide_columns.empty()) {
+    cfg.table_hide_columns = ctx.get<std::string>("-H", "");
+  }
+  cfg.table_empty =
+      ctx.get<bool>("--table-empty", false) || ctx.get<bool>("-e", false);
+  cfg.table_noescape =
+      ctx.get<bool>("--table-noescape", false) || ctx.get<bool>("-E", false);
+  cfg.json_output =
+      ctx.get<bool>("--json", false) || ctx.get<bool>("-J", false);
+  cfg.output_width = ctx.get<int>("--columns", 0);
 
   for (auto arg : ctx.positionals) {
     std::string file_arg(arg);
@@ -134,6 +240,17 @@ auto build_config(const CommandContext<COLUMN_OPTIONS.size()>& ctx)
 
 auto read_input(const std::string& filename) -> cp::Result<std::string> {
   std::string content;
+  auto input_open_error = [](std::string_view path) -> std::string {
+    std::error_code ec;
+    if (std::filesystem::is_directory(std::filesystem::u8path(path), ec) &&
+        !ec) {
+      return std::string("cannot open '") + std::string(path) +
+             "' for reading: Is a directory";
+    }
+
+    return std::string("cannot open '") + std::string(path) +
+           "' for reading: No such file or directory";
+  };
 
   if (filename == "-" || filename.empty()) {
     // Read from stdin
@@ -149,8 +266,7 @@ auto read_input(const std::string& filename) -> cp::Result<std::string> {
     // Read from file
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
-      return std::unexpected(std::string("cannot open '") + filename +
-                             "' for reading");
+      return std::unexpected(input_open_error(filename));
     }
 
     // Get file size
@@ -173,6 +289,130 @@ auto read_input(const std::string& filename) -> cp::Result<std::string> {
   return content;
 }
 
+auto split_records(std::string_view content) -> std::vector<std::string> {
+  std::vector<std::string> lines;
+  size_t start = 0;
+  while (start < content.size()) {
+    size_t end = content.find('\n', start);
+    if (end == std::string_view::npos) {
+      std::string line(content.substr(start));
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (!line.empty()) lines.push_back(std::move(line));
+      break;
+    }
+
+    std::string line(content.substr(start, end - start));
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    lines.push_back(std::move(line));
+    start = end + 1;
+  }
+  return lines;
+}
+
+auto split_table_line(const std::string& line, const Config& cfg)
+    -> std::vector<std::string> {
+  std::vector<std::string> row;
+
+  if (cfg.separator.empty()) {
+    size_t pos = 0;
+    while (pos < line.size()) {
+      pos = line.find_first_not_of(" \t", pos);
+      if (pos == std::string::npos) break;
+      size_t end = line.find_first_of(" \t", pos);
+      if (end == std::string::npos) {
+        row.push_back(line.substr(pos));
+        break;
+      }
+      row.push_back(line.substr(pos, end - pos));
+      pos = end + 1;
+    }
+    return row;
+  }
+
+  size_t start = 0;
+  while (start <= line.size()) {
+    size_t end = line.find_first_of(cfg.separator, start);
+    if (end == std::string::npos) {
+      row.push_back(line.substr(start));
+      break;
+    }
+    row.push_back(line.substr(start, end - start));
+    start = end + 1;
+  }
+  return row;
+}
+
+auto parse_column_set(std::string_view spec) -> std::set<size_t> {
+  std::set<size_t> columns;
+  size_t pos = 0;
+  while (pos < spec.size()) {
+    size_t comma = spec.find(',', pos);
+    std::string_view token = comma == std::string_view::npos
+                                 ? spec.substr(pos)
+                                 : spec.substr(pos, comma - pos);
+    size_t value = 0;
+    auto [ptr, ec] =
+        std::from_chars(token.data(), token.data() + token.size(), value);
+    if (ec == std::errc() && ptr == token.data() + token.size() && value > 0) {
+      columns.insert(value);
+    }
+    if (comma == std::string_view::npos) break;
+    pos = comma + 1;
+  }
+  return columns;
+}
+
+auto json_escape(std::string_view text) -> std::string {
+  std::string out;
+  for (unsigned char c : text) {
+    switch (c) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '"':
+        out += "\\\"";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out.push_back(static_cast<char>(c));
+        break;
+    }
+  }
+  return out;
+}
+
+auto table_escape(std::string_view text) -> std::string {
+  std::string out;
+  for (unsigned char c : text) {
+    switch (c) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out.push_back(static_cast<char>(c));
+        break;
+    }
+  }
+  return out;
+}
+
 auto run(const Config& cfg) -> int {
   std::string all_content;
 
@@ -186,53 +426,16 @@ auto run(const Config& cfg) -> int {
   }
 
   if (cfg.table_mode) {
-    // Table mode - format as a table
-    // Use heap allocation to avoid stack overflow
-    std::vector<std::string> lines;
-    size_t start = 0;
-    while (start < all_content.size()) {
-      size_t end = all_content.find('\n', start);
-      if (end == std::string::npos) {
-        if (!all_content.substr(start).empty()) {
-          lines.push_back(all_content.substr(start));
-        }
-        break;
-      }
-      lines.push_back(all_content.substr(start, end - start));
-      start = end + 1;
-    }
-
+    std::vector<std::string> lines = split_records(all_content);
     if (lines.empty()) {
       return 0;
     }
 
-    // Determine separator
-    char sep = '\t';  // Default to tab
-    if (!cfg.separator.empty()) {
-      sep = cfg.separator[0];
-    }
-
-    // Parse all lines into columns
     std::vector<std::vector<std::string>> table;
     size_t max_cols = 0;
 
     for (const auto& line : lines) {
-      std::vector<std::string> row;
-      size_t col_start = 0;
-
-      while (col_start < line.size()) {
-        size_t col_end = line.find(sep, col_start);
-        if (col_end == std::string::npos || col_end == col_start) {
-          if (col_start < line.size()) {
-            row.push_back(line.substr(col_start));
-          }
-          break;
-        }
-        if (col_end > col_start) {
-          row.push_back(line.substr(col_start, col_end - col_start));
-        }
-        col_start = col_end + 1;
-      }
+      std::vector<std::string> row = split_table_line(line, cfg);
 
       if (row.size() > max_cols) {
         max_cols = row.size();
@@ -256,91 +459,99 @@ auto run(const Config& cfg) -> int {
       }
     }
 
-    // Print table
+    const std::set<size_t> include_fields =
+        cfg.output_fields.empty() ? std::set<size_t>{}
+                                  : parse_column_set(cfg.output_fields);
+
+    if (cfg.json_output) {
+      const std::string table_name =
+          cfg.table_name.empty() ? "table" : cfg.table_name;
+      safePrintLn("{");
+      safePrintLn("  \"" + json_escape(table_name) + "\": [");
+      for (size_t row_idx = (!cfg.table_hide_columns.empty() ? 1 : 0);
+           row_idx < table.size(); ++row_idx) {
+        const auto& row = table[row_idx];
+        safePrint("    {");
+        for (size_t col_idx = 0; col_idx < row.size(); ++col_idx) {
+          if (!include_fields.empty() &&
+              !include_fields.contains(col_idx + 1)) {
+            continue;
+          }
+          if (col_idx > 0) safePrint(", ");
+          std::string key = "col" + std::to_string(col_idx + 1);
+          if (!table.empty() && col_idx < table[0].size()) {
+            key = table[0][col_idx].empty() ? key : table[0][col_idx];
+          }
+          safePrint("\"" + json_escape(key) + "\": \"" +
+                    json_escape(row[col_idx]) + "\"");
+        }
+        safePrintLn("}" + std::string(row_idx + 1 < table.size() ? "," : ""));
+      }
+      safePrintLn("  ]");
+      safePrintLn("}");
+      return 0;
+    }
+
+    const std::string output_separator =
+        cfg.output_separator.empty() ? "  " : cfg.output_separator;
+    const std::set<size_t> right_columns =
+        parse_column_set(cfg.table_right_columns);
+
     for (size_t row_idx = 0; row_idx < table.size(); ++row_idx) {
-      if (cfg.table_hide && row_idx == 0) {
-        continue;  // Skip header
+      if (!cfg.table_hide_columns.empty() && row_idx == 0) {
+        continue;
       }
 
       const auto& row = table[row_idx];
       std::string line_output;
 
       for (size_t col_idx = 0; col_idx < row.size(); ++col_idx) {
-        if (col_idx > 0) {
-          line_output += cfg.output_separator.empty() ? " " : cfg.output_separator;
+        if (!include_fields.empty() && !include_fields.contains(col_idx + 1)) {
+          continue;
+        }
+        const size_t width = (col_idx < col_widths.size())
+                                 ? col_widths[col_idx]
+                                 : row[col_idx].size();
+        const bool right_align = right_columns.contains(
+            col_idx + 1);  // [DIFFERS] table_right bool removed
+
+        std::string cell = row[col_idx];
+        if (!cfg.table_noescape) {
+          cell = table_escape(cell);
+        }
+        // [DIFFERS] table_no_trunc option removed; truncation now always
+        // applies
+        if (cell.size() > width) {
+          cell = cell.substr(0, width);
         }
 
-        size_t width = (col_idx < col_widths.size()) ? col_widths[col_idx]
-                                                     : row[col_idx].size();
-
-        // Check if this column should be right-aligned
-        bool right_align = cfg.table_right;
-        if (!cfg.table_right_columns.empty()) {
-          // Parse column numbers for right alignment (comma-separated)
-          std::string col_spec = cfg.table_right_columns;
-          size_t pos = 0;
-          while (pos < col_spec.size()) {
-            size_t comma = col_spec.find(',', pos);
-            std::string token = (comma == std::string::npos)
-                                    ? col_spec.substr(pos)
-                                    : col_spec.substr(pos, comma - pos);
-            try {
-              int col_num = std::stoi(token);
-              if (static_cast<size_t>(col_num) == col_idx + 1) {
-                right_align = true;
-                break;
-              }
-            } catch (...) {
-            }
-            if (comma == std::string::npos) break;
-            pos = comma + 1;
+        // Check if this is the last included column
+        bool is_last = true;
+        for (size_t next = col_idx + 1; next < row.size(); ++next) {
+          if (include_fields.empty() || include_fields.contains(next + 1)) {
+            is_last = false;
+            break;
           }
         }
 
-        if (right_align) {
-          // Right align
-          for (size_t i = 0; i < width - row[col_idx].size(); ++i) {
-            line_output += ' ';
-          }
-          line_output += row[col_idx];
-        } else {
-          // Left align
-          line_output += row[col_idx];
-          for (size_t i = 0; i < width - row[col_idx].size(); ++i) {
-            line_output += ' ';
-          }
+        if (right_align && cell.size() < width) {
+          line_output.append(width - cell.size(), ' ');
+        }
+        line_output += cell;
+        if (!right_align && !is_last && cell.size() < width) {
+          line_output.append(width - cell.size(), ' ');
+        }
+        if (!is_last) {
+          line_output += output_separator;
         }
       }
 
-      // Apply output width limit
       if (cfg.output_width > 0 &&
           static_cast<int>(line_output.size()) > cfg.output_width) {
         line_output = line_output.substr(0, cfg.output_width);
       }
 
       safePrintLn(line_output);
-    }
-
-    // JSON output mode
-    if (cfg.json_output) {
-      safePrintLn("[");
-      for (size_t row_idx = (cfg.table_hide ? 1 : 0); row_idx < table.size();
-           ++row_idx) {
-        const auto& row = table[row_idx];
-        safePrint("  {");
-        for (size_t col_idx = 0; col_idx < row.size(); ++col_idx) {
-          if (col_idx > 0) safePrint(",");
-          // Use header as key if available
-          std::string key = "col" + std::to_string(col_idx + 1);
-          if (!table.empty() && col_idx < table[0].size()) {
-            key = table[0][col_idx];
-          }
-          safePrint("\"" + key + "\":\"" + row[col_idx] + "\"");
-        }
-        safePrintLn("}" +
-                     std::string(row_idx < table.size() - 1 ? "," : ""));
-      }
-      safePrintLn("]");
     }
   } else {
     // Simple column output mode
@@ -364,6 +575,31 @@ REGISTER_COMMAND(column, "column", "column [options] [file...]",
                  "colrm(1), ls(1), paste(1), sort(1)", "WinuxCmd",
                  "Copyright © 2026 WinuxCmd", COLUMN_OPTIONS) {
   using namespace column_pipeline;
+
+  // Handle --version/--help
+  if (ctx.get<bool>("--version", false) || ctx.get<bool>("-V", false)) {
+    safePrintLn("column (WinuxCmd) 1.0");
+    return 0;
+  }
+  if (ctx.get<bool>("--help", false)) {
+    safePrintLn("column (WinuxCmd) 1.0");
+    safePrintLn("Columnate lists.");
+    safePrintLn("");
+    safePrintLn("Usage: column [options] [file...]");
+    safePrintLn(
+        "  -c, --columns WIDTH  output is formatted for a display width");
+    safePrintLn(
+        "  -t, --table          determine the number of columns the input "
+        "contains");
+    safePrintLn(
+        "  -s, --separator SEP  specify the possible input item delimiters");
+    safePrintLn("  -J, --json           use JSON output format for table");
+    safePrintLn("  -N, --table-no-trunc don't truncate text in table output");
+    safePrintLn("  -H, --table-hide     don't print header in table output");
+    safePrintLn("  --version            output version information and exit");
+    safePrintLn("  --help               display this help and exit");
+    return 0;
+  }
 
   auto cfg_result = build_config(ctx);
   if (!cfg_result) {

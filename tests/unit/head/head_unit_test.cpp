@@ -62,6 +62,17 @@ TEST(head, head_n_and_c_options) {
   EXPECT_EQ_TEXT(r2.stdout_text, "alpha");
 }
 
+TEST(head, head_plus_count_prints_first_requested_lines) {
+  TempDir tmp;
+  tmp.write("a.txt", "one\ntwo\nthree\nfour\n");
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"head.exe", {L"-n", L"+3", L"a.txt"});
+  auto r = p.run();
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "one\ntwo\nthree\n");
+}
+
 TEST(head, head_last_count_option_wins) {
   TempDir tmp;
   tmp.write("a.txt", "alpha\nbeta\ngamma\n");
@@ -83,6 +94,22 @@ TEST(head, head_last_count_option_wins) {
   EXPECT_EQ_TEXT(r2.stdout_text, "al");
 }
 
+TEST(head, head_obsolete_count_after_options_reports_invalid_context) {
+  TempDir tmp;
+  tmp.write("a.txt", "1\n2\n3\n4\n5\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"head.exe", {L"-n", L"1", L"-5", L"a.txt"});
+  auto r = p.run();
+
+  EXPECT_NE(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "");
+  EXPECT_NE(r.stderr_text.find("head: option used in invalid context -- 5"),
+            std::wstring::npos);
+  EXPECT_EQ(r.stderr_text.find("unrecognized option"), std::wstring::npos);
+}
+
 TEST(head, head_negative_line_and_byte_counts) {
   TempDir tmp;
   tmp.write("a.txt", "alpha\nbeta\ngamma\n");
@@ -102,6 +129,63 @@ TEST(head, head_negative_line_and_byte_counts) {
 
   EXPECT_EQ(r2.exit_code, 0);
   EXPECT_EQ_TEXT(r2.stdout_text, "alpha\nbeta\n");
+
+  Pipeline p3;
+  p3.set_cwd(tmp.wpath());
+  p3.add(L"head.exe", {L"-n", L"-1", L"a.txt"});
+  auto r3 = p3.run();
+
+  EXPECT_EQ(r3.exit_code, 0);
+  EXPECT_EQ_TEXT(r3.stdout_text, "alpha\nbeta\n");
+
+  Pipeline p4;
+  p4.set_cwd(tmp.wpath());
+  p4.add(L"head.exe", {L"-c", L"-6", L"a.txt"});
+  auto r4 = p4.run();
+
+  EXPECT_EQ(r4.exit_code, 0);
+  EXPECT_EQ_TEXT(r4.stdout_text, "alpha\nbeta\n");
+}
+
+TEST(head, head_elide_tail_bytes_large_seekable_file) {
+  TempDir tmp;
+  std::string data;
+  data.reserve(90'008);
+  for (int i = 0; i < 90'000; ++i) {
+    data.push_back(static_cast<char>('a' + (i % 26)));
+  }
+  data += "TAIL-END";
+  tmp.write("large.bin", data);
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"head.exe", {L"-c", L"-8", L"large.bin"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ(r.stdout_text.size(), data.size() - 8);
+  EXPECT_EQ_TEXT(r.stdout_text.substr(0, 26), "abcdefghijklmnopqrstuvwxyz");
+  EXPECT_EQ(r.stdout_text.find("TAIL-END"), std::string::npos);
+}
+
+TEST(head, head_elide_tail_lines_large_seekable_file) {
+  TempDir tmp;
+  std::string data;
+  std::string expected;
+  for (int i = 0; i < 9000; ++i) {
+    std::string line = "line" + std::to_string(i) + "\n";
+    data += line;
+    if (i < 8998) expected += line;
+  }
+  tmp.write("large.txt", data);
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"head.exe", {L"-n", L"-2", L"large.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, expected);
 }
 
 TEST(head, head_count_suffixes) {
@@ -209,6 +293,59 @@ TEST(head, head_legacy_count_shorthand) {
 
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_EQ_TEXT(r.stdout_text, "alpha\nbeta\n");
+}
+
+TEST(head, head_strips_utf8_bom_in_line_mode) {
+  TempDir tmp;
+  tmp.write("a.txt", "\xEF\xBB\xBFhello\nsecond\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"head.exe", {L"-n", L"1", L"a.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "hello\n");
+}
+
+TEST(head, head_decodes_utf16le_input) {
+  TempDir tmp;
+  tmp.write_bytes("a.txt", {static_cast<char>(0xFF),
+                            static_cast<char>(0xFE),
+                            'h',
+                            '\0',
+                            'e',
+                            '\0',
+                            'l',
+                            '\0',
+                            'l',
+                            '\0',
+                            'o',
+                            '\0',
+                            '\n',
+                            '\0',
+                            's',
+                            '\0',
+                            'e',
+                            '\0',
+                            'c',
+                            '\0',
+                            'o',
+                            '\0',
+                            'n',
+                            '\0',
+                            'd',
+                            '\0',
+                            '\n',
+                            '\0'});
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"head.exe", {L"-n", L"1", L"a.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "hello\n");
 }
 
 TEST(head, head_obsolete_compact_byte_count) {
@@ -323,6 +460,62 @@ TEST(head, head_stdin_header_uses_standard_input) {
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_EQ_TEXT(r.stdout_text,
                  "==> standard input <==\nS1\n\n==> a.txt <==\nA1\n");
+}
+
+TEST(head, head_stops_reading_a_live_pipeline_after_requested_lines) {
+  Pipeline p;
+  p.add(L"yes.exe", {L"pipeline"});
+  p.add(L"head.exe", {L"-n", L"3"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "pipeline\npipeline\npipeline\n");
+}
+
+TEST(head, head_missing_file_reports_gnu_shaped_open_error) {
+  TempDir tmp;
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"head.exe", {L"missing.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stderr_text.find("head: cannot open 'missing.txt' for reading: "
+                                 "No such file or directory") !=
+              std::string::npos);
+}
+
+TEST(head, head_multi_file_skips_header_for_missing_file) {
+  TempDir tmp;
+  tmp.write("a.txt", "A1\nA2\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"head.exe", {L"-n", L"1", L"missing.txt", L"a.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stderr_text.find("head: cannot open 'missing.txt' for reading: "
+                                 "No such file or directory") !=
+              std::string::npos);
+  EXPECT_EQ(r.stdout_text.find("==> missing.txt <=="), std::string::npos);
+  EXPECT_EQ_TEXT(r.stdout_text, "==> a.txt <==\nA1\n");
+}
+
+TEST(head, head_directory_operand_reports_gnu_shaped_read_error) {
+  TempDir tmp;
+  std::filesystem::create_directory(tmp.path / "dir");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"head.exe", {L"dir"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stdout_text.empty());
+  EXPECT_TRUE(r.stderr_text.find("head: error reading 'dir': Is a directory") !=
+              std::string::npos);
 }
 
 TEST(head, head_wildcard) {

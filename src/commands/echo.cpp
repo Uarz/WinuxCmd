@@ -66,6 +66,11 @@ constexpr int MAX_REPEAT = 100000;
  * - @a -u, @a --upper: Convert text to uppercase [IMPLEMENTED]
  * - @a -r, @a --repeat: Repeat output N times [IMPLEMENTED]
  */
+// [GNU] -n: do not append a newline
+// [GNU] -e: enable backslash escapes
+// [GNU] -E: suppress backslash escapes
+// [EXT] -u, --upper: WinuxCmd extension, not in GNU coreutils
+// [EXT] -r, --repeat: WinuxCmd extension, not in GNU coreutils
 auto constexpr ECHO_OPTIONS =
     std::array{OPTION("-n", "", "do not append a newline"),
                OPTION("-e", "", "enable backslash escapes"),
@@ -78,6 +83,39 @@ auto constexpr ECHO_OPTIONS =
 // ======================================================
 namespace echo_pipeline {
 namespace cp = core::pipeline;
+
+enum class EscapeMode {
+  disabled,
+  enabled,
+};
+
+auto posixly_correct_enabled() -> bool {
+  return GetEnvironmentVariableW(L"POSIXLY_CORRECT", nullptr, 0) != 0;
+}
+
+template <size_t N>
+auto determine_escape_mode(const CommandContext<N>& ctx) -> EscapeMode {
+  bool posix_mode = posixly_correct_enabled();
+  EscapeMode mode = posix_mode ? EscapeMode::enabled : EscapeMode::disabled;
+
+  for (const auto& occurrence : ctx.options.occurrences()) {
+    if (!ctx.metas || occurrence.index >= N) {
+      continue;
+    }
+
+    const auto& meta = (*ctx.metas)[occurrence.index];
+    if (meta.short_name == "-e") {
+      mode = EscapeMode::enabled;
+      continue;
+    }
+
+    if (!posix_mode && meta.short_name == "-E") {
+      mode = EscapeMode::disabled;
+    }
+  }
+
+  return mode;
+}
 // ----------------------------------------------
 // 1. Build text
 // ----------------------------------------------
@@ -93,7 +131,6 @@ namespace cp = core::pipeline;
  */
 auto build_text(std::span<const std::string_view> args)
     -> cp::Result<std::string> {
-  if (args.empty()) return std::unexpected("no arguments provided");
   std::string text;
   for (auto arg : args) {
     if (!text.empty()) text += ' ';
@@ -155,9 +192,14 @@ auto to_uppercase(std::string text, bool enabled) -> cp::Result<std::string> {
  * @param enabled Flag indicating whether to process escape sequences
  * @return A Result containing the text with escape sequences processed
  */
+struct EscapeResult {
+  std::string text;
+  bool suppress_newline = false;
+};
+
 auto process_escapes(std::string text, bool enabled)
-    -> cp::Result<std::string> {
-  if (!enabled) return text;
+    -> cp::Result<EscapeResult> {
+  if (!enabled) return EscapeResult{std::move(text), false};
 
   std::string result;
   for (size_t i = 0; i < text.size(); ++i) {
@@ -171,7 +213,7 @@ auto process_escapes(std::string text, bool enabled)
           result += '\b';
           break;
         case 'c':
-          return result;  // Suppress further output
+          return EscapeResult{std::move(result), true};
         case 'e':
           result += '\x1B';
           break;
@@ -196,21 +238,24 @@ auto process_escapes(std::string text, bool enabled)
         case '\\':
           result += '\\';
           break;
-        case '0': {
-          // Octal escape \0nnn
+        case '0':
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+        case '5':
+        case '6':
+        case '7': {
+          // Octal escape \0nnn and GNU old-style \nnn
           int value = 0;
-          size_t j = i + 1;
-          for (; j < i + 4 && j < text.size() &&
-                 std::isdigit(static_cast<unsigned char>(text[j]));
+          size_t j = i;
+          for (;
+               j < i + 3 && j < text.size() && text[j] >= '0' && text[j] <= '7';
                ++j) {
             value = value * 8 + (text[j] - '0');
           }
-          if (j > i + 1) {
-            result += static_cast<char>(value);
-            i = j - 1;
-          } else {
-            result += '\0';
-          }
+          result += static_cast<char>(value);
+          i = j - 1;
           break;
         }
         case 'x': {
@@ -230,19 +275,16 @@ auto process_escapes(std::string text, bool enabled)
             result += static_cast<char>(value);
             i = j - 1;
           } else {
+            result += '\\';
             result += 'x';
           }
           break;
         }
-        case 'u':
-        case 'U': {
-          // Unicode escapes - not fully implemented on Windows
-          // \uHHHH and \UHHHHHHHH
-          result += text[i - 1];
-          result += text[i];
-          break;
-        }
+        // GNU coreutils echo does not interpret \u/\U unicode escapes;
+        // they are printed literally (uutils #14414). Only printf %b and
+        // the printf format string handle them.
         default:
+          result += '\\';
           result += text[i];
           break;
       }
@@ -250,7 +292,7 @@ auto process_escapes(std::string text, bool enabled)
       result += text[i];
     }
   }
-  return result;
+  return EscapeResult{std::move(result), false};
 }
 
 // ----------------------------------------------
@@ -300,23 +342,21 @@ auto validate_repeat(int count) -> cp::Result<int> {
 template <size_t N>
 auto process_command(const CommandContext<N>& ctx)
     -> cp::Result<std::tuple<std::string, int, bool>> {
-  bool enable_escapes = ctx.get<bool>("-e", false);
-  bool suppress_escapes = ctx.get<bool>("-E", false);
-  // If both -e and -E are specified, -E takes precedence
-  bool process_escape = enable_escapes && !suppress_escapes;
+  bool process_escape = determine_escape_mode(ctx) == EscapeMode::enabled;
+  bool option_no_newline = ctx.get<bool>("-n", false);
 
   return build_text(ctx.positionals)
       .and_then([&](std::string text) {
         return to_uppercase(std::move(text), ctx.get<bool>("--upper", false));
       })
-      .and_then([&](std::string utext) {
+      .and_then([&](std::string utext) -> cp::Result<EscapeResult> {
         return process_escapes(std::move(utext), process_escape);
       })
-      .and_then([&](std::string etext) {
+      .and_then([&](EscapeResult escaped) {
         return validate_repeat(ctx.get<int>("--repeat", 1))
             .transform([&](int repeat) {
-              bool no_newline = ctx.get<bool>("-n", false);
-              return std::tuple{std::move(etext), repeat, no_newline};
+              bool no_newline = option_no_newline || escaped.suppress_newline;
+              return std::tuple{std::move(escaped.text), repeat, no_newline};
             });
       });
 }

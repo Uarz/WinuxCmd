@@ -43,10 +43,13 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr PASTE_OPTIONS = std::array{
+    // [GNU]
     OPTION("-d", "--delimiters", "reuse characters from LIST instead of TAB",
            OPTIONAL_STRING_TYPE),
+    // [GNU]
     OPTION("-s", "--serial", "paste one file at a time instead of in parallel",
            BOOL_TYPE),
+    // [GNU]
     OPTION("-z", "--zero-terminated", "line delimiter is NUL, not newline")};
 
 namespace paste_pipeline {
@@ -219,11 +222,27 @@ auto build_config(const CommandContext<PASTE_OPTIONS.size()>& ctx)
 }
 
 // Read all lines from a file
+auto paste_input_open_error(std::string_view filename) -> std::string {
+  std::error_code ec;
+  auto status = std::filesystem::status(std::filesystem::u8path(filename), ec);
+  if (!ec && status.type() == std::filesystem::file_type::directory) {
+    return std::string("cannot open '") + std::string(filename) +
+           "' for reading: Is a directory";
+  }
+  return std::string("cannot open '") + std::string(filename) +
+         "' for reading: No such file or directory";
+}
+
 auto read_lines(const std::string& filename, char delimiter = '\n')
     -> cp::Result<SmallVector<std::string, 1024>> {
   SmallVector<std::string, 1024> lines;
+  const bool trim_crlf = delimiter == '\n';
 
   if (filename == "-") {
+    // [GNU] closed stdin (<&-) errors "paste: -: Bad file descriptor".
+    if (file_io::stdin_is_bad()) {
+      return std::unexpected("-: Bad file descriptor");
+    }
     // Read from stdin
     std::string content;
     {
@@ -234,19 +253,27 @@ auto read_lines(const std::string& filename, char delimiter = '\n')
     size_t start = 0;
     for (size_t i = 0; i < content.size(); ++i) {
       if (content[i] == delimiter) {
-        lines.emplace_back(content.substr(start, i - start));
+        std::string line = content.substr(start, i - start);
+        if (trim_crlf && !line.empty() && line.back() == '\r') {
+          line.pop_back();
+        }
+        lines.push_back(std::move(line));
         start = i + 1;
       }
     }
     if (start < content.size()) {
-      lines.emplace_back(content.substr(start));
+      std::string line = content.substr(start);
+      if (trim_crlf && !line.empty() && line.back() == '\r') {
+        line.pop_back();
+      }
+      lines.push_back(std::move(line));
     }
   } else {
     // Read from file
-    std::ifstream f(filename, std::ios::binary);
+    std::ifstream f(native_path::normalize_api_operand(filename),
+                    std::ios::binary);
     if (!f) {
-      return std::unexpected(std::string("cannot open '") + filename +
-                             "' for reading");
+      return std::unexpected(paste_input_open_error(filename));
     }
 
     std::string content((std::istreambuf_iterator<char>(f)),
@@ -256,6 +283,9 @@ auto read_lines(const std::string& filename, char delimiter = '\n')
     for (size_t i = 0; i < content.size(); ++i) {
       if (content[i] == delimiter) {
         std::string line = content.substr(start, i - start);
+        if (trim_crlf && !line.empty() && line.back() == '\r') {
+          line.pop_back();
+        }
         // Skip UTF-8 BOM if present at the beginning of the first line
         if (lines.empty() && line.size() >= 3 &&
             static_cast<unsigned char>(line[0]) == 0xEF &&
@@ -269,6 +299,9 @@ auto read_lines(const std::string& filename, char delimiter = '\n')
     }
     if (start < content.size()) {
       std::string line = content.substr(start);
+      if (trim_crlf && !line.empty() && line.back() == '\r') {
+        line.pop_back();
+      }
       if (lines.empty() && line.size() >= 3 &&
           static_cast<unsigned char>(line[0]) == 0xEF &&
           static_cast<unsigned char>(line[1]) == 0xBB &&

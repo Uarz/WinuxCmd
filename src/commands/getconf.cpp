@@ -42,7 +42,12 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr GETCONF_OPTIONS =
+    // [GNU]
     std::array{OPTION("-a", "--all", "display all configuration variables"),
+               // [GNU] -v SPEC: give values for compilation environment SPEC
+               OPTION("-v", "", "give values for compilation environment SPEC",
+                      STRING_TYPE),
+               // [GNU]
                OPTION("", "", "get system configuration values", STRING_TYPE)};
 
 REGISTER_COMMAND(
@@ -51,14 +56,16 @@ REGISTER_COMMAND(
     "getconf",
 
     /* synopsis */
-    "getconf [OPTION]... [VARIABLE_NAME]...",
+    "getconf [OPTION]... [VARIABLE_NAME]...\n"
+    "getconf [OPTION]... PATH_VAR PATH",
     "Display configuration variable values.\n"
     "\n"
     "If no VARIABLE_NAME is specified, display system-dependent limit values.\n"
     "On Windows, this provides limited system configuration information.\n"
     "\n"
     "Options:\n"
-    "  -a, --all  display all configuration variables",
+    "  -a, --all  display all configuration variables\n"
+    "  -v SPEC    give values for compilation environment SPEC",
     "  getconf\n"
     "  getconf PATH_MAX\n"
     "  getconf -a",
@@ -68,6 +75,11 @@ REGISTER_COMMAND(
   namespace cp = core::pipeline;
 
   bool all = ctx.get<bool>("--all", false) || ctx.get<bool>("-a", false);
+
+  // [GNU] -v SPEC: give values for compilation environment SPEC
+  // On Windows, compilation environment SPEC is not applicable
+  // Accept the option but ignore the SPEC value for compatibility
+  (void)ctx.get<std::string>("-v", "");
 
   SYSTEM_INFO sysInfo;
   GetSystemInfo(&sysInfo);
@@ -98,19 +110,22 @@ REGISTER_COMMAND(
     std::transform(var_name.begin(), var_name.end(), var_name.begin(),
                    ::tolower);
 
-    if (var_name == "path_max" || var_name == "name_max") {
+    if (var_name == "path_max" || var_name == "_posix_path_max" ||
+        var_name == "name_max" || var_name == "_posix_name_max") {
       safePrintLn("260");  // MAX_PATH on Windows
     } else if (var_name == "nprocessors_onln" ||
-               var_name == "nprocessors_conf") {
+               var_name == "_nprocessors_onln" ||
+               var_name == "nprocessors_conf" ||
+               var_name == "_nprocessors_conf") {
       safePrintLn(std::to_string(sysInfo.dwNumberOfProcessors));
-    } else if (var_name == "page_size") {
+    } else if (var_name == "page_size" || var_name == "pagesize") {
       safePrintLn(std::to_string(sysInfo.dwPageSize));
-    } else if (var_name == "phys_pages") {
+    } else if (var_name == "phys_pages" || var_name == "_phys_pages") {
       MEMORYSTATUS memStatus;
       memStatus.dwLength = sizeof(memStatus);
       GlobalMemoryStatus(&memStatus);
       safePrintLn(std::to_string(memStatus.dwTotalPhys / sysInfo.dwPageSize));
-    } else if (var_name == "avphys_pages") {
+    } else if (var_name == "avphys_pages" || var_name == "_avphys_pages") {
       MEMORYSTATUS memStatus;
       memStatus.dwLength = sizeof(memStatus);
       GlobalMemoryStatus(&memStatus);

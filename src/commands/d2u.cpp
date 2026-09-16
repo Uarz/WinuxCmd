@@ -42,6 +42,7 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr D2U_OPTIONS = std::array{
+    // [EXT]
     OPTION("-v", "--verbose", "print a message for each file", BOOL_TYPE)};
 
 REGISTER_COMMAND(d2u,
@@ -73,7 +74,8 @@ REGISTER_COMMAND(d2u,
   auto process_file = [&](const std::string& filename,
                           bool modify_in_place) -> bool {
     std::wstring wfilename = utf8_to_wstring(filename);
-    std::ifstream input(wfilename, std::ios::binary);
+    std::ifstream input(native_path::normalize_api_operand_w(wfilename),
+                        std::ios::binary);
     if (!input) {
       safeErrorPrintLn("d2u: cannot open '" + filename +
                        "': No such file or directory");
@@ -113,22 +115,12 @@ REGISTER_COMMAND(d2u,
   };
 
   if (ctx.positionals.empty()) {
-    // Read from stdin, write to stdout
-    std::string line;
-    bool first = true;
-    while (std::getline(std::cin, line)) {
-      // Remove trailing \r if present
-      if (!line.empty() && line.back() == '\r') {
-        line.pop_back();
-      }
-      if (!first) {
-        safePrint("\n");
-      }
-      safePrint(line);
-      first = false;
-    }
-    if (!first) {
-      safePrint("\n");
+    std::string content((std::istreambuf_iterator<char>(std::cin)), {});
+    for (size_t i = 0; i < content.size(); ++i) {
+      if (content[i] == '\r' && i + 1 < content.size() &&
+          content[i + 1] == '\n')
+        continue;
+      safePrint(content.substr(i, 1));
     }
   } else {
     // Process each file in place

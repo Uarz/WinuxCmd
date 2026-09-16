@@ -31,13 +31,8 @@
 /// @Copyright: Copyright © 2026 WinuxCmd
 // *** SIMPLIFIED IMPLEMENTATION - Some features may not be fully supported ***
 
-#include "pch/pch.h"
-// include other header after pch.h
-#include <wincrypt.h>
-
 #include "core/command_macros.h"
-
-#pragma comment(lib, "advapi32.lib")
+#include "pch/pch.h"
 
 import std;
 import core;
@@ -48,22 +43,33 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr SHA224SUM_OPTIONS = std::array{
+    // [DIFFERS] -b, --binary
     OPTION("-b", "--binary", "read in binary mode (default)", BOOL_TYPE),
+    // [GNU] -c, --check
     OPTION("-c", "--check", "read SHA224 sums from the FILEs and check them",
-           STRING_TYPE),
-    OPTION("-t", "--text", "read in text mode", BOOL_TYPE),
-    OPTION("-q", "--quiet",
-           "don't print OK for each successfully verified file", BOOL_TYPE),
-    OPTION("-s", "--status", "don't output anything, status code shows success",
            BOOL_TYPE),
+    // [GNU] --ignore-missing
+    OPTION("", "--ignore-missing",
+           "don't fail or report status for missing files", BOOL_TYPE),
+    // [DIFFERS] -t, --text
+    OPTION("-t", "--text", "read in text mode", BOOL_TYPE),
+    // [GNU] -q, --quiet
+    OPTION("", "--quiet", "don't print OK for each successfully verified file",
+           BOOL_TYPE),
+    // [GNU] -s, --status
+    OPTION("", "--status", "don't output anything, status code shows success",
+           BOOL_TYPE),
+    // [GNU] -w, --warn
     OPTION("-w", "--warn", "warn about improperly formatted checksum lines",
            BOOL_TYPE),
-    OPTION("", "--tag",
-           "create a BSD-style checksum", BOOL_TYPE),
-    OPTION("", "--zero",
-           "end each output line with NUL, not newline", BOOL_TYPE),
-    OPTION("", "--strict",
-           "with --check, exit non-zero for any invalid input", BOOL_TYPE)};
+    // [GNU] --tag
+    OPTION("", "--tag", "create a BSD-style checksum", BOOL_TYPE),
+    // [GNU] -z, --zero
+    OPTION("-z", "--zero", "end each output line with NUL, not newline",
+           BOOL_TYPE),
+    // [GNU] --strict
+    OPTION("", "--strict", "with --check, exit non-zero for any invalid input",
+           BOOL_TYPE)};
 
 namespace sha224sum_pipeline {
 namespace cp = core::pipeline;
@@ -78,31 +84,89 @@ struct Config {
   bool tag = false;
   bool zero = false;
   bool strict = false;
-  std::string check_file;
+  bool ignore_missing = false;
   SmallVector<std::string, 64> files;
 };
+
+auto input_open_error(std::string_view path) -> std::string {
+  return std::string(path) + ": " + portable_digest::open_error_reason(path);
+}
 
 auto build_config(const CommandContext<SHA224SUM_OPTIONS.size()>& ctx)
     -> cp::Result<Config> {
   Config cfg;
+  cfg.text_mode = ctx.get<bool>("--text", false) || ctx.get<bool>("-t", false);
+#ifdef _WIN32
+  cfg.binary_mode = !cfg.text_mode;  // Binary mode is default on Windows
+#else
   cfg.binary_mode =
       ctx.get<bool>("--binary", false) || ctx.get<bool>("-b", false);
-  auto check_opt = ctx.get<std::string>("--check", "");
+#endif
   cfg.check_mode =
-      !check_opt.empty() || !ctx.get<std::string>("-c", "").empty();
-  cfg.text_mode = ctx.get<bool>("--text", false) || ctx.get<bool>("-t", false);
-  cfg.quiet = ctx.get<bool>("--quiet", false) || ctx.get<bool>("-q", false);
-  cfg.status = ctx.get<bool>("--status", false) || ctx.get<bool>("-s", false);
-  cfg.warn = ctx.get<bool>("--warn", false) || ctx.get<bool>("-w", false);
+      ctx.get<bool>("--check", false) || ctx.get<bool>("-c", false);
   cfg.tag = ctx.get<bool>("--tag", false);
-  cfg.zero = ctx.get<bool>("--zero", false);
+  cfg.zero = ctx.get<bool>("--zero", false) || ctx.get<bool>("-z", false);
   cfg.strict = ctx.get<bool>("--strict", false);
+  cfg.ignore_missing = ctx.get<bool>("--ignore-missing", false);
 
-  if (cfg.check_mode) {
-    cfg.check_file = ctx.get<std::string>("--check", "");
-    if (cfg.check_file.empty()) {
-      cfg.check_file = ctx.get<std::string>("-c", "");
+  // [GNU] the last of --status/--warn/--quiet wins and resets the other two
+  // (getopt cases STATUS_OPTION/'w'/QUIET_OPTION in src/cksum.c).
+  for (const auto& occurrence : ctx.options.occurrences()) {
+    const auto& meta = (*ctx.metas)[occurrence.index];
+    if (meta.long_name == "--status") {
+      cfg.status = true;
+      cfg.warn = false;
+      cfg.quiet = false;
+    } else if (meta.long_name == "--warn") {
+      cfg.status = false;
+      cfg.warn = true;
+      cfg.quiet = false;
+    } else if (meta.long_name == "--quiet") {
+      cfg.status = false;
+      cfg.warn = false;
+      cfg.quiet = true;
     }
+  }
+
+  // [GNU] option-conflict checks, in src/cksum.c main() order.
+  const bool mode_seen = ctx.has("-b") || ctx.has("--binary") ||
+                         ctx.has("-t") || ctx.has("--text");
+  if (cfg.zero && cfg.check_mode) {
+    return std::unexpected(
+        "the --zero option is not supported when verifying checksums");
+  }
+  if (cfg.tag && cfg.check_mode) {
+    return std::unexpected(
+        "the --tag option is meaningless when verifying checksums");
+  }
+  if (mode_seen && cfg.check_mode) {
+    return std::unexpected(
+        "the --binary and --text options are meaningless when verifying "
+        "checksums");
+  }
+  if (cfg.ignore_missing && !cfg.check_mode) {
+    return std::unexpected(
+        "the --ignore-missing option is meaningful only when verifying "
+        "checksums");
+  }
+  if (cfg.status && !cfg.check_mode) {
+    return std::unexpected(
+        "the --status option is meaningful only when verifying checksums");
+  }
+  if (cfg.warn && !cfg.check_mode) {
+    return std::unexpected(
+        "the --warn option is meaningful only when verifying checksums");
+  }
+  if (cfg.quiet && !cfg.check_mode) {
+    return std::unexpected(
+        "the --quiet option is meaningful only when verifying checksums");
+  }
+  if (cfg.strict && !cfg.check_mode) {
+    return std::unexpected(
+        "the --strict option is meaningful only when verifying checksums");
+  }
+  if (cfg.tag && cfg.text_mode) {
+    return std::unexpected("--tag does not support --text mode");
   }
 
   for (auto arg : ctx.positionals) {
@@ -119,108 +183,36 @@ auto build_config(const CommandContext<SHA224SUM_OPTIONS.size()>& ctx)
     cfg.files.push_back(file_arg);
   }
 
-  if (cfg.files.empty() && !cfg.check_mode) {
+  if (cfg.files.empty()) {
     cfg.files.push_back("-");
   }
 
   return cfg;
 }
 
-// Calculate SHA224 hash using Windows CryptoAPI
-// Note: Windows CryptoAPI doesn't directly support SHA224, need to use SHA256
-// and truncate
 auto calculate_sha224(const std::string& filename, bool text_mode = false)
     -> cp::Result<std::string> {
-  HCRYPTPROV hProv = 0;
-  HCRYPTHASH hHash = 0;
-
-  // Open cryptographic provider
-  // Note: SHA256 requires PROV_RSA_AES or a SHA256-capable provider
-  if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_AES,
-                           CRYPT_VERIFYCONTEXT)) {
-    return std::unexpected("failed to acquire cryptographic context");
-  }
-
-  // Create hash object using SHA256 (we'll truncate to SHA224)
-  if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
-    CryptReleaseContext(hProv, 0);
-    return std::unexpected("failed to create hash object");
-  }
-
-  bool success = false;
-  if (filename == "-" || filename.empty()) {
-    // Read from stdin
-    std::array<char, 8192> buffer;
-    size_t bytes_read;
-
-    while ((bytes_read = fread(buffer.data(), 1, buffer.size(), stdin)) > 0) {
-      if (!CryptHashData(hHash, reinterpret_cast<BYTE*>(buffer.data()),
-                         static_cast<DWORD>(bytes_read), 0)) {
-        CryptDestroyHash(hHash);
-        CryptReleaseContext(hProv, 0);
-        return std::unexpected("failed to hash data");
-      }
-    }
-    success = true;
-  } else {
-    // Read from file (binary mode by default, text mode if --text)
-    std::ifstream file(filename, text_mode ? std::ios::in : std::ios::binary);
-    if (!file) {
-      CryptDestroyHash(hHash);
-      CryptReleaseContext(hProv, 0);
-      return std::unexpected(std::string("cannot open '") + filename +
-                             "' for reading");
-    }
-
-    std::array<char, 8192> buffer;
-    while (file) {
-      file.read(buffer.data(), buffer.size());
-      std::streamsize bytes_read = file.gcount();
-      if (bytes_read > 0) {
-        if (!CryptHashData(hHash, reinterpret_cast<BYTE*>(buffer.data()),
-                           static_cast<DWORD>(bytes_read), 0)) {
-          CryptDestroyHash(hHash);
-          CryptReleaseContext(hProv, 0);
-          return std::unexpected("failed to hash data");
-        }
-      }
-    }
-    success = !file.fail();
-  }
-
-  // Get hash value
-  DWORD hash_len = 32;  // SHA256 produces 32 bytes
-  std::array<BYTE, 32> hash_value{};
-
-  if (!CryptGetHashParam(hHash, HP_HASHVAL, hash_value.data(), &hash_len, 0)) {
-    CryptDestroyHash(hHash);
-    CryptReleaseContext(hProv, 0);
-    return std::unexpected("failed to get hash value");
-  }
-
-  CryptDestroyHash(hHash);
-  CryptReleaseContext(hProv, 0);
-
-  // SHA224 is SHA256 truncated to 28 bytes (224 bits)
-  // Convert first 28 bytes to hex string
-  std::string result;
-  result.reserve(56);
-  for (DWORD i = 0; i < 28; ++i) {
-    char buf[3];
-    snprintf(buf, sizeof(buf), "%02x", hash_value[i]);
-    result += buf;
-  }
-
-  return result;
+  return portable_digest::hash_file_hex(portable_digest::HashAlgorithm::Sha224,
+                                        filename, text_mode);
 }
 
 auto run(const Config& cfg) -> int {
   if (cfg.check_mode) {
-    // Check mode (not fully implemented)
-    // strict mode: when implemented, exit non-zero for any invalid input
-    cp::report_custom_error(
-        L"sha224sum", L"check mode is not fully implemented in this version");
-    return 1;
+    // [GNU] digest_check() over every check FILE operand ("-" = stdin).
+    portable_digest::SumCheckFlags flags{
+        .status_only = cfg.status,
+        .quiet = cfg.quiet,
+        .warn = cfg.warn,
+        .strict = cfg.strict,
+        .ignore_missing = cfg.ignore_missing,
+    };
+    auto hash_fn = [](const std::string& filename, size_t) {
+      return calculate_sha224(filename, false);
+    };
+    return portable_digest::sum_check_main(
+        "sha224sum", "SHA224", 56, flags,
+        std::span<const std::string>(cfg.files.data(), cfg.files.size()),
+        hash_fn);
   }
 
   bool all_ok = true;
@@ -233,13 +225,15 @@ auto run(const Config& cfg) -> int {
       continue;
     }
 
-    // Output format: HASH  FILENAME (or BSD-style if --tag)
-    const char* term = cfg.zero ? "\0" : "\n";
+    // GNU/MSYS defaults to binary marker on Windows; --text uses a space.
+    std::string output;
     if (cfg.tag) {
-      safePrint("SHA224 (" + file + ") = " + *hash_result + term);
+      output = "SHA224 (" + file + ") = " + *hash_result;
     } else {
-      safePrint(*hash_result + "  " + file + term);
+      output = *hash_result + (cfg.binary_mode ? " *" : "  ") + file;
     }
+    output.push_back(cfg.zero ? '\0' : '\n');
+    safePrint(output);
   }
 
   return all_ok ? 0 : 1;
@@ -254,8 +248,8 @@ REGISTER_COMMAND(sha224sum, "sha224sum", "sha224sum [OPTION]... [FILE]...",
                  "\n"
                  "SHA224 produces a 224-bit (28-byte) hash value, typically "
                  "rendered as a 56-digit hexadecimal number.\n"
-                 "This implementation uses SHA256 and truncates to 224 bits as "
-                 "Windows CryptoAPI doesn't directly support SHA224.",
+                 "Uses WinuxCmd's portable SHA-224 implementation with the "
+                 "RFC 3874 initial state and digest length.",
                  "  sha224sum file.txt\n"
                  "  echo \"test\" | sha224sum\n"
                  "  sha224sum *.txt > checksums.sha224",
@@ -266,6 +260,7 @@ REGISTER_COMMAND(sha224sum, "sha224sum", "sha224sum [OPTION]... [FILE]...",
   auto cfg_result = build_config(ctx);
   if (!cfg_result) {
     cp::report_error(cfg_result, L"sha224sum");
+    safeErrorPrintLn("Try 'sha224sum --help' for more information.");
     return 1;
   }
 

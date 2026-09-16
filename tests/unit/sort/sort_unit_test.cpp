@@ -38,6 +38,37 @@ TEST(sort, sort_basic_lexicographic) {
   EXPECT_EQ_TEXT(r.stdout_text, "apple\nbanana\npear\n");
 }
 
+TEST(sort, sort_missing_file_reports_gnu_shaped_read_error) {
+  TempDir tmp;
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sort.exe", {L"missing.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 2);
+  EXPECT_EQ_TEXT(r.stdout_text, "");
+  EXPECT_TRUE(
+      r.stderr_text.find(
+          "sort: cannot read: missing.txt: No such file or directory") !=
+      std::string::npos);
+}
+
+TEST(sort, sort_preserves_crlf_input_records) {
+  TempDir tmp;
+  tmp.write_bytes("a.txt",
+                  {'p',  'e',  'a', 'r', '\r', '\n', 'a', 'p', 'p',  'l', 'e',
+                   '\r', '\n', 'b', 'a', 'n',  'a',  'n', 'a', '\r', '\n'});
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sort.exe", {L"a.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ(r.stdout_text, std::string("apple\r\nbanana\r\npear\r\n", 21));
+}
+
 TEST(sort, sort_numeric_reverse_unique) {
   TempDir tmp;
   tmp.write("n.txt", "2\n10\n2\n1\n");
@@ -274,6 +305,131 @@ TEST(sort, sort_accepts_long_buffer_size_percent_hint) {
   EXPECT_EQ_TEXT(r.stdout_text, "1\n2\n3\n");
 }
 
+TEST(sort, sort_accepts_parallel_hint) {
+  TempDir tmp;
+  tmp.write("in.txt", "3\n1\n2\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sort.exe", {L"--parallel=2", L"in.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "1\n2\n3\n");
+}
+
+TEST(sort, sort_rejects_invalid_parallel_hint) {
+  Pipeline p;
+  p.add(L"sort.exe", {L"--parallel=0"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 2);
+  EXPECT_TRUE(r.stderr_text.find("invalid --parallel argument '0'") !=
+              std::string::npos);
+}
+
+TEST(sort, sort_accepts_batch_size_hint) {
+  TempDir tmp;
+  tmp.write("in.txt", "3\n1\n2\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sort.exe", {L"--batch-size=16", L"in.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "1\n2\n3\n");
+}
+
+TEST(sort, sort_rejects_invalid_batch_size_hint) {
+  Pipeline p;
+  p.add(L"sort.exe", {L"--batch-size=1"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 2);
+  EXPECT_TRUE(r.stderr_text.find("invalid --batch-size argument '1'") !=
+              std::string::npos);
+  // [GNU] below-minimum values get a second diagnostic line.
+  EXPECT_TRUE(r.stderr_text.find("minimum --batch-size argument is '2'") !=
+              std::string::npos);
+}
+
+TEST(sort, sort_rejects_batch_size_above_rlimit) {
+  // [GNU] --batch-size may not exceed the open-file budget (RLIMIT_NOFILE-3,
+  // 3197 on the MSYS2/Cygwin GNU build) (uutils #10632).
+  Pipeline p;
+  p.add(L"sort.exe", {L"--batch-size=99999"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 2);
+  EXPECT_TRUE(r.stderr_text.find("--batch-size argument '99999' too large") !=
+              std::string::npos);
+  EXPECT_TRUE(
+      r.stderr_text.find(
+          "maximum --batch-size argument with current rlimit is 3197") !=
+      std::string::npos);
+}
+
+TEST(sort, sort_accepts_compress_program_hint) {
+  TempDir tmp;
+  tmp.write("in.txt", "3\n1\n2\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sort.exe", {L"--compress-program=gzip", L"in.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "1\n2\n3\n");
+}
+
+TEST(sort, sort_rejects_empty_compress_program_hint) {
+  Pipeline p;
+  p.add(L"sort.exe", {L"--compress-program="});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 2);
+  EXPECT_TRUE(r.stderr_text.find("invalid compress program") !=
+              std::string::npos);
+}
+
+TEST(sort, sort_accepts_temporary_directory_hint) {
+  TempDir tmp;
+  tmp.write("in.txt", "3\n1\n2\n");
+  tmp.mkdir("tmpdir");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sort.exe", {L"-T", L"tmpdir", L"in.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "1\n2\n3\n");
+}
+
+TEST(sort, sort_rejects_invalid_temporary_directory_hint) {
+  TempDir tmp;
+  tmp.write("notadir.txt", "x\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sort.exe", {L"--temporary-directory=missing", L"notadir.txt"});
+  auto missing = p.run();
+
+  EXPECT_EQ(missing.exit_code, 2);
+  EXPECT_TRUE(missing.stderr_text.find("invalid temporary directory") !=
+              std::string::npos);
+
+  Pipeline file_operand;
+  file_operand.set_cwd(tmp.wpath());
+  file_operand.add(L"sort.exe", {L"-T", L"notadir.txt"});
+  auto not_directory = file_operand.run();
+
+  EXPECT_EQ(not_directory.exit_code, 2);
+  EXPECT_TRUE(not_directory.stderr_text.find("invalid temporary directory") !=
+              std::string::npos);
+}
+
 TEST(sort, sort_rejects_invalid_buffer_size_hint) {
   Pipeline p;
   p.add(L"sort.exe", {L"--buffer-size=bad"});
@@ -303,6 +459,28 @@ TEST(sort, sort_version_sort) {
 
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_EQ_TEXT(r.stdout_text, "1.2.0\n1.2.2\n1.2.10\n1.10.0\n");
+}
+
+TEST(sort, sort_version_flag_does_not_steal_version_sort_short_option) {
+  TempDir tmp;
+  tmp.write("v.txt", "1.10\n1.2\n");
+
+  Pipeline version_sort;
+  version_sort.set_cwd(tmp.wpath());
+  version_sort.add(L"sort.exe", {L"-V", L"v.txt"});
+  auto sort_result = version_sort.run();
+
+  EXPECT_EQ(sort_result.exit_code, 0);
+  EXPECT_EQ_TEXT(sort_result.stdout_text, "1.2\n1.10\n");
+
+  Pipeline version_flag;
+  version_flag.add(L"sort.exe", {L"--version"});
+  auto version_result = version_flag.run();
+
+  EXPECT_EQ(version_result.exit_code, 0);
+  EXPECT_NE(version_result.stdout_text.find("sort (WinuxCmd)"),
+            std::string::npos);
+  EXPECT_TRUE(version_result.stderr_text.empty());
 }
 
 TEST(sort, sort_long_sort_numeric_word) {
@@ -549,6 +727,33 @@ TEST(sort, sort_merge_sorted_inputs) {
   EXPECT_EQ_TEXT(r.stdout_text, "a\nb\nc\nd\n");
 }
 
+TEST(sort, sort_merge_keeps_single_input_stream_order) {
+  TempDir tmp;
+  tmp.write("one.txt", "2\na\n1\nb\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sort.exe", {L"-m", L"one.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "2\na\n1\nb\n");
+}
+
+TEST(sort, sort_merge_does_not_resort_within_input_streams) {
+  TempDir tmp;
+  tmp.write("a.txt", "1\n3\n2\n");
+  tmp.write("b.txt", "0\n4\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sort.exe", {L"-m", L"a.txt", L"b.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "0\n1\n3\n2\n4\n");
+}
+
 TEST(sort, sort_check_detects_unsorted_input) {
   TempDir tmp;
   tmp.write("bad.txt", "b\na\n");
@@ -559,6 +764,22 @@ TEST(sort, sort_check_detects_unsorted_input) {
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 1);
+  EXPECT_EQ_TEXT(r.stdout_text, "");
+  EXPECT_TRUE(r.stderr_text.find("sort: bad.txt:2: disorder: a") !=
+              std::string::npos);
+}
+
+TEST(sort, sort_zero_terminated_records_are_sorted_and_written_binary) {
+  TempDir tmp;
+  tmp.write_bytes("z.bin", {'b', '\0', 'a', '\0', 'c', '\0'});
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sort.exe", {L"-z", L"z.bin"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, std::string("a\0b\0c\0", 6));
 }
 
 TEST(sort, sort_check_quiet_detects_unsorted_input) {
@@ -568,6 +789,19 @@ TEST(sort, sort_check_quiet_detects_unsorted_input) {
   Pipeline p;
   p.set_cwd(tmp.wpath());
   p.add(L"sort.exe", {L"-C", L"bad.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_EQ_TEXT(r.stdout_text, "");
+}
+
+TEST(sort, sort_check_silent_long_option_matches_quiet_check_mode) {
+  TempDir tmp;
+  tmp.write("bad.txt", "b\na\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sort.exe", {L"--check-silent", L"bad.txt"});
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 1);
@@ -623,6 +857,19 @@ TEST(sort, sort_uniq_pipeline_accepts_utf16le_stdin_with_bom) {
   EXPECT_TRUE(r.stdout_text.find("2 dog") != std::string::npos);
 }
 
+TEST(sort, sort_preserves_nul_dense_input_without_encoding_bom) {
+  TempDir tmp;
+  tmp.write_bytes("binary.dat", {'b', '\0', 'x', '\n', 'a', '\0', 'y', '\n'});
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sort.exe", {L"binary.dat"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ(r.stdout_text, std::string("a\0y\nb\0x\n", 8));
+}
+
 TEST(sort, sort_wildcard) {
   TempDir tmp;
   tmp.write("file1.txt", "cherry\napple\n");
@@ -648,4 +895,193 @@ TEST(sort, sort_wildcard) {
   EXPECT_TRUE(r.stdout_text.find("date") != std::string::npos);
   EXPECT_TRUE(r.stdout_text.find("aaa") == std::string::npos);
   EXPECT_TRUE(r.stdout_text.find("zzz") == std::string::npos);
+}
+
+TEST(sort, sort_files0_from_rejects_empty_file_list) {
+  TempDir tmp;
+  tmp.write("list.bin", "");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sort.exe", {L"--files0-from", L"list.bin"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 2);
+  EXPECT_TRUE(r.stderr_text.find("no input from list.bin") !=
+              std::string::npos);
+}
+
+TEST(sort, sort_files0_from_rejects_zero_length_file_name) {
+  TempDir tmp;
+  tmp.write_bytes("list.bin", {'\0'});
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sort.exe", {L"--files0-from", L"list.bin"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 2);
+  EXPECT_TRUE(r.stderr_text.find("list.bin:1: invalid zero-length file name") !=
+              std::string::npos);
+}
+
+TEST(sort, sort_files0_from_rejects_stdin_file_name) {
+  TempDir tmp;
+  tmp.write_bytes("list.bin", {'-', '\0'});
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sort.exe", {L"--files0-from", L"list.bin"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 2);
+  EXPECT_TRUE(r.stderr_text.find("no file name of '-' allowed") !=
+              std::string::npos);
+}
+
+TEST(sort, sort_check_rejects_extra_operands) {
+  TempDir tmp;
+  tmp.write("a.txt", "a\n");
+  tmp.write("b.txt", "b\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sort.exe", {L"-c", L"a.txt", L"b.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 2);
+  EXPECT_TRUE(r.stderr_text.find("extra operand 'b.txt' not allowed with -c") !=
+              std::string::npos);
+}
+
+TEST(sort, sort_check_rejects_output_file) {
+  TempDir tmp;
+  tmp.write("a.txt", "a\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"sort.exe", {L"-c", L"-o", L"out.txt", L"a.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 2);
+  EXPECT_TRUE(r.stderr_text.find("options '-co' are incompatible") !=
+              std::string::npos);
+}
+
+TEST(sort, sort_debug_rejects_check_and_output_file) {
+  TempDir tmp;
+  tmp.write("a.txt", "a\n");
+
+  Pipeline check_mode;
+  check_mode.set_cwd(tmp.wpath());
+  check_mode.add(L"sort.exe", {L"--debug", L"-c", L"a.txt"});
+  auto check_result = check_mode.run();
+
+  EXPECT_EQ(check_result.exit_code, 2);
+  EXPECT_TRUE(
+      check_result.stderr_text.find("options '-c --debug' are incompatible") !=
+      std::string::npos);
+
+  Pipeline output_mode;
+  output_mode.set_cwd(tmp.wpath());
+  output_mode.add(L"sort.exe", {L"--debug", L"-o", L"out.txt", L"a.txt"});
+  auto output_result = output_mode.run();
+
+  EXPECT_EQ(output_result.exit_code, 2);
+  EXPECT_TRUE(
+      output_result.stderr_text.find("options '-o --debug' are incompatible") !=
+      std::string::npos);
+}
+
+// [GNU] --check=quiet and --check=silent behave like -C: disorder is
+// detected with exit status 1 but no diagnostic reaches stderr (#1034).
+TEST(sort, sort_check_quiet_silent_arguments_suppress_disorder) {
+  TempDir tmp;
+  tmp.write("bad.txt", "b\na\n");
+  tmp.write("good.txt", "a\nb\n");
+
+  for (const wchar_t* opt : {L"--check=quiet", L"--check=silent"}) {
+    Pipeline p;
+    p.set_cwd(tmp.wpath());
+    p.add(L"sort.exe", {opt, L"bad.txt"});
+    auto r = p.run();
+
+    EXPECT_EQ(r.exit_code, 1);
+    EXPECT_EQ_TEXT(r.stdout_text, "");
+    EXPECT_EQ_TEXT(r.stderr_text, "");
+  }
+
+  Pipeline sorted;
+  sorted.set_cwd(tmp.wpath());
+  sorted.add(L"sort.exe", {L"--check=quiet", L"good.txt"});
+  auto sorted_result = sorted.run();
+
+  EXPECT_EQ(sorted_result.exit_code, 0);
+  EXPECT_EQ_TEXT(sorted_result.stdout_text, "");
+  EXPECT_EQ_TEXT(sorted_result.stderr_text, "");
+}
+
+// [GNU] sort.c argmatch: --check accepts unique prefixes of
+// {quiet, silent, diagnose-first}; an invalid or ambiguous value reports
+// the valid-arguments list and exits 1 (#1035).
+TEST(sort, sort_check_argument_matching_follows_argmatch_rules) {
+  TempDir tmp;
+  tmp.write("bad.txt", "b\na\n");
+
+  Pipeline prefix;
+  prefix.set_cwd(tmp.wpath());
+  prefix.add(L"sort.exe", {L"--check=q", L"bad.txt"});
+  auto prefix_result = prefix.run();
+  EXPECT_EQ(prefix_result.exit_code, 1);
+  EXPECT_EQ_TEXT(prefix_result.stderr_text, "");
+
+  Pipeline invalid;
+  invalid.set_cwd(tmp.wpath());
+  invalid.add(L"sort.exe", {L"--check=foo", L"bad.txt"});
+  auto invalid_result = invalid.run();
+  EXPECT_EQ(invalid_result.exit_code, 1);
+  EXPECT_TRUE(invalid_result.stderr_text.find(
+                  "invalid argument 'foo' for '--check'") != std::string::npos);
+  EXPECT_TRUE(invalid_result.stderr_text.find("Valid arguments are:") !=
+              std::string::npos);
+  EXPECT_TRUE(invalid_result.stderr_text.find("- 'quiet', 'silent'") !=
+              std::string::npos);
+
+  Pipeline ambiguous;
+  ambiguous.set_cwd(tmp.wpath());
+  ambiguous.add(L"sort.exe", {L"--check=", L"bad.txt"});
+  auto ambiguous_result = ambiguous.run();
+  EXPECT_EQ(ambiguous_result.exit_code, 1);
+  EXPECT_TRUE(ambiguous_result.stderr_text.find(
+                  "ambiguous argument '' for '--check'") != std::string::npos);
+}
+
+// [GNU] usage errors exit 2; the diagnose-first and quiet check modes are
+// incompatible even when spelled through --check=quiet (#1035).
+TEST(sort, sort_check_usage_error_statuses) {
+  TempDir tmp;
+  tmp.write("a.txt", "a\n");
+
+  Pipeline bad_option;
+  bad_option.add(L"sort.exe", {L"--bogus"});
+  auto bad_option_result = bad_option.run();
+  EXPECT_EQ(bad_option_result.exit_code, 2);
+  EXPECT_TRUE(bad_option_result.stderr_text.find("unrecognized option") !=
+              std::string::npos);
+
+  Pipeline mixed;
+  mixed.set_cwd(tmp.wpath());
+  mixed.add(L"sort.exe", {L"-c", L"--check=quiet", L"a.txt"});
+  auto mixed_result = mixed.run();
+  EXPECT_EQ(mixed_result.exit_code, 2);
+  EXPECT_TRUE(mixed_result.stderr_text.find("options '-cC' are incompatible") !=
+              std::string::npos);
+
+  Pipeline quiet_output;
+  quiet_output.set_cwd(tmp.wpath());
+  quiet_output.add(L"sort.exe", {L"-C", L"-o", L"out.txt", L"a.txt"});
+  auto quiet_output_result = quiet_output.run();
+  EXPECT_EQ(quiet_output_result.exit_code, 2);
+  EXPECT_TRUE(quiet_output_result.stderr_text.find(
+                  "options '-Co' are incompatible") != std::string::npos);
 }

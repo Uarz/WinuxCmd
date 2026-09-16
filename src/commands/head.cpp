@@ -33,6 +33,7 @@ import core;
 import utils;
 import container;
 
+using cmd::meta::option_matches;
 using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
@@ -63,20 +64,26 @@ using cmd::meta::OptionType;
  * [IMPLEMENTED]
  */
 auto constexpr HEAD_OPTIONS = std::array{
+    // [GNU]
     OPTION("-c", "--bytes",
            "print the first NUM bytes of each file; with the leading '-',\n"
            "print all but the last NUM bytes",
            STRING_TYPE),
+    // [GNU]
     OPTION("-n", "--lines",
            "print the first NUM lines instead of the first 10; with the\n"
            "leading '-', print all but the last NUM lines",
            STRING_TYPE),
+    // [GNU]
     OPTION("-q", "--quiet",
            "never print headers giving file names for multiple files"),
+    // [GNU]
     OPTION("", "--silent",
            "never print headers giving file names for multiple files"),
+    // [GNU]
     OPTION("-v", "--verbose",
            "always print headers giving file names for multiple files"),
+    // [GNU]
     OPTION("-z", "--zero-terminated", "line delimiter is NUL, not newline")};
 
 namespace head_pipeline {
@@ -85,6 +92,7 @@ namespace cp = core::pipeline;
 struct CountSpec {
   std::uintmax_t value = 10;
   bool all_but_last = false;
+  bool plus_form = false;
 };
 
 struct HeadConfig {
@@ -94,12 +102,6 @@ struct HeadConfig {
   bool verbose = false;
   char delimiter = '\n';
 };
-
-auto option_matches(const OptionMeta& meta, std::string_view short_name,
-                    std::string_view long_name) -> bool {
-  return (!short_name.empty() && meta.short_name == short_name) ||
-         (!long_name.empty() && meta.long_name == long_name);
-}
 
 auto parse_uint(std::string_view text) -> std::optional<std::uintmax_t> {
   if (text.empty()) return std::nullopt;
@@ -182,8 +184,15 @@ auto parse_numeric_with_suffix(std::string_view text)
 
 auto parse_count_spec(std::string spec_text, std::string_view opt_name)
     -> cp::Result<CountSpec> {
+  // [GNU] invalid-number diagnostics quote the offending operand:
+  //   head: invalid number of lines: 'bogus'
+  const std::string original = spec_text;
+  auto invalid = [&]() {
+    return std::unexpected("invalid number of " + std::string(opt_name) +
+                           ": '" + original + "'");
+  };
   if (spec_text.empty()) {
-    return std::unexpected("invalid number of " + std::string(opt_name));
+    return invalid();
   }
 
   CountSpec spec;
@@ -191,13 +200,19 @@ auto parse_count_spec(std::string spec_text, std::string_view opt_name)
     spec.all_but_last = true;
     spec_text = spec_text.substr(1);  // Avoid modifying original string
     if (spec_text.empty()) {
-      return std::unexpected("invalid number of " + std::string(opt_name));
+      return invalid();
+    }
+  } else if (spec_text[0] == '+') {
+    spec.plus_form = true;
+    spec_text = spec_text.substr(1);
+    if (spec_text.empty()) {
+      return invalid();
     }
   }
 
   auto parsed = parse_numeric_with_suffix(spec_text);
   if (!parsed.has_value()) {
-    return std::unexpected("invalid number of " + std::string(opt_name));
+    return invalid();
   }
   spec.value = *parsed;
   return spec;
@@ -213,7 +228,175 @@ auto stream_all(std::istream& in) -> void {
   }
 }
 
+auto stream_needs_text_decoding(std::istream& in) -> bool {
+  auto original = in.tellg();
+  if (original == std::streampos(-1)) return true;
+
+  std::array<char, 4096> sample{};
+  in.read(sample.data(), static_cast<std::streamsize>(sample.size()));
+  auto got = static_cast<size_t>(std::max<std::streamsize>(in.gcount(), 0));
+  in.clear();
+  in.seekg(original);
+
+  if (got >= 3 && static_cast<std::uint8_t>(sample[0]) == 0xEF &&
+      static_cast<std::uint8_t>(sample[1]) == 0xBB &&
+      static_cast<std::uint8_t>(sample[2]) == 0xBF) {
+    return true;
+  }
+  if (got >= 2 && ((static_cast<std::uint8_t>(sample[0]) == 0xFF &&
+                    static_cast<std::uint8_t>(sample[1]) == 0xFE) ||
+                   (static_cast<std::uint8_t>(sample[0]) == 0xFE &&
+                    static_cast<std::uint8_t>(sample[1]) == 0xFF))) {
+    return true;
+  }
+
+  return std::find(sample.begin(), sample.begin() + got, '\0') !=
+         sample.begin() + got;
+}
+
+auto streampos_to_size(std::streampos pos) -> std::uintmax_t {
+  if (pos == std::streampos(-1)) return 0;
+  auto offset = static_cast<std::streamoff>(pos);
+  if (offset <= 0) return 0;
+  return static_cast<std::uintmax_t>(offset);
+}
+
+auto seek_to_end(std::ifstream& input) -> std::optional<std::uintmax_t> {
+  input.clear();
+  input.seekg(0, std::ios::end);
+  auto end = input.tellg();
+  if (end == std::streampos(-1) || input.bad()) return std::nullopt;
+  return streampos_to_size(end);
+}
+
+auto output_file_range(std::ifstream& input, std::uintmax_t start,
+                       std::optional<std::uintmax_t> byte_count = std::nullopt)
+    -> bool {
+  input.clear();
+  input.seekg(static_cast<std::streamoff>(start), std::ios::beg);
+  if (input.bad()) return false;
+
+  std::array<char, 64 * 1024> buffer{};
+  std::uintmax_t remaining =
+      byte_count.value_or(std::numeric_limits<std::uintmax_t>::max());
+  while (remaining > 0 && input.good()) {
+    const auto want = static_cast<std::streamsize>(std::min<std::uintmax_t>(
+        remaining, static_cast<std::uintmax_t>(buffer.size())));
+    input.read(buffer.data(), want);
+    auto got =
+        static_cast<size_t>(std::max<std::streamsize>(input.gcount(), 0));
+    if (got == 0) break;
+    safePrint(std::string_view(buffer.data(), got));
+    if (byte_count.has_value()) remaining -= got;
+  }
+  return !input.bad();
+}
+
+auto reset_to_beginning(std::ifstream& input) -> void {
+  input.clear();
+  input.seekg(0, std::ios::beg);
+}
+
+auto output_head_seekable_bytes(std::ifstream& input, const HeadConfig& config)
+    -> bool {
+  if (!config.by_bytes || !config.spec.all_but_last) return false;
+  auto end = seek_to_end(input);
+  if (!end) return false;
+
+  const std::uintmax_t elide = config.spec.value;
+  if (elide == 0) return output_file_range(input, 0);
+  if (elide >= *end) return true;
+  return output_file_range(input, 0, *end - elide);
+}
+
+auto output_head_seekable_lines(std::ifstream& input, const HeadConfig& config)
+    -> bool {
+  if (config.by_bytes || !config.spec.all_but_last) return false;
+  std::uintmax_t lines = config.spec.value;
+  if (lines == 0) return output_file_range(input, 0);
+
+  auto end = seek_to_end(input);
+  if (!end) return false;
+  if (*end == 0) return true;
+
+  constexpr std::uintmax_t kChunkSize = 64 * 1024;
+  std::vector<char> buffer(static_cast<size_t>(kChunkSize));
+  std::uintmax_t pos = *end;
+  bool checked_last_byte = false;
+
+  while (pos > 0) {
+    const std::uintmax_t chunk_start = pos > kChunkSize ? pos - kChunkSize : 0;
+    const auto chunk_size = static_cast<size_t>(pos - chunk_start);
+    input.clear();
+    input.seekg(static_cast<std::streamoff>(chunk_start), std::ios::beg);
+    input.read(buffer.data(), static_cast<std::streamsize>(chunk_size));
+    auto got =
+        static_cast<size_t>(std::max<std::streamsize>(input.gcount(), 0));
+    if (got == 0 || input.bad()) return false;
+
+    if (!checked_last_byte) {
+      checked_last_byte = true;
+      if (buffer[got - 1] != config.delimiter && lines > 0) --lines;
+    }
+
+    for (size_t i = got; i > 0; --i) {
+      if (buffer[i - 1] != config.delimiter) continue;
+      if (lines == 0) {
+        return output_file_range(input, 0, chunk_start + i);
+      }
+      --lines;
+    }
+    pos = chunk_start;
+  }
+
+  return true;
+}
+
+auto output_first_records(std::istream& in, size_t records, char delimiter)
+    -> void {
+  if (records == 0) return;
+
+  std::array<char, 64 * 1024> buffer{};
+  while (records > 0 && in.good()) {
+    in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    auto got = static_cast<size_t>(std::max<std::streamsize>(in.gcount(), 0));
+    if (got == 0) break;
+
+    size_t bytes_to_write = got;
+    for (size_t i = 0; i < got; ++i) {
+      if (buffer[i] == delimiter && --records == 0) {
+        bytes_to_write = i + 1;
+        break;
+      }
+    }
+    safePrint(std::string_view(buffer.data(), bytes_to_write));
+  }
+}
+
+auto stream_bytes(std::istream& in, size_t bytes) -> void {
+  std::array<char, 64 * 1024> buffer{};
+  while (bytes > 0 && in.good()) {
+    const auto want = std::min(bytes, buffer.size());
+    in.read(buffer.data(), static_cast<std::streamsize>(want));
+    const auto got =
+        static_cast<size_t>(std::max<std::streamsize>(in.gcount(), 0));
+    if (got == 0) break;
+    safePrint(std::string_view(buffer.data(), got));
+    bytes -= got;
+  }
+}
+
 auto output_head(std::istream& in, const HeadConfig& config) -> void {
+  if (config.spec.plus_form) {
+    if (config.by_bytes) {
+      stream_bytes(in, static_cast<size_t>(config.spec.value));
+    } else {
+      output_first_records(in, static_cast<size_t>(config.spec.value),
+                           config.delimiter);
+    }
+    return;
+  }
+
   if (config.by_bytes) {
     size_t n = static_cast<size_t>(config.spec.value);
     if (config.spec.all_but_last) {
@@ -286,14 +469,32 @@ auto output_head(std::istream& in, const HeadConfig& config) -> void {
   }
 
   if (n == 0) return;
-  char ch = '\0';
-  while (in.get(ch)) {
-    safePrint(ch);
-    if (ch == config.delimiter) {
-      --n;
-      if (n == 0) break;
-    }
+  output_first_records(in, n, config.delimiter);
+}
+
+auto open_input_file(const std::string& file) -> std::ifstream {
+  return file_io::open_binary_file(file);
+}
+
+auto describe_open_failure(const std::string& file) -> std::string {
+  std::wstring wfile = utf8_to_wstring(file);
+  DWORD attrs = native_path::attributes_w(utf8_to_wstring(file));
+  if (attrs == INVALID_FILE_ATTRIBUTES) {
+    return "No such file or directory";
   }
+  if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+    return "Is a directory";
+  }
+  return "Permission denied";
+}
+
+auto is_directory_open_failure(std::string_view reason) -> bool {
+  return reason == "Is a directory";
+}
+
+auto output_text_head(std::istream& in, const HeadConfig& config) -> void {
+  std::istringstream decoded(read_text_stream(in));
+  output_head(decoded, config);
 }
 
 template <size_t N>
@@ -389,31 +590,77 @@ REGISTER_COMMAND(
     const auto& file = files[i];
 
     bool show_header = config.verbose || (multi && !config.quiet);
-    if (show_header) {
+    auto emit_header = [&]() {
+      if (!show_header) return;
       if (!first_print) safePrint(std::string(1, config.delimiter));
       safePrint("==> ");
       safePrint(file == "-" ? "standard input" : file);
       safePrint(" <==");
       safePrint(std::string(1, config.delimiter));
-    }
+      first_print = false;
+    };
 
     if (file == "-") {
+      emit_header();
+      // [GNU] A closed standard input (<&-) is a read error, not EOF (#973).
+      if (file_io::stdin_is_bad()) {
+        safeErrorPrint(
+            "head: error reading 'standard input': Bad file descriptor\n");
+        any_error = true;
+        continue;
+      }
+      // stdin may be a live pipe.  Do not decode the whole stream before
+      // applying the head limit: an unbounded producer such as `yes` must be
+      // able to stop once the requested records have been emitted.
       output_head(std::cin, config);
       if (std::cin.bad()) {
         safeErrorPrint("head: error reading '-'\n");
         any_error = true;
       }
     } else {
-      std::ifstream input(file, std::ios::binary);
+      std::ifstream input = open_input_file(file);
       if (!input.is_open()) {
-        safeErrorPrint("head: cannot open '");
-        safeErrorPrint(file);
-        safeErrorPrint("'\n");
+        std::string reason = describe_open_failure(file);
+        if (is_directory_open_failure(reason)) {
+          safeErrorPrint("head: error reading '");
+          safeErrorPrint(file);
+          safeErrorPrint("': ");
+          safeErrorPrint(reason);
+          safeErrorPrint("\n");
+        } else {
+          safeErrorPrint("head: cannot open '");
+          safeErrorPrint(file);
+          safeErrorPrint("' for reading: ");
+          safeErrorPrint(reason);
+          safeErrorPrint("\n");
+        }
         any_error = true;
         continue;
       }
 
-      output_head(input, config);
+      emit_header();
+      bool handled = false;
+      if (config.by_bytes) {
+        if (config.spec.all_but_last) {
+          handled = output_head_seekable_bytes(input, config);
+          if (!handled) reset_to_beginning(input);
+        }
+        if (!handled) output_head(input, config);
+      } else if (config.delimiter == '\0') {
+        if (config.spec.all_but_last) {
+          handled = output_head_seekable_lines(input, config);
+          if (!handled) reset_to_beginning(input);
+        }
+        if (!handled) output_head(input, config);
+      } else if (!stream_needs_text_decoding(input)) {
+        if (config.spec.all_but_last) {
+          handled = output_head_seekable_lines(input, config);
+          if (!handled) reset_to_beginning(input);
+        }
+        if (!handled) output_head(input, config);
+      } else {
+        output_text_head(input, config);
+      }
       if (input.bad()) {
         safeErrorPrint("head: error reading '");
         safeErrorPrint(file);
@@ -421,8 +668,6 @@ REGISTER_COMMAND(
         any_error = true;
       }
     }
-
-    first_print = false;
   }
 
   return any_error ? 1 : 0;

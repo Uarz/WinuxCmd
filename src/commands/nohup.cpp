@@ -47,9 +47,15 @@ using cmd::meta::OptionType;
 // ======================================================
 
 auto constexpr NOHUP_OPTIONS =
+    // [GNU]
     std::array{OPTION("", "", "command to run", STRING_TYPE)};
 
 namespace {
+auto nohup_usage_error_exit_code() -> int {
+  const char* value = std::getenv("POSIXLY_CORRECT");
+  return value != nullptr && value[0] != '\0' ? 127 : 125;
+}
+
 auto nohup_command_status_from_create_error(DWORD error) -> int {
   switch (error) {
     case ERROR_FILE_NOT_FOUND:
@@ -58,6 +64,10 @@ auto nohup_command_status_from_create_error(DWORD error) -> int {
     default:
       return 126;
   }
+}
+
+auto nohup_windows_error_text(DWORD error) -> std::string {
+  return win32_posix_error_text(error);
 }
 
 auto nohup_is_terminal(FILE* stream) -> bool {
@@ -70,6 +80,11 @@ auto open_inheritable_file(const wchar_t* path, DWORD access, DWORD creation)
   SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
   return CreateFileW(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
                      creation, FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+
+auto build_nohup_command_line(std::span<const std::string_view> args)
+    -> std::wstring {
+  return build_windows_command_line(args);
 }
 }  // namespace
 
@@ -97,15 +112,8 @@ REGISTER_COMMAND(
     /* options */ NOHUP_OPTIONS) {
   if (ctx.positionals.empty()) {
     safeErrorPrintLn("nohup: missing operand");
-    safePrintLn("Try 'nohup --help' for more information.");
-    return 125;
-  }
-
-  // Build command string
-  std::string cmd;
-  for (size_t i = 0; i < ctx.positionals.size(); ++i) {
-    if (i > 0) cmd += " ";
-    cmd += ctx.positionals[i];
+    safeErrorPrintLn("Try 'nohup --help' for more information.");
+    return nohup_usage_error_exit_code();
   }
 
   // Prepare process startup info
@@ -151,18 +159,19 @@ REGISTER_COMMAND(
     }
   }
 
-  std::wstring wcmd = utf8_to_wstring(cmd);
+  auto cmd_line = build_nohup_command_line(ctx.positionals);
 
   DWORD creation_flags = CREATE_NEW_PROCESS_GROUP;
 
-  if (!CreateProcessW(nullptr, const_cast<wchar_t*>(wcmd.c_str()), nullptr,
-                      nullptr, TRUE, creation_flags, nullptr, nullptr, &si,
-                      &pi)) {
+  if (!CreateProcessW(nullptr, cmd_line.data(), nullptr, nullptr, TRUE,
+                      creation_flags, nullptr, nullptr, &si, &pi)) {
     DWORD error = GetLastError();
     for (HANDLE handle : owned_handles) {
       CloseHandle(handle);
     }
-    safeErrorPrintLn("nohup: failed to execute command");
+    safeErrorPrintLn("nohup: failed to run command '" +
+                     std::string(ctx.positionals[0]) +
+                     "': " + nohup_windows_error_text(error));
     return nohup_command_status_from_create_error(error);
   }
 

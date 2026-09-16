@@ -41,13 +41,16 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr BASE32_OPTIONS = std::array{
+    // [GNU]
     OPTION("-d", "--decode", "decode data", BOOL_TYPE),
+    // [GNU]
     OPTION("-i", "--ignore-garbage",
            "when decoding, ignore non-alphabet characters", BOOL_TYPE),
+    // [GNU]
     OPTION("-w", "--wrap",
            "wrap encoded lines after COLS character (default 76). Use 0 to "
            "disable line wrapping",
-           INT_TYPE)};
+           STRING_TYPE)};
 
 namespace base32_pipeline {
 
@@ -62,142 +65,36 @@ struct Config {
 
 auto read_input(std::string_view filename)
     -> std::expected<std::string, std::string> {
-  std::string content;
-
-  if (filename == "-") {
-    content.assign(std::istreambuf_iterator<char>(std::cin),
-                   std::istreambuf_iterator<char>());
-    if (std::cin.fail() && !std::cin.eof()) {
-      return std::unexpected("error reading from standard input");
-    }
-    return content;
-  }
-
-  std::ifstream file(std::string(filename), std::ios::binary);
-  if (!file) {
-    return std::unexpected("cannot open '" + std::string(filename) +
-                           "' for reading");
-  }
-
-  content.assign(std::istreambuf_iterator<char>(file),
-                 std::istreambuf_iterator<char>());
-  if (file.fail() && !file.eof()) {
-    return std::unexpected("error reading '" + std::string(filename) + "'");
-  }
-
-  return content;
+  return file_io::read_all_input(filename);
 }
 
-auto encode_base32(std::string_view input, int wrap) -> std::string {
-  std::string result;
-  result.reserve(((input.size() + 4) / 5) * 8);
-
-  for (size_t i = 0; i < input.size(); i += 5) {
-    uint8_t block[5] = {0};
-    const size_t block_size = std::min<size_t>(5, input.size() - i);
-    for (size_t j = 0; j < block_size; ++j) {
-      block[j] = static_cast<uint8_t>(input[i + j]);
-    }
-
-    result.push_back(BASE32_ALPHABET[(block[0] >> 3) & 0x1f]);
-    result.push_back(
-        BASE32_ALPHABET[((block[0] & 0x07) << 2) | (block[1] >> 6)]);
-    result.push_back(block_size > 1 ? BASE32_ALPHABET[(block[1] >> 1) & 0x1f]
-                                    : '=');
-    result.push_back(
-        block_size > 1
-            ? BASE32_ALPHABET[((block[1] & 0x01) << 4) | (block[2] >> 4)]
-            : '=');
-    result.push_back(
-        block_size > 2
-            ? BASE32_ALPHABET[((block[2] & 0x0f) << 1) | (block[3] >> 7)]
-            : '=');
-    result.push_back(block_size > 3 ? BASE32_ALPHABET[(block[3] >> 2) & 0x1f]
-                                    : '=');
-    result.push_back(
-        block_size > 3
-            ? BASE32_ALPHABET[((block[3] & 0x03) << 3) | (block[4] >> 5)]
-            : '=');
-    result.push_back(block_size > 4 ? BASE32_ALPHABET[block[4] & 0x1f] : '=');
-  }
-
-  if (wrap <= 0 || result.empty()) return result;
-
-  std::string wrapped;
-  for (size_t i = 0; i < result.size(); i += static_cast<size_t>(wrap)) {
-    if (!wrapped.empty()) wrapped.push_back('\n');
-    wrapped.append(result.substr(i, static_cast<size_t>(wrap)));
-  }
-  return wrapped;
-}
-
+// GNU decodes quantum units of 8 characters (uppercase alphabet only — no
+// case folding), keeps every byte decoded before the first error, and fails
+// a trailing partial unit (uutils #6008, #12204).
 auto decode_base32(std::string_view input, bool ignore_garbage)
-    -> std::expected<std::string, std::string> {
-  std::string clean;
-  clean.reserve(input.size());
-  bool saw_padding = false;
-  int padding = 0;
+    -> encoding::GnuDecodeResult {
+  return encoding::base32_decode_gnu(input, BASE32_ALPHABET, ignore_garbage);
+}
 
-  for (unsigned char c : input) {
-    if (c == '\n' || c == '\r') continue;
-
-    char upper = static_cast<char>(std::toupper(c));
-    if (BASE32_ALPHABET.find(upper) != std::string_view::npos) {
-      if (saw_padding) return std::unexpected("invalid input");
-      clean.push_back(upper);
-      continue;
-    }
-
-    if (c == '=') {
-      saw_padding = true;
-      ++padding;
-      if (padding > 6) return std::unexpected("invalid input");
-      clean.push_back('=');
-      continue;
-    }
-
-    if (!ignore_garbage) return std::unexpected("invalid input");
-  }
-
-  const size_t data_chars = clean.find('=');
-  const size_t encoded_chars =
-      data_chars == std::string::npos ? clean.size() : data_chars;
-  const size_t encoded_mod = encoded_chars % 8;
-
-  if (encoded_mod == 1 || encoded_mod == 3 || encoded_mod == 6) {
-    return std::unexpected("invalid input");
-  }
-  if (padding > 0 && clean.size() % 8 != 0) {
-    return std::unexpected("invalid input");
-  }
-  if ((padding == 1 && encoded_mod != 7) ||
-      (padding == 3 && encoded_mod != 5) ||
-      (padding == 4 && encoded_mod != 4) ||
-      (padding == 6 && encoded_mod != 2) || (padding == 2 || padding == 5)) {
-    return std::unexpected("invalid input");
-  }
-
-  std::string output;
-  output.reserve((encoded_chars * 5) / 8);
-  uint32_t accumulator = 0;
-  int bits = 0;
-
-  for (char c : clean.substr(0, encoded_chars)) {
-    const auto value = static_cast<uint32_t>(BASE32_ALPHABET.find(c));
-    accumulator = (accumulator << 5) | value;
-    bits += 5;
-
-    if (bits >= 8) {
-      bits -= 8;
-      output.push_back(static_cast<char>((accumulator >> bits) & 0xff));
+// [GNU] the wrap size is validated by xstrtol: any non-numeric token or a
+// negative value dies with "invalid wrap size: '<raw>'" (uutils #14084).
+auto parse_wrap_size(const std::string& raw)
+    -> std::expected<int, std::string> {
+  size_t digit_start = 0;
+  if (!raw.empty() && (raw[0] == '+' || raw[0] == '-')) digit_start = 1;
+  const bool numeric =
+      digit_start < raw.size() &&
+      std::ranges::all_of(
+          raw.substr(digit_start),
+          [](unsigned char ch) { return std::isdigit(ch) != 0; });
+  if (numeric) {
+    errno = 0;
+    const long long value = std::strtoll(raw.c_str(), nullptr, 10);
+    if (errno == 0 && value >= 0 && value <= 2147483647LL) {
+      return static_cast<int>(value);
     }
   }
-
-  if (bits > 0 && (accumulator & ((uint32_t{1} << bits) - 1)) != 0) {
-    return std::unexpected("invalid input");
-  }
-
-  return output;
+  return std::unexpected("invalid wrap size: '" + raw + "'");
 }
 
 auto build_config(const CommandContext<BASE32_OPTIONS.size()>& ctx)
@@ -206,14 +103,22 @@ auto build_config(const CommandContext<BASE32_OPTIONS.size()>& ctx)
   cfg.decode = ctx.get<bool>("--decode", false) || ctx.get<bool>("-d", false);
   cfg.ignore_garbage =
       ctx.get<bool>("--ignore-garbage", false) || ctx.get<bool>("-i", false);
-  cfg.wrap = ctx.get<int>("--wrap", 76);
+  auto wrap = parse_wrap_size(ctx.get<std::string>("--wrap", "76"));
+  if (!wrap) return std::unexpected(wrap.error());
+  cfg.wrap = *wrap;
 
-  if (cfg.wrap < 0) return std::unexpected("invalid wrap size");
-  if (ctx.positionals.size() > 1) {
-    return std::unexpected("extra operand '" + std::string(ctx.positionals[1]) +
-                           "'");
+  SmallVector<std::string, 16> files;
+  for (auto arg : ctx.positionals) {
+    std::string file_arg(arg);
+    for (const auto& file : expand_file_operand(file_arg)) {
+      files.push_back(file);
+    }
   }
-  if (!ctx.positionals.empty()) cfg.file = std::string(ctx.positionals[0]);
+
+  if (files.size() > 1) {
+    return std::unexpected("extra operand '" + files[1] + "'");
+  }
+  if (!files.empty()) cfg.file = files[0];
 
   return cfg;
 }
@@ -227,16 +132,19 @@ auto run(const Config& cfg) -> int {
 
   if (cfg.decode) {
     auto decoded = decode_base32(*content_result, cfg.ignore_garbage);
-    if (!decoded) {
-      safeErrorPrintLn("base32: " + decoded.error());
+    if (!decoded.output.empty()) safePrint(decoded.output);
+    if (!decoded.ok) {
+      safeErrorPrintLn("base32: invalid input");
       return 1;
     }
-    safePrint(*decoded);
     return 0;
   }
 
-  std::string output = encode_base32(*content_result, cfg.wrap);
-  if (!output.empty()) output.push_back('\n');
+  auto data = std::span<const uint8_t>(
+      reinterpret_cast<const uint8_t*>(content_result->data()),
+      content_result->size());
+  std::string output = encoding::base32_encode(data, cfg.wrap);
+  if (!output.empty() && cfg.wrap > 0) output.push_back('\n');
   safePrint(output);
   return 0;
 }
@@ -259,7 +167,11 @@ REGISTER_COMMAND(
 
   auto cfg_result = build_config(ctx);
   if (!cfg_result) {
-    safeErrorPrintLn("base32: " + cfg_result.error());
+    safeErrorPrintLn("base32: " +
+                     winux::i18n::translate_error(cfg_result.error()));
+    if (cfg_result.error().starts_with("extra operand '")) {
+      safeErrorPrintLn("Try 'base32 --help' for more information.");
+    }
     return 1;
   }
 

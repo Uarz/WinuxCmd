@@ -45,10 +45,13 @@ using cmd::meta::OptionType;
 // ======================================================
 
 auto constexpr STDBUF_OPTIONS =
+    // [GNU] -i, --input
     std::array{OPTION("-i", "--input", "adjust standard input stream buffering",
                       STRING_TYPE),
+               // [GNU] -o, --output
                OPTION("-o", "--output",
                       "adjust standard output stream buffering", STRING_TYPE),
+               // [GNU] -e, --error
                OPTION("-e", "--error", "adjust standard error stream buffering",
                       STRING_TYPE)};
 
@@ -57,6 +60,8 @@ auto constexpr STDBUF_OPTIONS =
 // ======================================================
 
 namespace {
+constexpr int kStdbufUsageErrorExitCode = 125;
+
 struct BufferSizeSuffix {
   std::string_view suffix;
   std::size_t base;
@@ -138,7 +143,7 @@ auto validate_buffer_mode(std::string_view stream_name, const std::string& mode)
     -> bool {
   if (mode.empty()) return true;
   if (mode == "0") return true;
-  if (mode == "L") return stream_name != "standard input";
+  if (mode == "L") return true;
   auto size = parse_buffer_size(mode);
   return size.has_value() && *size > 0;
 }
@@ -153,7 +158,9 @@ auto set_stream_buffering(FILE* stream, const std::string& mode) -> bool {
     return true;
   }
   if (mode == "L") {
-    setvbuf(stream, nullptr, _IOLBF, 0);  // Line buffered
+    // MSVC's CRT does not implement POSIX line buffering reliably for these
+    // streams and may abort through the invalid-parameter handler. Keep L as
+    // an accepted child-inheritance marker and leave the parent stream alone.
     return true;
   }
 
@@ -174,6 +181,30 @@ auto stdbuf_command_status_from_create_error(DWORD error) -> int {
     default:
       return 126;
   }
+}
+
+auto stdbuf_windows_error_text(DWORD error) -> std::string {
+  return win32_posix_error_text(error);
+}
+
+auto build_stdbuf_command_line(std::span<const std::string_view> args)
+    -> std::wstring {
+  return build_windows_command_line(args);
+}
+
+auto set_child_buffer_mode(const char* name, const std::string& mode)
+    -> std::optional<std::string> {
+  const char* old = std::getenv(name);
+  std::optional<std::string> previous;
+  if (old != nullptr) previous = old;
+  _putenv_s(name, mode.c_str());
+  return previous;
+}
+
+auto restore_child_buffer_mode(const char* name,
+                               const std::optional<std::string>& previous)
+    -> void {
+  _putenv_s(name, previous.has_value() ? previous->c_str() : "");
 }
 }  // namespace
 
@@ -196,64 +227,106 @@ REGISTER_COMMAND(
     /* author */ "WinuxCmd",
     /* copyright */ "Copyright © 2026 WinuxCmd",
     /* options */ STDBUF_OPTIONS) {
-  if (ctx.positionals.empty()) {
-    safeErrorPrintLn("stdbuf: missing command");
-    safePrintLn("Try 'stdbuf --help' for more information.");
-    return 1;
-  }
-
+  const bool input_given = ctx.has("-i") || ctx.has("--input");
+  const bool output_given = ctx.has("-o") || ctx.has("--output");
+  const bool error_given = ctx.has("-e") || ctx.has("--error");
   std::string input_mode = ctx.get<std::string>("-i", "");
+  if (input_mode.empty()) input_mode = ctx.get<std::string>("--input", "");
   std::string output_mode = ctx.get<std::string>("-o", "");
+  if (output_mode.empty()) output_mode = ctx.get<std::string>("--output", "");
   std::string error_mode = ctx.get<std::string>("-e", "");
+  if (error_mode.empty()) error_mode = ctx.get<std::string>("--error", "");
 
-  if (!validate_buffer_mode("standard input", input_mode)) {
-    safeErrorPrintLn("stdbuf: invalid mode for standard input: " + input_mode);
-    return 1;
+  // [GNU] stdbuf.c: the buffering MODE operand is validated while parsing
+  // options, so an invalid mode is diagnosed even when COMMAND is missing.
+  // An explicitly empty MODE ("stdbuf -i ''") is invalid too.
+  auto invalid_mode = [](const std::string& mode) {
+    safeErrorPrintLn("stdbuf: " +
+                     winux::i18n::format("command.stdbuf.error.invalid_mode",
+                                         "invalid mode '{}'", mode));
+  };
+  if ((input_given && input_mode.empty()) ||
+      !validate_buffer_mode("standard input", input_mode)) {
+    invalid_mode(input_mode);
+    return kStdbufUsageErrorExitCode;
   }
-  if (!validate_buffer_mode("standard output", output_mode)) {
-    safeErrorPrintLn("stdbuf: invalid mode for standard output: " +
-                     output_mode);
-    return 1;
+  if ((output_given && output_mode.empty()) ||
+      !validate_buffer_mode("standard output", output_mode)) {
+    invalid_mode(output_mode);
+    return kStdbufUsageErrorExitCode;
   }
-  if (!validate_buffer_mode("standard error", error_mode)) {
-    safeErrorPrintLn("stdbuf: invalid mode for standard error: " + error_mode);
-    return 1;
+  if ((error_given && error_mode.empty()) ||
+      !validate_buffer_mode("standard error", error_mode)) {
+    invalid_mode(error_mode);
+    return kStdbufUsageErrorExitCode;
   }
 
-  // Build command string
-  std::string cmd;
-  for (size_t i = 0; i < ctx.positionals.size(); ++i) {
-    if (i > 0) cmd += " ";
-    cmd += ctx.positionals[i];
+  if (ctx.positionals.empty()) {
+    // [GNU] stdbuf.c: "missing operand" when COMMAND is absent.
+    safeErrorPrintLn("stdbuf: " +
+                     winux::i18n::translate("common.error.missing_operand",
+                                            "missing operand"));
+    safeErrorPrintLn(winux::i18n::format(
+        "common.try_help", "Try '{} --help' for more information.", "stdbuf"));
+    return kStdbufUsageErrorExitCode;
+  }
+
+  // [GNU] stdbuf.c refuses to run COMMAND when no -i/-o/-e buffering mode
+  // option was given at all (checked after the missing-command diagnostic).
+  if (!input_given && !output_given && !error_given) {
+    safeErrorPrintLn(
+        "stdbuf: " +
+        winux::i18n::format("command.stdbuf.error.mode_required",
+                            "you must specify a buffering mode option"));
+    safeErrorPrintLn(winux::i18n::format(
+        "common.try_help", "Try '{} --help' for more information.", "stdbuf"));
+    return kStdbufUsageErrorExitCode;
   }
 
   // For Windows, we'll just execute the command directly
   // and set the parent process buffering
-  if (!set_stream_buffering(stdin, input_mode)) {
+  if (input_mode != "L" && !set_stream_buffering(stdin, input_mode)) {
     safeErrorPrintLn("stdbuf: invalid mode for standard input: " + input_mode);
-    return 1;
+    return kStdbufUsageErrorExitCode;
   }
   if (!set_stream_buffering(stdout, output_mode)) {
     safeErrorPrintLn("stdbuf: invalid mode for standard output: " +
                      output_mode);
-    return 1;
+    return kStdbufUsageErrorExitCode;
   }
   if (!set_stream_buffering(stderr, error_mode)) {
     safeErrorPrintLn("stdbuf: invalid mode for standard error: " + error_mode);
-    return 1;
+    return kStdbufUsageErrorExitCode;
   }
+
+  // WinuxCmd children apply these inherited settings at their common entry
+  // point. Store resolved byte sizes so the child does not duplicate the
+  // suffix parser; line mode remains the explicit L marker.
+  auto resolve_mode = [](const std::string& mode) {
+    if (mode == "L" || mode == "0" || mode.empty()) return mode;
+    return std::to_string(*parse_buffer_size(mode));
+  };
+  auto old_i =
+      set_child_buffer_mode("WINUX_STDBUF_I", resolve_mode(input_mode));
+  auto old_o =
+      set_child_buffer_mode("WINUX_STDBUF_O", resolve_mode(output_mode));
+  auto old_e =
+      set_child_buffer_mode("WINUX_STDBUF_E", resolve_mode(error_mode));
 
   // Execute command
   STARTUPINFOW si = {sizeof(si)};
   PROCESS_INFORMATION pi;
+  auto cmd_line = build_stdbuf_command_line(ctx.positionals);
 
-  std::wstring wcmd = utf8_to_wstring(cmd);
-
-  if (!CreateProcessW(nullptr, const_cast<wchar_t*>(wcmd.c_str()), nullptr,
-                      nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
+  if (!CreateProcessW(nullptr, cmd_line.data(), nullptr, nullptr, TRUE, 0,
+                      nullptr, nullptr, &si, &pi)) {
+    restore_child_buffer_mode("WINUX_STDBUF_I", old_i);
+    restore_child_buffer_mode("WINUX_STDBUF_O", old_o);
+    restore_child_buffer_mode("WINUX_STDBUF_E", old_e);
     DWORD error = GetLastError();
-    safeErrorPrintLn("stdbuf: failed to execute command: " +
-                     std::string(ctx.positionals[0]));
+    safeErrorPrintLn("stdbuf: failed to run command '" +
+                     std::string(ctx.positionals[0]) +
+                     "': " + stdbuf_windows_error_text(error));
     return stdbuf_command_status_from_create_error(error);
   }
 
@@ -265,6 +338,10 @@ REGISTER_COMMAND(
 
   CloseHandle(pi.hProcess);
   CloseHandle(pi.hThread);
+
+  restore_child_buffer_mode("WINUX_STDBUF_I", old_i);
+  restore_child_buffer_mode("WINUX_STDBUF_O", old_o);
+  restore_child_buffer_mode("WINUX_STDBUF_E", old_e);
 
   return static_cast<int>(exit_code);
 }

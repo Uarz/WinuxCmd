@@ -38,6 +38,7 @@ import utils;
 
 import container;
 
+using cmd::meta::option_matches;
 using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
@@ -84,36 +85,54 @@ using cmd::meta::OptionType;
  * [IMPLEMENTED]
  */
 auto constexpr TAIL_OPTIONS = std::array{
+    // [GNU] -c, --bytes
     OPTION("-c", "--bytes",
            "output the last NUM bytes; or use -c +NUM to output\n"
            "starting with byte NUM of each file",
            STRING_TYPE),
+    // [GNU] --debug
     OPTION("", "--debug", "output extra follow diagnostics to stderr"),
+    // [GNU] -f
     OPTION("-f", "", "output appended data as the file grows"),
+    // [GNU] --follow
     OPTION("", "--follow",
            "output appended data as the file grows; with --follow=name,\n"
            "follow the file name rather than the descriptor",
            OPTIONAL_STRING_TYPE),
+    // [GNU] -F
     OPTION("-F", "", "same as --follow=name --retry"),
+    // [GNU] -n, --lines
     OPTION("-n", "--lines",
            "output the last NUM lines, instead of the last 10; or\n"
            "use -n +NUM to skip NUM-1 lines at the start",
            STRING_TYPE),
+    // [GNU] --max-unchanged-stats
     OPTION("", "--max-unchanged-stats",
            "with --follow=name, reopen a FILE which has not changed\n"
            "size after N iterations to see if it has been renamed\n"
            "[IMPLEMENTED]",
            INT_TYPE),
+    // [GNU] --pid
     OPTION("", "--pid",
            "with -f, terminate after process ID, PID dies [IMPLEMENTED]",
            INT_TYPE),
+    // [GNU] -q, --quiet
     OPTION("-q", "--quiet", "never output headers giving file names"),
+    // [GNU] --silent
     OPTION("", "--silent", "never output headers giving file names"),
+    // [GNU] --retry
     OPTION("", "--retry", "keep trying to open a file if it is inaccessible"),
+    // [GNU] --use-polling
+    // [DIFFERS] - not applicable; Windows uses ReadDirectoryChangesW
+    OPTION("", "--use-polling",
+           "disable native directory change watching and use polling instead"),
+    // [GNU] -s, --sleep-interval
     OPTION("-s", "--sleep-interval",
            "with -f, sleep for approximately N seconds between iterations",
            STRING_TYPE),
+    // [GNU] -v, --verbose
     OPTION("-v", "--verbose", "always output headers giving file names"),
+    // [GNU] -z, --zero-terminated
     OPTION("-z", "--zero-terminated", "line delimiter is NUL, not newline")};
 
 namespace tail_pipeline {
@@ -131,6 +150,7 @@ struct TailConfig {
   bool verbose = false;
   bool follow = false;
   bool follow_by_name = false;
+  bool explicit_retry = false;
   bool retry = false;
   bool debug = false;
   std::vector<DWORD> follow_pids;
@@ -139,12 +159,6 @@ struct TailConfig {
   std::chrono::milliseconds sleep_interval{1000};
   std::uintmax_t max_unchanged_stats = 5;
 };
-
-auto option_matches(const OptionMeta& meta, std::string_view short_name,
-                    std::string_view long_name) -> bool {
-  return (!short_name.empty() && meta.short_name == short_name) ||
-         (!long_name.empty() && meta.long_name == long_name);
-}
 
 auto stream_all(std::istream& in) -> void {
   std::array<char, 8192> buffer{};
@@ -208,27 +222,56 @@ auto apply_suffix_multiplier(std::uintmax_t value, std::string_view suffix)
   return std::nullopt;
 }
 
-auto parse_numeric_with_suffix(std::string_view text)
-    -> std::optional<std::uintmax_t> {
-  if (text.empty()) return std::nullopt;
+// Distinguishes malformed input from an overflowing value so the GNU
+// EOVERFLOW diagnostic can be reproduced.
+struct NumericParse {
+  std::uintmax_t value = 0;
+  bool ok = false;
+  bool overflow = false;
+};
+
+auto parse_numeric_with_suffix_status(std::string_view text) -> NumericParse {
+  if (text.empty()) return {};
 
   size_t i = 0;
   while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i]))) {
     ++i;
   }
-  if (i == 0) return std::nullopt;
+  if (i == 0) return {};
 
   std::uintmax_t base = 0;
   auto [ptr, ec] = std::from_chars(text.data(), text.data() + i, base);
-  if (ec != std::errc() || ptr != text.data() + i) return std::nullopt;
+  if (ec == std::errc::result_out_of_range) {
+    return {.value = 0, .ok = false, .overflow = true};
+  }
+  if (ec != std::errc() || ptr != text.data() + i) return {};
 
-  return apply_suffix_multiplier(base, text.substr(i));
+  auto scaled = apply_suffix_multiplier(base, text.substr(i));
+  if (!scaled.has_value()) {
+    return {.value = 0, .ok = false, .overflow = true};
+  }
+  return {.value = *scaled, .ok = true, .overflow = false};
 }
 
 auto parse_count_spec(std::string spec_text, std::string_view opt_name)
     -> cp::Result<CountSpec> {
+  // GNU strips a leading '-' before parsing but keeps '+' in the
+  // diagnostic string, and appends the EOVERFLOW message on overflow.
+  std::string_view quoted = spec_text;
+  if (!quoted.empty() && quoted[0] == '-') {
+    quoted.remove_prefix(1);
+  }
+  auto make_error = [&](const bool overflow) -> cp::Error {
+    auto message = "invalid number of " + std::string(opt_name) + ": '" +
+                   std::string(quoted) + "'";
+    if (overflow) {
+      message += ": Value too large for defined data type";
+    }
+    return cp::Error(std::move(message));
+  };
+
   if (spec_text.empty()) {
-    return std::unexpected("invalid number of " + std::string(opt_name));
+    return std::unexpected(make_error(false));
   }
 
   CountSpec spec;
@@ -240,15 +283,15 @@ auto parse_count_spec(std::string spec_text, std::string_view opt_name)
   }
 
   if (spec_text.empty()) {
-    return std::unexpected("invalid number of " + std::string(opt_name));
+    return std::unexpected(make_error(false));
   }
 
-  auto parsed = parse_numeric_with_suffix(spec_text);
-  if (!parsed.has_value()) {
-    return std::unexpected("invalid number of " + std::string(opt_name));
+  auto parsed = parse_numeric_with_suffix_status(spec_text);
+  if (!parsed.ok) {
+    return std::unexpected(make_error(parsed.overflow));
   }
 
-  spec.value = *parsed;
+  spec.value = parsed.value;
   return spec;
 }
 
@@ -301,9 +344,10 @@ auto same_identity(const FileIdentity& lhs, const FileIdentity& rhs) -> bool {
 }
 
 auto read_file_status(const std::string& file) -> std::optional<FileStatus> {
-  auto wfile = utf8_to_wstring(file);
+  // Extended API path: pseudo-devices and >MAX_PATH operands (#1061).
+  const auto operand = native_path::make_api_path_operand(file);
   HANDLE handle =
-      CreateFileW(wfile.c_str(), FILE_READ_ATTRIBUTES,
+      CreateFileW(operand.extended.c_str(), FILE_READ_ATTRIBUTES,
                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                   nullptr, OPEN_EXISTING, 0, nullptr);
   if (handle == INVALID_HANDLE_VALUE) return std::nullopt;
@@ -340,14 +384,146 @@ auto streampos_to_size(std::streampos pos) -> std::uintmax_t {
   return static_cast<std::uintmax_t>(offset);
 }
 
+auto stream_needs_text_decoding(std::istream& in) -> bool {
+  auto original = in.tellg();
+  if (original == std::streampos(-1)) return true;
+
+  std::array<char, 4096> sample{};
+  in.read(sample.data(), static_cast<std::streamsize>(sample.size()));
+  auto got = static_cast<size_t>(std::max<std::streamsize>(in.gcount(), 0));
+  in.clear();
+  in.seekg(original);
+
+  if (got >= 3 && static_cast<std::uint8_t>(sample[0]) == 0xEF &&
+      static_cast<std::uint8_t>(sample[1]) == 0xBB &&
+      static_cast<std::uint8_t>(sample[2]) == 0xBF) {
+    return true;
+  }
+  if (got >= 2 && ((static_cast<std::uint8_t>(sample[0]) == 0xFF &&
+                    static_cast<std::uint8_t>(sample[1]) == 0xFE) ||
+                   (static_cast<std::uint8_t>(sample[0]) == 0xFE &&
+                    static_cast<std::uint8_t>(sample[1]) == 0xFF))) {
+    return true;
+  }
+
+  return std::find(sample.begin(), sample.begin() + got, '\0') !=
+         sample.begin() + got;
+}
+
+auto seek_to_end(std::ifstream& input) -> std::optional<std::uintmax_t> {
+  input.clear();
+  input.seekg(0, std::ios::end);
+  auto end = input.tellg();
+  if (end == std::streampos(-1) || input.bad()) return std::nullopt;
+  return streampos_to_size(end);
+}
+
+auto output_file_range(std::ifstream& input, std::uintmax_t start,
+                       std::optional<std::uintmax_t> byte_count = std::nullopt)
+    -> bool {
+  input.clear();
+  input.seekg(static_cast<std::streamoff>(start), std::ios::beg);
+  if (input.bad()) return false;
+
+  std::array<char, 64 * 1024> buffer{};
+  std::uintmax_t remaining =
+      byte_count.value_or(std::numeric_limits<std::uintmax_t>::max());
+  while (remaining > 0 && input.good()) {
+    const auto want = static_cast<std::streamsize>(std::min<std::uintmax_t>(
+        remaining, static_cast<std::uintmax_t>(buffer.size())));
+    input.read(buffer.data(), want);
+    auto got =
+        static_cast<size_t>(std::max<std::streamsize>(input.gcount(), 0));
+    if (got == 0) break;
+    safePrint(std::string_view(buffer.data(), got));
+    if (byte_count.has_value()) remaining -= got;
+  }
+
+  return !input.bad();
+}
+
+auto output_tail_seekable_bytes(std::ifstream& input, const TailConfig& config)
+    -> bool {
+  if (!config.by_bytes) return false;
+  auto end = seek_to_end(input);
+  if (!end) return false;
+
+  const std::uintmax_t n = config.spec.value;
+  std::uintmax_t start = 0;
+  if (config.spec.from_start) {
+    start = n > 0 ? n - 1 : 0;
+    if (start >= *end) return true;
+  } else {
+    if (n == 0) return true;
+    start = n >= *end ? 0 : *end - n;
+  }
+
+  return output_file_range(input, start);
+}
+
+auto output_tail_seekable_lines(std::ifstream& input, const TailConfig& config)
+    -> bool {
+  if (config.by_bytes || config.spec.from_start) return false;
+  std::uintmax_t lines = config.spec.value;
+  if (lines == 0) return true;
+
+  auto end = seek_to_end(input);
+  if (!end) return false;
+  if (*end == 0) return true;
+
+  constexpr std::uintmax_t kChunkSize = 64 * 1024;
+  std::vector<char> buffer(static_cast<size_t>(kChunkSize));
+  std::uintmax_t pos = *end;
+  bool checked_last_byte = false;
+
+  while (pos > 0) {
+    const std::uintmax_t chunk_start = pos > kChunkSize ? pos - kChunkSize : 0;
+    const auto chunk_size = static_cast<size_t>(pos - chunk_start);
+    input.clear();
+    input.seekg(static_cast<std::streamoff>(chunk_start), std::ios::beg);
+    input.read(buffer.data(), static_cast<std::streamsize>(chunk_size));
+    auto got =
+        static_cast<size_t>(std::max<std::streamsize>(input.gcount(), 0));
+    if (got == 0 || input.bad()) return false;
+
+    if (!checked_last_byte) {
+      checked_last_byte = true;
+      if (buffer[got - 1] != config.delimiter && lines > 0) --lines;
+    }
+
+    for (size_t i = got; i > 0; --i) {
+      if (buffer[i - 1] != config.delimiter) continue;
+      if (lines == 0) {
+        return output_file_range(input, chunk_start + i);
+      }
+      --lines;
+    }
+
+    pos = chunk_start;
+  }
+
+  return output_file_range(input, 0);
+}
+
 auto output_new_data(std::ifstream& input, std::streampos& offset,
-                     std::string_view header = {}) -> bool {
+                     std::string_view header = {},
+                     std::string_view diag_name = {}) -> bool {
   input.clear();
   input.seekg(0, std::ios::end);
   auto end = input.tellg();
   if (end == std::streampos(-1)) return !input.bad();
 
-  if (end < offset) offset = 0;
+  if (end < offset) {
+    // [GNU] A shrinking file reports "tail: NAME: file truncated" once and
+    // is then followed from the start.
+    if (!diag_name.empty()) {
+      safeErrorPrint("tail: ");
+      safeErrorPrint(winux::i18n::format("command.tail.follow.file_truncated",
+                                         "{}: file truncated", diag_name));
+      safeErrorPrint("\n");
+    }
+    offset = 0;
+  }
   if (end == offset) return true;
 
   input.clear();
@@ -371,6 +547,34 @@ auto output_new_data(std::ifstream& input, std::streampos& offset,
 
   offset = end;
   return !input.bad();
+}
+
+auto output_tail_from_start_records(std::istream& in, size_t records_to_skip,
+                                    char delimiter) -> void {
+  if (records_to_skip == 0) {
+    stream_all(in);
+    return;
+  }
+
+  std::array<char, 64 * 1024> buffer{};
+  while (records_to_skip > 0 && in.good()) {
+    in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    auto got = static_cast<size_t>(std::max<std::streamsize>(in.gcount(), 0));
+    if (got == 0) break;
+
+    for (size_t i = 0; i < got; ++i) {
+      if (buffer[i] != delimiter) continue;
+      if (--records_to_skip == 0) {
+        const size_t remainder_start = i + 1;
+        if (remainder_start < got) {
+          safePrint(std::string_view(buffer.data() + remainder_start,
+                                     got - remainder_start));
+        }
+        stream_all(in);
+        return;
+      }
+    }
+  }
 }
 
 auto output_tail(std::istream& in, const TailConfig& config) -> void {
@@ -413,26 +617,7 @@ auto output_tail(std::istream& in, const TailConfig& config) -> void {
 
   size_t n = static_cast<size_t>(config.spec.value);
   if (config.spec.from_start) {
-    size_t start = n > 0 ? n - 1 : 0;
-    if (start == 0) {
-      stream_all(in);
-      return;
-    }
-
-    size_t record_index = 0;
-    std::string current;
-    char ch = '\0';
-    while (in.get(ch)) {
-      current.push_back(ch);
-      if (ch == config.delimiter) {
-        if (record_index >= start) safePrint(current);
-        current.clear();
-        ++record_index;
-      }
-    }
-    if (!current.empty() && record_index >= start) {
-      safePrint(current);
-    }
+    output_tail_from_start_records(in, n > 0 ? n - 1 : 0, config.delimiter);
     return;
   }
 
@@ -455,6 +640,31 @@ auto output_tail(std::istream& in, const TailConfig& config) -> void {
   for (const auto& rec : trailing_records) safePrint(rec);
 }
 
+auto open_input_file(const std::string& file) -> std::ifstream {
+  return file_io::open_binary_file(file);
+}
+
+auto describe_open_failure(const std::string& file) -> std::string {
+  std::wstring wfile = utf8_to_wstring(file);
+  DWORD attrs = native_path::attributes_w(utf8_to_wstring(file));
+  if (attrs == INVALID_FILE_ATTRIBUTES) {
+    return "No such file or directory";
+  }
+  if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+    return "Is a directory";
+  }
+  return "Permission denied";
+}
+
+auto is_directory_open_failure(std::string_view reason) -> bool {
+  return reason == "Is a directory";
+}
+
+auto output_text_tail(std::istream& in, const TailConfig& config) -> void {
+  std::istringstream decoded(read_text_stream(in));
+  output_tail(decoded, config);
+}
+
 template <size_t N>
 auto check_unsupported(const CommandContext<N>&) -> cp::Result<void> {
   return {};
@@ -464,19 +674,40 @@ template <size_t N>
 auto build_config(const CommandContext<N>& ctx) -> cp::Result<TailConfig> {
   TailConfig config;
   config.delimiter = ctx.get<bool>("--zero-terminated", false) ? '\0' : '\n';
+  (void)ctx.has("--use-polling");
   config.debug = ctx.get<bool>("--debug", false);
-  config.follow_by_name = ctx.get<bool>("-F", false);
-  if (ctx.has("--follow")) {
-    std::string follow_mode = ctx.get<std::string>("--follow", "");
-    if (follow_mode == "name") {
+
+  for (const auto& occurrence : ctx.options.occurrences()) {
+    if (!ctx.metas || occurrence.index >= N) continue;
+    const auto& meta = (*ctx.metas)[occurrence.index];
+
+    if (option_matches(meta, "-F", "")) {
       config.follow_by_name = true;
-    } else if (!follow_mode.empty() && follow_mode != "descriptor") {
-      return std::unexpected("invalid follow mode");
+      // [GNU] -F is shorthand for --follow=name --retry; --follow=name on
+      // its own does not retry.
+      config.retry = true;
+      continue;
+    }
+
+    if (option_matches(meta, "", "--follow")) {
+      auto value = std::get_if<std::string>(&occurrence.value);
+      if (!value) {
+        config.follow_by_name = false;
+        continue;
+      }
+      if (*value == "name") {
+        config.follow_by_name = true;
+      } else if (*value == "descriptor" || value->empty()) {
+        config.follow_by_name = false;
+      } else {
+        return std::unexpected("invalid follow mode");
+      }
     }
   }
   config.follow = ctx.get<bool>("-f", false) || ctx.has("--follow") ||
                   config.follow_by_name;
-  config.retry = ctx.get<bool>("--retry", false) || config.follow_by_name;
+  config.explicit_retry = ctx.get<bool>("--retry", false);
+  config.retry = config.retry || config.explicit_retry;
   for (int pid : ctx.template get_all<int>("--pid")) {
     if (pid < 0) return std::unexpected("invalid process ID");
     config.follow_pids.push_back(static_cast<DWORD>(pid));
@@ -541,113 +772,20 @@ auto build_config(const CommandContext<N>& ctx) -> cp::Result<TailConfig> {
 
   return config;
 }
-
-auto open_file_with_retry(const std::string& file, const TailConfig& config)
-    -> std::optional<std::ifstream> {
-  while (true) {
-    std::ifstream input(file, std::ios::binary);
-    if (input.is_open()) return input;
-    if (!config.retry || should_stop_follow(config)) return std::nullopt;
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  }
-}
-
-auto follow_descriptor(const std::string& file, const TailConfig& config)
-    -> bool {
-  std::ifstream monitor_file(file, std::ios::binary);
-  if (!monitor_file.is_open()) {
-    safeErrorPrint("tail: cannot open '");
-    safeErrorPrint(file);
-    safeErrorPrint("' for following\n");
-    return false;
-  }
-
-  monitor_file.seekg(0, std::ios::end);
-  auto offset = monitor_file.tellg();
-  if (offset == std::streampos(-1)) offset = 0;
-
-  while (true) {
-    if (should_stop_follow(config)) break;
-    std::this_thread::sleep_for(config.sleep_interval);
-    if (!output_new_data(monitor_file, offset)) {
-      safeErrorPrint("tail: error reading '");
-      safeErrorPrint(file);
-      safeErrorPrint("' while following\n");
-      return false;
-    }
-  }
-
-  return true;
-}
-
-auto follow_name(const std::string& file, const TailConfig& config,
-                 std::optional<FileIdentity> identity, std::streampos offset)
-    -> bool {
-  std::uintmax_t unchanged_stats = 0;
-
-  while (true) {
-    if (should_stop_follow(config)) break;
-    std::this_thread::sleep_for(config.sleep_interval);
-
-    auto current_status = read_file_status(file);
-    if (!current_status) {
-      if (config.retry) continue;
-      safeErrorPrint("tail: cannot open '");
-      safeErrorPrint(file);
-      safeErrorPrint("' for following\n");
-      return false;
-    }
-
-    bool identity_changed =
-        !identity || !same_identity(*identity, current_status->identity);
-    bool unchanged = current_status->size == streampos_to_size(offset);
-
-    if (identity_changed) {
-      if (unchanged_stats < config.max_unchanged_stats) {
-        ++unchanged_stats;
-        continue;
-      }
-      identity = current_status->identity;
-      offset = 0;
-      unchanged_stats = 0;
-    } else if (unchanged) {
-      if (unchanged_stats < config.max_unchanged_stats) {
-        ++unchanged_stats;
-      } else {
-        unchanged_stats = 0;
-      }
-      continue;
-    } else {
-      unchanged_stats = 0;
-    }
-
-    std::ifstream current(file, std::ios::binary);
-    if (!current.is_open()) {
-      if (config.retry) continue;
-      safeErrorPrint("tail: cannot open '");
-      safeErrorPrint(file);
-      safeErrorPrint("' for following\n");
-      return false;
-    }
-
-    if (!output_new_data(current, offset)) {
-      safeErrorPrint("tail: error reading '");
-      safeErrorPrint(file);
-      safeErrorPrint("' while following\n");
-      return false;
-    }
-  }
-
-  return true;
-}
-
 struct FollowTarget {
   std::string file;
   std::optional<FileIdentity> identity;
   std::streampos offset = 0;
-  std::uintmax_t unchanged_stats = 0;
   std::ifstream descriptor;
+  // [GNU] Count of consecutive polls that saw no size change; when it
+  // reaches --max-unchanged-stats the file is reopened by name even though
+  // the size still matches, mirroring GNU's periodic fstat refresh.
+  std::uintmax_t unchanged_stats = 0;
   bool active = true;
+  // [GNU] Whether the name last resolved to a readable file; drives the
+  // once-per-transition "has become inaccessible" / "has appeared"
+  // diagnostics while --retry keeps polling an absent file.
+  bool accessible = true;
 };
 
 auto follow_header(const FollowTarget& target, const TailConfig& config)
@@ -676,24 +814,79 @@ auto debug_follow_start(const TailConfig& config, size_t file_count) -> void {
   }
 }
 
+auto emit_ignored_pid_warning(const TailConfig& config) -> void {
+  if (config.follow || config.follow_pids.empty()) return;
+  safeErrorPrint(
+      "tail: warning: PID ignored; --pid=PID is useful only when following\n");
+}
+
+auto emit_retry_warning(const TailConfig& config) -> void {
+  if (!config.explicit_retry) return;
+  if (!config.follow) {
+    safeErrorPrint(
+        "tail: warning: --retry ignored; --retry is useful only when "
+        "following\n");
+    return;
+  }
+  if (!config.follow_by_name) {
+    safeErrorPrint(
+        "tail: warning: --retry only effective for the initial open\n");
+  }
+}
+
+// [GNU] Shared "name disappeared" diagnostic used while following: with
+// --retry the name stays in the follow set and the transition is reported
+// once, otherwise the target is dropped like GNU's recheck() does.
+auto report_follow_inaccessible(FollowTarget& target, const TailConfig& config)
+    -> bool {
+  if (config.retry) {
+    if (target.accessible) {
+      target.accessible = false;
+      safeErrorPrint(
+          winux::i18n::format("command.tail.follow.inaccessible",
+                              "tail: '{}' has become inaccessible: {}\n",
+                              target.file, describe_open_failure(target.file)));
+    }
+    return true;
+  }
+  safeErrorPrint("tail: ");
+  safeErrorPrint(target.file);
+  safeErrorPrint(": ");
+  safeErrorPrint(describe_open_failure(target.file));
+  safeErrorPrint("\n");
+  target.active = false;
+  return false;
+}
+
+auto report_follow_reappeared(FollowTarget& target) -> void {
+  target.accessible = true;
+  safeErrorPrint(winux::i18n::format(
+      "command.tail.follow.appeared",
+      "tail: '{}' has appeared;  following new file\n", target.file));
+}
+
 auto follow_descriptor_target(FollowTarget& target, const TailConfig& config,
                               bool multi) -> bool {
   if (!target.descriptor.is_open()) {
-    target.descriptor.open(target.file, std::ios::binary);
+    target.descriptor = open_input_file(target.file);
     if (!target.descriptor.is_open()) {
-      safeErrorPrint("tail: cannot open '");
-      safeErrorPrint(target.file);
-      safeErrorPrint("' for following\n");
-      target.active = false;
-      return false;
+      return report_follow_inaccessible(target, config);
     }
-    target.descriptor.seekg(0, std::ios::end);
-    target.offset = target.descriptor.tellg();
-    if (target.offset == std::streampos(-1)) target.offset = 0;
+    if (!target.accessible) {
+      // [GNU] A file that (re)appears while --retry polls is followed from
+      // its beginning, not just from its end.
+      report_follow_reappeared(target);
+      target.offset = 0;
+    } else {
+      target.descriptor.seekg(0, std::ios::end);
+      target.offset = target.descriptor.tellg();
+      if (target.offset == std::streampos(-1)) target.offset = 0;
+    }
   }
 
   if (!output_new_data(target.descriptor, target.offset,
-                       multi ? follow_header(target, config) : "")) {
+                       multi ? follow_header(target, config) : "",
+                       target.file)) {
     safeErrorPrint("tail: error reading '");
     safeErrorPrint(target.file);
     safeErrorPrint("' while following\n");
@@ -703,54 +896,62 @@ auto follow_descriptor_target(FollowTarget& target, const TailConfig& config,
   return true;
 }
 
+// [GNU] --follow=name recheck(): the path is statted by name every poll, so
+// replacement (rename+recreate, symlink repoint) is detected as soon as the
+// volume/index pair changes rather than only after --max-unchanged-stats
+// quiet iterations.
 auto follow_name_target(FollowTarget& target, const TailConfig& config,
                         bool multi) -> bool {
   auto current_status = read_file_status(target.file);
   if (!current_status) {
-    if (config.retry) return true;
-    safeErrorPrint("tail: cannot open '");
-    safeErrorPrint(target.file);
-    safeErrorPrint("' for following\n");
-    target.active = false;
-    return false;
+    return report_follow_inaccessible(target, config);
   }
 
-  bool identity_changed =
-      !target.identity ||
-      !same_identity(*target.identity, current_status->identity);
-  bool unchanged = current_status->size == streampos_to_size(target.offset);
-
-  if (identity_changed) {
-    if (target.unchanged_stats < config.max_unchanged_stats) {
-      ++target.unchanged_stats;
-      return true;
-    }
+  bool reopen_from_start = false;
+  if (!target.accessible) {
+    report_follow_reappeared(target);
     target.identity = current_status->identity;
+    reopen_from_start = true;
+  } else if (target.identity &&
+             !same_identity(*target.identity, current_status->identity)) {
+    // [GNU] tail.c recheck: diagnose replacement of the followed file name.
+    safeErrorPrint(winux::i18n::format(
+        "command.tail.replaced",
+        "tail: '{}' has been replaced;  following new file\n", target.file));
+    target.identity = current_status->identity;
+    reopen_from_start = true;
+  } else if (!target.identity) {
+    target.identity = current_status->identity;
+  }
+
+  if (reopen_from_start) {
     target.offset = 0;
     target.unchanged_stats = 0;
-  } else if (unchanged) {
+  } else if (current_status->size == streampos_to_size(target.offset)) {
+    // [GNU] --max-unchanged-stats=N: after N unchanged polls GNU reopens
+    // the file because its followed descriptor could be stale.  This
+    // implementation stats the path by name every poll, so the identity
+    // check above already sees a replacement; the periodic reopen below is
+    // kept so a same-size rewrite still produces a fresh open like GNU.
     if (target.unchanged_stats < config.max_unchanged_stats) {
       ++target.unchanged_stats;
-    } else {
-      target.unchanged_stats = 0;
+      return true;  // Unchanged: nothing new to dump this iteration.
     }
-    return true;
+    target.unchanged_stats = 0;
   } else {
     target.unchanged_stats = 0;
   }
+  // A shrunken file is reported by output_new_data ("file truncated") and
+  // re-read from the start; a grown file dumps only the appended range.
 
-  std::ifstream current(target.file, std::ios::binary);
+  std::ifstream current = open_input_file(target.file);
   if (!current.is_open()) {
-    if (config.retry) return true;
-    safeErrorPrint("tail: cannot open '");
-    safeErrorPrint(target.file);
-    safeErrorPrint("' for following\n");
-    target.active = false;
-    return false;
+    return report_follow_inaccessible(target, config);
   }
 
   if (!output_new_data(current, target.offset,
-                       multi ? follow_header(target, config) : "")) {
+                       multi ? follow_header(target, config) : "",
+                       target.file)) {
     safeErrorPrint("tail: error reading '");
     safeErrorPrint(target.file);
     safeErrorPrint("' while following\n");
@@ -780,6 +981,12 @@ auto follow_targets(std::vector<FollowTarget>& targets,
 
     std::erase_if(targets,
                   [](const FollowTarget& target) { return !target.active; });
+    if (targets.empty() && !ok) {
+      // [GNU] Once the last followed name is gone tail gives up with this
+      // diagnostic instead of silently exiting the follow loop.
+      safeErrorPrint(winux::i18n::format("command.tail.follow.no_files",
+                                         "tail: no files remaining\n"));
+    }
   }
 
   return ok;
@@ -810,6 +1017,8 @@ REGISTER_COMMAND(
     return 1;
   }
   auto config = *config_result;
+  emit_ignored_pid_warning(config);
+  emit_retry_warning(config);
 
   // Use SmallVector for files (max 64 files) - all stack-allocated
   SmallVector<std::string, 64> files{};
@@ -837,33 +1046,84 @@ REGISTER_COMMAND(
     const auto& file = files[i];
 
     bool show_header = config.verbose || (multi && !config.quiet);
-    if (show_header) {
+    auto emit_header = [&]() {
+      if (!show_header) return;
       if (!first_print) safePrint(std::string(1, config.delimiter));
       safePrint("==> ");
       safePrint(file == "-" ? "standard input" : file);
       safePrint(" <==");
       safePrint(std::string(1, config.delimiter));
-    }
+      first_print = false;
+    };
 
     if (file == "-") {
+      emit_header();
+      // [GNU] A closed standard input (<&-) is an error, not EOF (#973).
+      if (file_io::stdin_is_bad()) {
+        safeErrorPrint(
+            "tail: cannot fstat 'standard input': Bad file descriptor\n");
+        any_error = true;
+        continue;
+      }
       config.stdin_mode = true;
-      output_tail(std::cin, config);
+      if (config.by_bytes || config.delimiter == '\0') {
+        output_tail(std::cin, config);
+      } else {
+        output_text_tail(std::cin, config);
+      }
       if (std::cin.bad()) {
         safeErrorPrint("tail: error reading '-'\n");
         any_error = true;
       }
     } else {
-      auto input = open_file_with_retry(file, config);
-      if (!input) {
-        safeErrorPrint("tail: cannot open '");
-        safeErrorPrint(file);
-        safeErrorPrint("'\n");
+      auto input = open_input_file(file);
+      if (!input.is_open()) {
+        std::string reason = describe_open_failure(file);
+        if (is_directory_open_failure(reason)) {
+          safeErrorPrint("tail: error reading '");
+          safeErrorPrint(file);
+          safeErrorPrint("': ");
+          safeErrorPrint(reason);
+          safeErrorPrint("\n");
+        } else {
+          safeErrorPrint("tail: cannot open '");
+          safeErrorPrint(file);
+          safeErrorPrint("' for reading: ");
+          safeErrorPrint(reason);
+          safeErrorPrint("\n");
+        }
+        // [GNU] With --retry the failed name stays in the follow set: the
+        // initial open error is reported once and every follow iteration
+        // retries the open until the file appears.
+        if (config.retry && config.follow &&
+            !is_directory_open_failure(reason)) {
+          FollowTarget target;
+          target.file = file;
+          target.accessible = false;
+          follow_targets_to_run.push_back(std::move(target));
+          continue;
+        }
         any_error = true;
         continue;
       }
 
-      output_tail(*input, config);
-      if (input->bad()) {
+      emit_header();
+      bool used_fast_path = false;
+      if (config.by_bytes) {
+        used_fast_path = output_tail_seekable_bytes(input, config);
+      } else if (config.delimiter == '\0') {
+        used_fast_path = output_tail_seekable_lines(input, config);
+      } else if (!stream_needs_text_decoding(input)) {
+        used_fast_path = output_tail_seekable_lines(input, config);
+        if (!used_fast_path) output_tail(input, config);
+      } else {
+        output_text_tail(input, config);
+        used_fast_path = true;
+      }
+      if (!used_fast_path) {
+        output_tail(input, config);
+      }
+      if (input.bad()) {
         safeErrorPrint("tail: error reading '");
         safeErrorPrint(file);
         safeErrorPrint("'\n");
@@ -874,15 +1134,30 @@ REGISTER_COMMAND(
         FollowTarget target;
         target.file = file;
         target.identity = read_file_identity(file);
-        input->clear();
-        input->seekg(0, std::ios::end);
-        target.offset = input->tellg();
+        // Record the end offset before the stream is moved into the
+        // descriptor slot: tellg() on a moved-from stream returns -1 and
+        // the follow dump would restart at offset 0, re-printing the file.
+        input.clear();
+        input.seekg(0, std::ios::end);
+        target.offset = input.tellg();
         if (target.offset == std::streampos(-1)) target.offset = 0;
+        if (config.follow_by_name) {
+          // [GNU] --follow=name always re-opens the path for the first
+          // dump; the stream used for the initial output is not reused.
+          target.descriptor.close();
+        } else {
+          target.descriptor = std::move(input);
+        }
         follow_targets_to_run.push_back(std::move(target));
       }
     }
+  }
 
-    first_print = false;
+  if (config.follow && follow_targets_to_run.empty() && any_error) {
+    // [GNU] tail.c: with -f/--follow and no live inputs left, tail ends
+    // with "tail: no files remaining" rather than exiting silently.
+    safeErrorPrint(winux::i18n::format("command.tail.follow.no_files",
+                                       "tail: no files remaining\n"));
   }
 
   if (!follow_targets_to_run.empty() &&

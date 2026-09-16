@@ -16,6 +16,62 @@ TEST(stdbuf, stdbuf_basic) {
   EXPECT_EQ(r.exit_code, 0);
 }
 
+TEST(stdbuf, stdbuf_preserves_argument_with_spaces) {
+  Pipeline p;
+  p.add(L"stdbuf.exe", {L"-o0", L"printf.exe", L"<%s>", L"a b"});
+
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("stdbuf preserved space argument output", r.stdout_text);
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stderr_text.empty());
+  EXPECT_EQ_TEXT(r.stdout_text, "<a b>");
+}
+
+TEST(stdbuf, stdbuf_missing_command_reports_help_hint_on_stderr) {
+  Pipeline p;
+  p.add(L"stdbuf.exe", {});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 125);
+  EXPECT_TRUE(r.stdout_text.empty());
+  // [GNU] stdbuf with no COMMAND reports "missing operand".
+  EXPECT_EQ_TEXT(r.stderr_text,
+                 "stdbuf: missing operand\n"
+                 "Try 'stdbuf --help' for more information.\n");
+}
+
+// [GNU] stdbuf COMMAND without any -i/-o/-e buffering mode option is a
+// usage error, checked after the missing-operand diagnostic.
+TEST(stdbuf, stdbuf_command_without_mode_option_returns_125) {
+  Pipeline p;
+  p.add(L"stdbuf.exe", {L"echo.exe", L"test"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 125);
+  EXPECT_TRUE(r.stdout_text.empty());
+  EXPECT_EQ_TEXT(r.stderr_text,
+                 "stdbuf: you must specify a buffering mode option\n"
+                 "Try 'stdbuf --help' for more information.\n");
+}
+
+TEST(stdbuf, stdbuf_invalid_option_returns_125) {
+  Pipeline p;
+  p.add(L"stdbuf.exe", {L"--invalid"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 125);
+  EXPECT_TRUE(r.stdout_text.empty());
+  EXPECT_EQ_TEXT(r.stderr_text,
+                 "stdbuf: unrecognized option '--invalid'\n"
+                 "Try 'stdbuf --help' for more information.\n");
+}
+
 TEST(stdbuf, stdbuf_attached_output_mode) {
   Pipeline p;
   p.add(L"stdbuf.exe", {L"-o0", L"echo.exe", L"test"});
@@ -42,7 +98,7 @@ TEST(stdbuf, stdbuf_accepts_bare_binary_suffix) {
   EXPECT_EQ(r.exit_code, 0);
 }
 
-TEST(stdbuf, stdbuf_rejects_line_buffered_stdin) {
+TEST(stdbuf, stdbuf_accepts_line_buffered_stdin) {
   Pipeline p;
   p.add(L"stdbuf.exe", {L"-iL", L"echo.exe", L"test"});
 
@@ -53,8 +109,21 @@ TEST(stdbuf, stdbuf_rejects_line_buffered_stdin) {
   TEST_LOG_EXIT_CODE(r);
   TEST_LOG("stdbuf stderr", r.stderr_text);
 
-  EXPECT_EQ(r.exit_code, 1);
-  EXPECT_FALSE(r.stderr_text.empty());
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "test\n");
+}
+
+TEST(stdbuf, stdbuf_accepts_line_buffered_stdout) {
+  Pipeline p;
+  p.add(L"stdbuf.exe", {L"-oL", L"echo.exe", L"test"});
+
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("stdbuf stdout line buffered stderr", r.stderr_text);
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "test\n");
 }
 
 TEST(stdbuf, stdbuf_rejects_zero_sized_buffer_mode) {
@@ -68,7 +137,6 @@ TEST(stdbuf, stdbuf_rejects_zero_sized_buffer_mode) {
   TEST_LOG_EXIT_CODE(r);
   TEST_LOG("stdbuf stderr", r.stderr_text);
 
-  EXPECT_EQ(r.exit_code, 1);
-  EXPECT_TRUE(r.stderr_text.find("invalid mode for standard output") !=
-              std::string::npos);
+  EXPECT_EQ(r.exit_code, 125);
+  EXPECT_TRUE(r.stderr_text.find("invalid mode '0KiB'") != std::string::npos);
 }

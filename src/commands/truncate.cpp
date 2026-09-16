@@ -43,10 +43,14 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr TRUNCATE_OPTIONS = std::array{
+    // [GNU] option
     OPTION("-c", "--no-create", "do not create files", BOOL_TYPE),
+    // [GNU] option
     OPTION("-o", "--io-blocks", "treat SIZE as number of IO blocks", BOOL_TYPE),
+    // [GNU] option
     OPTION("-s", "--size", "set or adjust the file size by SIZE bytes",
            STRING_TYPE),
+    // [GNU] option
     OPTION("-r", "--reference", "base size on RFILE", STRING_TYPE)};
 
 namespace truncate_pipeline {
@@ -70,6 +74,7 @@ struct SizeSpec {
 struct Config {
   bool no_create = false;
   bool io_blocks = false;
+  bool got_size = false;
   SizeSpec size;
   std::string reference_file;
   SmallVector<std::string, 64> files;
@@ -174,70 +179,70 @@ auto scale_size(int64_t value, long double multiplier) -> cp::Result<int64_t> {
 }
 
 auto parse_size(const std::string& size_str) -> cp::Result<SizeSpec> {
-  try {
-    std::string s = size_str;
-    SizeSpec spec;
+  std::string s = size_str;
+  SizeSpec spec;
+  // [GNU] every rejected size reports the raw operand (uutils #13576)
+  const auto invalid_number = [&size_str]() -> std::string {
+    return "Invalid number: '" + size_str + "'";
+  };
 
-    if (!s.empty()) {
-      switch (s[0]) {
-        case '+':
-          spec.mode = SizeMode::Add;
-          s.erase(0, 1);
-          break;
-        case '-':
-          spec.mode = SizeMode::Subtract;
-          s.erase(0, 1);
-          break;
-        case '<':
-          spec.mode = SizeMode::AtMost;
-          s.erase(0, 1);
-          break;
-        case '>':
-          spec.mode = SizeMode::AtLeast;
-          s.erase(0, 1);
-          break;
-        case '/':
-          spec.mode = SizeMode::RoundDown;
-          s.erase(0, 1);
-          break;
-        case '%':
-          spec.mode = SizeMode::RoundUp;
-          s.erase(0, 1);
-          break;
-        default:
-          break;
-      }
+  if (!s.empty()) {
+    switch (s[0]) {
+      case '+':
+        spec.mode = SizeMode::Add;
+        s.erase(0, 1);
+        break;
+      case '-':
+        spec.mode = SizeMode::Subtract;
+        s.erase(0, 1);
+        break;
+      case '<':
+        spec.mode = SizeMode::AtMost;
+        s.erase(0, 1);
+        break;
+      case '>':
+        spec.mode = SizeMode::AtLeast;
+        s.erase(0, 1);
+        break;
+      case '/':
+        spec.mode = SizeMode::RoundDown;
+        s.erase(0, 1);
+        break;
+      case '%':
+        spec.mode = SizeMode::RoundUp;
+        s.erase(0, 1);
+        break;
+      default:
+        break;
     }
-
-    if (s.empty()) {
-      return std::unexpected("invalid size");
-    }
-
-    long double multiplier = match_suffix(s);
-    if (s.empty()) {
-      return std::unexpected("invalid size");
-    }
-
-    size_t consumed = 0;
-    int64_t base_value = std::stoll(s, &consumed);
-    if (consumed != s.size() || base_value < 0) {
-      return std::unexpected("invalid size format");
-    }
-
-    auto scaled = scale_size(base_value, multiplier);
-    if (!scaled) {
-      return std::unexpected(scaled.error());
-    }
-    spec.value = *scaled;
-    if ((spec.mode == SizeMode::RoundDown || spec.mode == SizeMode::RoundUp) &&
-        spec.value == 0) {
-      return std::unexpected("division by zero size");
-    }
-
-    return spec;
-  } catch (...) {
-    return std::unexpected("invalid size format");
   }
+
+  if (s.empty()) {
+    return std::unexpected(invalid_number());
+  }
+
+  long double multiplier = match_suffix(s);
+  if (s.empty()) {
+    return std::unexpected(invalid_number());
+  }
+
+  int64_t base_value = 0;
+  auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), base_value);
+  if (ec != std::errc() || ptr != s.data() + s.size() || base_value < 0) {
+    return std::unexpected(invalid_number());
+  }
+
+  auto scaled = scale_size(base_value, multiplier);
+  if (!scaled) {
+    return std::unexpected(scaled.error());
+  }
+  spec.value = *scaled;
+  if ((spec.mode == SizeMode::RoundDown || spec.mode == SizeMode::RoundUp) &&
+      spec.value == 0) {
+    return std::unexpected("division by zero size");
+  }
+
+  return spec;
 }
 
 auto build_config(const CommandContext<TRUNCATE_OPTIONS.size()>& ctx)
@@ -253,23 +258,33 @@ auto build_config(const CommandContext<TRUNCATE_OPTIONS.size()>& ctx)
     size_opt = ctx.get<std::string>("-s", "");
   }
 
-  if (size_opt.empty()) {
-    auto ref_opt = ctx.get<std::string>("--reference", "");
-    if (ref_opt.empty()) {
-      ref_opt = ctx.get<std::string>("-r", "");
-    }
-
-    if (!ref_opt.empty()) {
-      cfg.reference_file = ref_opt;
-    } else {
-      return std::unexpected("specify --size or --reference");
-    }
-  } else {
+  cfg.got_size = ctx.has("--size") || ctx.has("-s");
+  if (cfg.got_size) {
+    // [GNU] an explicitly empty -s value is a parse error, not a missing
+    // operand (uutils #13576)
     auto size_result = parse_size(size_opt);
     if (!size_result) {
       return std::unexpected(size_result.error());
     }
     cfg.size = *size_result;
+  }
+
+  auto ref_opt = ctx.get<std::string>("--reference", "");
+  if (ref_opt.empty()) {
+    ref_opt = ctx.get<std::string>("-r", "");
+  }
+  cfg.reference_file = ref_opt;
+
+  // [GNU] option validation order (truncate.c:291-302): a reference may be
+  // combined with a *relative* --size, never an absolute one
+  // (uutils #12963).
+  if (!cfg.got_size && cfg.reference_file.empty()) {
+    return std::unexpected("you must specify either '--size' or '--reference'");
+  }
+  if (!cfg.reference_file.empty() && cfg.got_size &&
+      cfg.size.mode == SizeMode::Absolute) {
+    return std::unexpected(
+        "you must specify a relative '--size' with '--reference'");
   }
 
   for (auto arg : ctx.positionals) {
@@ -294,33 +309,43 @@ auto build_config(const CommandContext<TRUNCATE_OPTIONS.size()>& ctx)
 }
 
 auto get_file_size(const std::string& file) -> cp::Result<int64_t> {
-  std::error_code ec;
-  auto size = std::filesystem::file_size(file, ec);
-  if (ec) {
+  auto operand = native_path::make_api_path_operand(file);
+  if (operand.had_trailing_separator &&
+      native_path::attributes_are_regular_file(
+          native_path::operand_target_attributes_w(operand))) {
+    return std::unexpected("Not a directory");
+  }
+
+  UniqueHandle h(
+      CreateFileW(operand.extended.c_str(), FILE_READ_ATTRIBUTES,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                  nullptr, OPEN_EXISTING,
+                  FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+  if (!h) {
     return std::unexpected("cannot get file size");
   }
-  if (size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+
+  LARGE_INTEGER size{};
+  if (!GetFileSizeEx(h.get(), &size)) {
+    return std::unexpected("cannot get file size");
+  }
+  if (size.QuadPart > std::numeric_limits<int64_t>::max()) {
     return std::unexpected("file too large");
   }
-  return static_cast<int64_t>(size);
+  return static_cast<int64_t>(size.QuadPart);
 }
 
 auto io_block_size_for(const std::string& file) -> uint64_t {
-  std::filesystem::path p(file);
-  auto dir = p.has_parent_path() ? p.parent_path() : std::filesystem::path(".");
-  std::error_code ec;
-  auto abs = std::filesystem::absolute(dir, ec);
-  if (ec) {
-    abs = dir;
-  }
-
   wchar_t root[MAX_PATH];
   DWORD sectors_per_cluster = 0;
   DWORD bytes_per_sector = 0;
   DWORD free_clusters = 0;
   DWORD total_clusters = 0;
 
-  auto wdir = abs.wstring();
+  std::wstring wdir = native_path::parent_path_w(native_path::from_utf8(file));
+  if (wdir.empty()) {
+    wdir = native_path::current_directory_w();
+  }
   if (!GetVolumePathNameW(wdir.c_str(), root, MAX_PATH)) {
     return 512;
   }
@@ -383,19 +408,27 @@ auto apply_size_mode(int64_t current_size, SizeSpec spec,
 }
 
 auto set_file_size(const std::string& file, int64_t target_size) -> bool {
-  HANDLE hFile =
-      CreateFileA(file.c_str(), GENERIC_WRITE,
+  auto operand = native_path::make_api_path_operand(file);
+  if (operand.had_trailing_separator) {
+    DWORD attrs = native_path::operand_target_attributes_w(operand);
+    if (native_path::attributes_are_regular_file(attrs) ||
+        !native_path::valid_attributes(attrs)) {
+      return false;
+    }
+  }
+
+  UniqueHandle hFile(
+      CreateFileW(operand.extended.c_str(), GENERIC_WRITE,
                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                  nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (hFile == INVALID_HANDLE_VALUE) {
+                  nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+  if (!hFile) {
     return false;
   }
 
   LARGE_INTEGER distance;
   distance.QuadPart = target_size;
-  bool ok = SetFilePointerEx(hFile, distance, nullptr, FILE_BEGIN) != 0 &&
-            SetEndOfFile(hFile) != 0;
-  CloseHandle(hFile);
+  bool ok = SetFilePointerEx(hFile.get(), distance, nullptr, FILE_BEGIN) != 0 &&
+            SetEndOfFile(hFile.get()) != 0;
   return ok;
 }
 
@@ -404,18 +437,36 @@ auto run(const Config& cfg) -> int {
   std::optional<int64_t> reference_size;
 
   if (!cfg.reference_file.empty()) {
+    // [GNU] the reference is statted before any file is touched:
+    // "cannot stat 'R': ..." for a missing one, then "cannot get the size
+    // of 'R': ..." when its size cannot be determined (uutils #12963).
+    auto ref_operand = native_path::make_api_path_operand(cfg.reference_file);
+    DWORD ref_attrs = native_path::operand_target_attributes_w(ref_operand);
+    if (!native_path::valid_attributes(ref_attrs)) {
+      safeErrorPrintLn("truncate: cannot stat '" + cfg.reference_file +
+                       "': No such file or directory");
+      return 1;
+    }
     auto ref_size = get_file_size(cfg.reference_file);
     if (!ref_size) {
-      safeErrorPrintLn("truncate: cannot stat reference file '" +
-                       cfg.reference_file + "'");
+      safeErrorPrintLn("truncate: cannot get the size of '" +
+                       cfg.reference_file + "': No such device or address");
       return 1;
     }
     reference_size = *ref_size;
   }
 
   for (const auto& file : cfg.files) {
-    std::error_code ec;
-    bool exists = std::filesystem::exists(file, ec);
+    auto operand = native_path::make_api_path_operand(file);
+    DWORD attrs = native_path::operand_target_attributes_w(operand);
+    if (operand.had_trailing_separator &&
+        native_path::attributes_are_regular_file(attrs)) {
+      safeErrorPrintLn("truncate: cannot resize '" + file +
+                       "': Not a directory");
+      all_ok = false;
+      continue;
+    }
+    bool exists = native_path::valid_attributes(attrs);
     if (!exists) {
       if (cfg.no_create) {
         continue;
@@ -433,10 +484,15 @@ auto run(const Config& cfg) -> int {
       current_size = *current;
     }
 
-    int64_t target_size = reference_size.value_or(0);
-    if (!reference_size) {
+    // [GNU] with --reference, a relative SIZE applies to the reference
+    // file's size rather than the target file's own size (uutils #12963).
+    int64_t target_size;
+    if (reference_size && !cfg.got_size) {
+      target_size = *reference_size;
+    } else {
+      const int64_t base_size = reference_size.value_or(current_size);
       auto applied = apply_size_mode(
-          current_size, cfg.size,
+          base_size, cfg.size,
           cfg.io_blocks ? io_block_size_for(file) : static_cast<uint64_t>(1));
       if (!applied) {
         safeErrorPrintLn("truncate: " + std::string(applied.error()));
@@ -484,6 +540,10 @@ REGISTER_COMMAND(
   auto cfg_result = build_config(ctx);
   if (!cfg_result) {
     cp::report_error(cfg_result, L"truncate");
+    const std::string err(cfg_result.error());
+    if (err.contains("you must specify") || err == "missing file operand") {
+      safeErrorPrintLn("Try 'truncate --help' for more information.");
+    }
     return 1;
   }
 

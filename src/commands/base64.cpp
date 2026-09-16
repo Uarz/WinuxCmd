@@ -43,13 +43,16 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr BASE64_OPTIONS = std::array{
+    // [GNU]
     OPTION("-d", "--decode", "decode data", BOOL_TYPE),
+    // [GNU]
     OPTION("-i", "--ignore-garbage",
            "when decoding, ignore non-alphabet characters", BOOL_TYPE),
+    // [GNU]
     OPTION("-w", "--wrap",
            "wrap encoded lines after COLS character (default 76). Use 0 to "
            "disable line wrapping",
-           INT_TYPE)};
+           STRING_TYPE)};
 
 namespace base64_pipeline {
 
@@ -62,98 +65,38 @@ struct Config {
 
 auto read_input(std::string_view filename)
     -> std::expected<std::string, std::string> {
-  std::string content;
-
-  if (filename == "-") {
-    content.assign(std::istreambuf_iterator<char>(std::cin),
-                   std::istreambuf_iterator<char>());
-    if (std::cin.fail() && !std::cin.eof()) {
-      return std::unexpected("error reading from standard input");
-    }
-    return content;
-  }
-
-  std::ifstream file(std::string(filename), std::ios::binary);
-  if (!file) {
-    return std::unexpected("cannot open '" + std::string(filename) +
-                           "' for reading");
-  }
-
-  content.assign(std::istreambuf_iterator<char>(file),
-                 std::istreambuf_iterator<char>());
-  if (file.fail() && !file.eof()) {
-    return std::unexpected("error reading '" + std::string(filename) + "'");
-  }
-
-  return content;
+  return file_io::read_all_input(filename);
 }
 
+// GNU decodes quantum units of 4 characters and keeps every byte decoded
+// before the first error; the prefix is printed before "invalid input"
+// (uutils #6008, #12204).
 auto decode_base64(std::string_view input, bool ignore_garbage)
-    -> std::expected<std::string, std::string> {
+    -> encoding::GnuDecodeResult {
   constexpr std::string_view alphabet =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  return encoding::base64_decode_gnu(input, alphabet, ignore_garbage);
+}
 
-  std::string clean;
-  clean.reserve(input.size());
-  bool saw_padding = false;
-  int padding = 0;
-
-  for (unsigned char c : input) {
-    if (c == '\n' || c == '\r') continue;
-
-    if (alphabet.find(static_cast<char>(c)) != std::string_view::npos) {
-      if (saw_padding) return std::unexpected("invalid input");
-      clean.push_back(static_cast<char>(c));
-      continue;
-    }
-
-    if (c == '=') {
-      saw_padding = true;
-      ++padding;
-      if (padding > 2) return std::unexpected("invalid input");
-      clean.push_back('=');
-      continue;
-    }
-
-    if (!ignore_garbage) return std::unexpected("invalid input");
-  }
-
-  const size_t data_chars = clean.find('=');
-  const size_t encoded_chars =
-      data_chars == std::string::npos ? clean.size() : data_chars;
-
-  if (clean.size() % 4 == 1 || encoded_chars % 4 == 1) {
-    return std::unexpected("invalid input");
-  }
-  if (padding > 0 && clean.size() % 4 != 0) {
-    return std::unexpected("invalid input");
-  }
-  if ((padding == 1 && encoded_chars % 4 != 3) ||
-      (padding == 2 && encoded_chars % 4 != 2)) {
-    return std::unexpected("invalid input");
-  }
-
-  std::string output;
-  output.reserve((encoded_chars / 4) * 3 + 2);
-  uint32_t accumulator = 0;
-  int bits = 0;
-
-  for (char c : clean.substr(0, encoded_chars)) {
-    const auto value = static_cast<uint32_t>(alphabet.find(c));
-    accumulator = (accumulator << 6) | value;
-    bits += 6;
-
-    if (bits >= 8) {
-      bits -= 8;
-      output.push_back(static_cast<char>((accumulator >> bits) & 0xff));
+// [GNU] the wrap size is validated by xstrtol: any non-numeric token or a
+// negative value dies with "invalid wrap size: '<raw>'" (uutils #14084).
+auto parse_wrap_size(const std::string& raw)
+    -> std::expected<int, std::string> {
+  size_t digit_start = 0;
+  if (!raw.empty() && (raw[0] == '+' || raw[0] == '-')) digit_start = 1;
+  const bool numeric =
+      digit_start < raw.size() &&
+      std::ranges::all_of(
+          raw.substr(digit_start),
+          [](unsigned char ch) { return std::isdigit(ch) != 0; });
+  if (numeric) {
+    errno = 0;
+    const long long value = std::strtoll(raw.c_str(), nullptr, 10);
+    if (errno == 0 && value >= 0 && value <= 2147483647LL) {
+      return static_cast<int>(value);
     }
   }
-
-  if (bits > 0 && (accumulator & ((uint32_t{1} << bits) - 1)) != 0) {
-    return std::unexpected("invalid input");
-  }
-
-  return output;
+  return std::unexpected("invalid wrap size: '" + raw + "'");
 }
 
 auto build_config(const CommandContext<BASE64_OPTIONS.size()>& ctx)
@@ -162,23 +105,16 @@ auto build_config(const CommandContext<BASE64_OPTIONS.size()>& ctx)
   cfg.decode = ctx.get<bool>("--decode", false) || ctx.get<bool>("-d", false);
   cfg.ignore_garbage =
       ctx.get<bool>("--ignore-garbage", false) || ctx.get<bool>("-i", false);
-  cfg.wrap = ctx.get<int>("--wrap", 76);
-
-  if (cfg.wrap < 0) return std::unexpected("invalid wrap size");
+  auto wrap = parse_wrap_size(ctx.get<std::string>("--wrap", "76"));
+  if (!wrap) return std::unexpected(wrap.error());
+  cfg.wrap = *wrap;
 
   SmallVector<std::string, 16> files;
   for (auto arg : ctx.positionals) {
     std::string file_arg(arg);
-    if (contains_wildcard(file_arg)) {
-      auto glob_result = glob_expand(file_arg);
-      if (glob_result.expanded) {
-        for (const auto& file : glob_result.files) {
-          files.push_back(wstring_to_utf8(file));
-        }
-        continue;
-      }
+    for (const auto& file : expand_file_operand(file_arg)) {
+      files.push_back(file);
     }
-    files.push_back(file_arg);
   }
 
   if (files.size() > 1) {
@@ -198,11 +134,11 @@ auto run(const Config& cfg) -> int {
 
   if (cfg.decode) {
     auto decoded = decode_base64(*content_result, cfg.ignore_garbage);
-    if (!decoded) {
-      safeErrorPrintLn("base64: " + decoded.error());
+    if (!decoded.output.empty()) safePrint(decoded.output);
+    if (!decoded.ok) {
+      safeErrorPrintLn("base64: invalid input");
       return 1;
     }
-    safePrint(*decoded);
     return 0;
   }
 
@@ -210,7 +146,7 @@ auto run(const Config& cfg) -> int {
   auto data = std::span<const uint8_t>(
       reinterpret_cast<const uint8_t*>(content.data()), content.size());
   std::string output = encoding::base64_encode(data, cfg.wrap);
-  if (!output.empty()) output.push_back('\n');
+  if (!output.empty() && cfg.wrap > 0) output.push_back('\n');
   safePrint(output);
   return 0;
 }
@@ -236,7 +172,11 @@ REGISTER_COMMAND(
 
   auto cfg_result = build_config(ctx);
   if (!cfg_result) {
-    safeErrorPrintLn("base64: " + cfg_result.error());
+    safeErrorPrintLn("base64: " +
+                     winux::i18n::translate_error(cfg_result.error()));
+    if (cfg_result.error().starts_with("extra operand '")) {
+      safeErrorPrintLn("Try 'base64 --help' for more information.");
+    }
     return 1;
   }
 

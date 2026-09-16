@@ -41,6 +41,24 @@ TEST(tac, tac_basic_file) {
   EXPECT_TRUE(r.stdout_text.find("line2") < r.stdout_text.find("line1"));
 }
 
+TEST(tac, tac_reads_utf8_filename) {
+  TempDir tmp;
+  const std::wstring name = L"\x6D4B\x8BD5.txt";
+  {
+    std::ofstream out(tmp.path / name, std::ios::binary);
+    out << "one\ntwo\n";
+  }
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"tac.exe", {name});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "two\none\n");
+}
+
 TEST(tac, tac_reverses_each_file_independently) {
   TempDir tmp;
   tmp.write("a.txt", "a1\na2\n");
@@ -85,17 +103,15 @@ TEST(tac, tac_before_attaches_separator_to_next_record) {
 }
 
 TEST(tac, tac_empty_separator_uses_nul) {
-  TempDir tmp;
-  tmp.write_bytes("nul.bin", {'a', '\0', 'b', '\0', 'c', '\0'});
-
   Pipeline p;
-  p.set_cwd(tmp.wpath());
-  p.add(L"tac.exe", {L"-s", L"", L"nul.bin"});
+  p.set_stdin(std::string("a\0b\0c\0", 6));
+  p.add(L"tac.exe", {L"--separator="});
+  p.add(L"base64.exe", {});
 
   auto r = p.run();
 
   EXPECT_EQ(r.exit_code, 0);
-  EXPECT_EQ(r.stdout_text, std::string("c\0b\0a\0", 6));
+  EXPECT_EQ_TEXT(r.stdout_text, "YwBiAGEA\n");
 }
 
 TEST(tac, tac_regex_separator) {
@@ -136,4 +152,69 @@ TEST(tac, tac_single_line) {
 
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_EQ_TEXT(r.stdout_text, "only one line\n");
+}
+
+TEST(tac, tac_newline_mode_preserves_crlf_records) {
+  TempDir tmp;
+  tmp.write_bytes("crlf.txt",
+                  {'l', 'i',  'n',  'e', '1', '\r', '\n', 'l', 'i',  'n', 'e',
+                   '2', '\r', '\n', 'l', 'i', 'n',  'e',  '3', '\r', '\n'});
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"tac.exe", {L"crlf.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "line3\r\nline2\r\nline1\r\n");
+}
+
+TEST(tac, tac_missing_input_reports_no_such_file) {
+  TempDir tmp;
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"tac.exe", {L"missing.txt"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stderr_text.find(
+                  "tac: cannot open 'missing.txt' for reading: No such file "
+                  "or directory") != std::string::npos);
+}
+
+TEST(tac, tac_directory_input_reports_is_a_directory) {
+  TempDir tmp;
+  tmp.mkdir("indir");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"tac.exe", {L"indir"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stderr_text.find(
+                  "tac: cannot open 'indir' for reading: Is a directory") !=
+              std::string::npos);
+}
+
+TEST(tac, tac_file_with_trailing_separator_reports_not_directory) {
+  TempDir tmp;
+  tmp.write("file.txt", "payload\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"tac.exe", {L"file.txt/"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(r.stdout_text.empty());
+  EXPECT_TRUE(
+      r.stderr_text.find(
+          "tac: cannot open 'file.txt/' for reading: Not a directory") !=
+      std::string::npos);
 }

@@ -42,6 +42,7 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr PRINTENV_OPTIONS = std::array{
+    // [GNU]
     OPTION("-0", "--null", "end each output line with NUL, not newline")};
 
 namespace {
@@ -51,6 +52,14 @@ void print_separator(bool null_terminated) {
   } else {
     safePrint("\n");
   }
+}
+
+bool is_hidden_windows_env_entry(const std::wstring& entry) {
+  return !entry.empty() && entry.front() == L'=';
+}
+
+bool is_invalid_printenv_variable_name(std::string_view name) {
+  return name.find('=') != std::string_view::npos;
 }
 }  // namespace
 
@@ -92,6 +101,9 @@ REGISTER_COMMAND(
 
     for (wchar_t* env = env_block; *env; env += wcslen(env) + 1) {
       std::wstring wenv(env);
+      if (is_hidden_windows_env_entry(wenv)) {
+        continue;
+      }
       std::string utf8_env = wstring_to_utf8(wenv);
       safePrint(utf8_env);
       print_separator(null_terminated);
@@ -101,7 +113,13 @@ REGISTER_COMMAND(
     // Print specified environment variables
     bool all_found = true;
     for (auto var : ctx.positionals) {
-      std::wstring wvar = utf8_to_wstring(std::string(var));
+      std::string var_name(var);
+      if (is_invalid_printenv_variable_name(var_name)) {
+        all_found = false;
+        continue;
+      }
+
+      std::wstring wvar = utf8_to_wstring(var_name);
       wchar_t* value = _wgetenv(wvar.c_str());
 
       if (value) {

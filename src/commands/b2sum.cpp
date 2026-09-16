@@ -31,15 +31,8 @@
 /// @Copyright: Copyright © 2026 WinuxCmd
 // *** SIMPLIFIED IMPLEMENTATION - Some features may not be fully supported ***
 
-#include "pch/pch.h"
-// include other header after pch.h
-#include <bcrypt.h>  // For CNG API (BLAKE2 support)
-#include <wincrypt.h>
-
 #include "core/command_macros.h"
-
-#pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "bcrypt.lib")  // For CNG API
+#include "pch/pch.h"
 
 import std;
 import core;
@@ -50,30 +43,42 @@ using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr B2SUM_OPTIONS = std::array{
+    // [GNU]
     OPTION("-l", "--length", "digest length in bits; must be multiple of 8",
            STRING_TYPE),
+    // [GNU]
     OPTION("-b", "--binary", "read in binary mode (default)", BOOL_TYPE),
+    // [GNU]
     OPTION("-c", "--check", "read BLAKE2 sums from the FILEs and check them",
-           STRING_TYPE),
-    OPTION("-t", "--text", "read in text mode", BOOL_TYPE),
-    OPTION("-q", "--quiet",
-           "don't print OK for each successfully verified file", BOOL_TYPE),
-    OPTION("-s", "--status", "don't output anything, status code shows success",
            BOOL_TYPE),
+    // [GNU]
+    OPTION("", "--ignore-missing",
+           "don't fail or report status for missing files", BOOL_TYPE),
+    // [GNU]
+    OPTION("-t", "--text", "read in text mode", BOOL_TYPE),
+    // [GNU]
+    OPTION("", "--quiet", "don't print OK for each successfully verified file",
+           BOOL_TYPE),
+    // [GNU]
+    OPTION("", "--status", "don't output anything, status code shows success",
+           BOOL_TYPE),
+    // [GNU]
     OPTION("-w", "--warn", "warn about improperly formatted checksum lines",
            BOOL_TYPE),
-    OPTION("", "--tag",
-           "create a BSD-style checksum", BOOL_TYPE),
-    OPTION("", "--zero",
-           "end each output line with NUL, not newline", BOOL_TYPE),
-    OPTION("", "--strict",
-           "with --check, exit non-zero for any invalid input", BOOL_TYPE)};
+    // [GNU]
+    OPTION("", "--tag", "create a BSD-style checksum", BOOL_TYPE),
+    // [GNU]
+    OPTION("-z", "--zero", "end each output line with NUL, not newline",
+           BOOL_TYPE),
+    // [GNU]
+    OPTION("", "--strict", "with --check, exit non-zero for any invalid input",
+           BOOL_TYPE)};
 
 namespace b2sum_pipeline {
 namespace cp = core::pipeline;
 
 struct Config {
-  int digest_bits = 256;  // Default: BLAKE2-256
+  int digest_bits = 512;  // GNU b2sum defaults to the full BLAKE2b width.
   bool binary_mode = true;
   bool check_mode = false;
   bool text_mode = false;
@@ -83,212 +88,175 @@ struct Config {
   bool tag = false;
   bool zero = false;
   bool strict = false;
-  std::string check_file;
+  bool ignore_missing = false;
   SmallVector<std::string, 64> files;
 };
 
 auto build_config(const CommandContext<B2SUM_OPTIONS.size()>& ctx)
     -> cp::Result<Config> {
   Config cfg;
+  cfg.text_mode = ctx.get<bool>("--text", false) || ctx.get<bool>("-t", false);
+#ifdef _WIN32
+  cfg.binary_mode = !cfg.text_mode;  // Binary mode is default on Windows
+#else
   cfg.binary_mode =
       ctx.get<bool>("--binary", false) || ctx.get<bool>("-b", false);
+#endif
 
   auto length_opt = ctx.get<std::string>("--length", "");
   if (length_opt.empty()) {
     length_opt = ctx.get<std::string>("-l", "");
   }
   if (!length_opt.empty()) {
-    try {
-      cfg.digest_bits = std::stoi(length_opt);
-      if (cfg.digest_bits != 128 && cfg.digest_bits != 256 &&
-          cfg.digest_bits != 384 && cfg.digest_bits != 512) {
-        return std::unexpected(
-            "digest length must be 128, 256, 384, or 512 bits");
-      }
-    } catch (...) {
+    auto [ptr, ec] =
+        std::from_chars(length_opt.data(),
+                        length_opt.data() + length_opt.size(), cfg.digest_bits);
+    if (ec != std::errc() || ptr != length_opt.data() + length_opt.size()) {
       return std::unexpected("invalid digest length");
+    }
+    if (cfg.digest_bits <= 0 || cfg.digest_bits > 512 ||
+        cfg.digest_bits % 8 != 0) {
+      return std::unexpected(
+          "digest length must be a positive multiple of 8 and at most 512 "
+          "bits");
     }
   }
 
-  auto check_opt = ctx.get<std::string>("--check", "");
-  if (check_opt.empty()) {
-    check_opt = ctx.get<std::string>("-c", "");
-  }
-  cfg.check_mode = !check_opt.empty();
-  if (cfg.check_mode) {
-    cfg.check_file = check_opt;
+  cfg.check_mode =
+      ctx.get<bool>("--check", false) || ctx.get<bool>("-c", false);
+  cfg.tag = ctx.get<bool>("--tag", false);
+  cfg.zero = ctx.get<bool>("--zero", false) || ctx.get<bool>("-z", false);
+  cfg.strict = ctx.get<bool>("--strict", false);
+  cfg.ignore_missing = ctx.get<bool>("--ignore-missing", false);
+
+  // [GNU] the last of --status/--warn/--quiet wins and resets the other two
+  // (getopt cases STATUS_OPTION/'w'/QUIET_OPTION in src/cksum.c).
+  for (const auto& occurrence : ctx.options.occurrences()) {
+    const auto& meta = (*ctx.metas)[occurrence.index];
+    if (meta.long_name == "--status") {
+      cfg.status = true;
+      cfg.warn = false;
+      cfg.quiet = false;
+    } else if (meta.long_name == "--warn") {
+      cfg.status = false;
+      cfg.warn = true;
+      cfg.quiet = false;
+    } else if (meta.long_name == "--quiet") {
+      cfg.status = false;
+      cfg.warn = false;
+      cfg.quiet = true;
+    }
   }
 
-  cfg.text_mode = ctx.get<bool>("--text", false) || ctx.get<bool>("-t", false);
-  cfg.quiet = ctx.get<bool>("--quiet", false) || ctx.get<bool>("-q", false);
-  cfg.status = ctx.get<bool>("--status", false) || ctx.get<bool>("-s", false);
-  cfg.warn = ctx.get<bool>("--warn", false) || ctx.get<bool>("-w", false);
-  cfg.tag = ctx.get<bool>("--tag", false);
-  cfg.zero = ctx.get<bool>("--zero", false);
-  cfg.strict = ctx.get<bool>("--strict", false);
+  // [GNU] option-conflict checks, in src/cksum.c main() order.
+  const bool mode_seen = ctx.has("-b") || ctx.has("--binary") ||
+                         ctx.has("-t") || ctx.has("--text");
+  if (cfg.zero && cfg.check_mode) {
+    return std::unexpected(
+        "the --zero option is not supported when verifying checksums");
+  }
+  if (cfg.tag && cfg.check_mode) {
+    return std::unexpected(
+        "the --tag option is meaningless when verifying checksums");
+  }
+  if (mode_seen && cfg.check_mode) {
+    return std::unexpected(
+        "the --binary and --text options are meaningless when verifying "
+        "checksums");
+  }
+  if (cfg.ignore_missing && !cfg.check_mode) {
+    return std::unexpected(
+        "the --ignore-missing option is meaningful only when verifying "
+        "checksums");
+  }
+  if (cfg.status && !cfg.check_mode) {
+    return std::unexpected(
+        "the --status option is meaningful only when verifying checksums");
+  }
+  if (cfg.warn && !cfg.check_mode) {
+    return std::unexpected(
+        "the --warn option is meaningful only when verifying checksums");
+  }
+  if (cfg.quiet && !cfg.check_mode) {
+    return std::unexpected(
+        "the --quiet option is meaningful only when verifying checksums");
+  }
+  if (cfg.strict && !cfg.check_mode) {
+    return std::unexpected(
+        "the --strict option is meaningful only when verifying checksums");
+  }
+  if (cfg.tag && cfg.text_mode) {
+    return std::unexpected("--tag does not support --text mode");
+  }
 
   for (auto arg : ctx.positionals) {
     std::string file_arg(arg);
-    if (contains_wildcard(file_arg)) {
-      auto glob_result = glob_expand(file_arg);
-      if (glob_result.expanded) {
-        for (const auto& file : glob_result.files) {
-          cfg.files.push_back(wstring_to_utf8(file));
-        }
-        continue;
-      }
+    for (const auto& file : expand_file_operand(file_arg)) {
+      cfg.files.push_back(file);
     }
-    cfg.files.push_back(file_arg);
   }
 
-  if (cfg.files.empty() && !cfg.check_mode) {
+  // [GNU] with no FILE operand both modes default to standard input.
+  if (cfg.files.empty()) {
     cfg.files.push_back("-");
   }
 
   return cfg;
 }
 
-// Calculate hash using CNG API (SHA512 as BLAKE2-512 placeholder)
-auto calculate_hash(const std::string& filename, bool text_mode = false)
-    -> cp::Result<std::string> {
-  BCRYPT_ALG_HANDLE hAlg = NULL;
-  BCRYPT_HASH_HANDLE hHash = NULL;
-  NTSTATUS status;
+auto input_open_error(const std::string& filename) -> std::string {
+  return filename + ": " + portable_digest::open_error_reason(filename);
+}
 
-  // Open SHA512 algorithm provider (using CNG API)
-  status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA512_ALGORITHM, NULL, 0);
-  if (!BCRYPT_SUCCESS(status)) {
-    return std::unexpected("failed to open SHA512 algorithm provider");
-  }
-
-  // Get hash object size
-  DWORD hash_object_size = 0;
-  DWORD data_size = 0;
-  status =
-      BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&hash_object_size,
-                        sizeof(DWORD), &data_size, 0);
-  if (!BCRYPT_SUCCESS(status)) {
-    BCryptCloseAlgorithmProvider(hAlg, 0);
-    return std::unexpected("failed to get hash object size");
-  }
-
-  // Allocate hash object
-  std::vector<BYTE> hash_object(hash_object_size);
-
-  // Create hash handle
-  status = BCryptCreateHash(hAlg, &hHash, hash_object.data(), hash_object_size,
-                            NULL, 0, 0);
-  if (!BCRYPT_SUCCESS(status)) {
-    BCryptCloseAlgorithmProvider(hAlg, 0);
-    return std::unexpected("failed to create hash handle");
-  }
-
-  // Hash the data
-  if (filename == "-" || filename.empty()) {
-    // Read from stdin
-    std::array<char, 8192> buffer;
-    size_t bytes_read;
-    while ((bytes_read = fread(buffer.data(), 1, buffer.size(), stdin)) > 0) {
-      status = BCryptHashData(hHash, reinterpret_cast<PUCHAR>(buffer.data()),
-                              static_cast<ULONG>(bytes_read), 0);
-      if (!BCRYPT_SUCCESS(status)) {
-        BCryptDestroyHash(hHash);
-        BCryptCloseAlgorithmProvider(hAlg, 0);
-        return std::unexpected("failed to hash data");
-      }
-    }
-  } else {
-    // Read from file (binary mode by default, text mode if --text)
-    std::ifstream file(filename, text_mode ? std::ios::in : std::ios::binary);
-    if (!file) {
-      BCryptDestroyHash(hHash);
-      BCryptCloseAlgorithmProvider(hAlg, 0);
-      return std::unexpected(std::string("cannot open '") + filename +
-                             "' for reading");
-    }
-
-    std::array<char, 8192> buffer;
-    while (file) {
-      file.read(buffer.data(), buffer.size());
-      std::streamsize bytes_read = file.gcount();
-      if (bytes_read > 0) {
-        status = BCryptHashData(hHash, reinterpret_cast<PUCHAR>(buffer.data()),
-                                static_cast<ULONG>(bytes_read), 0);
-        if (!BCRYPT_SUCCESS(status)) {
-          BCryptDestroyHash(hHash);
-          BCryptCloseAlgorithmProvider(hAlg, 0);
-          return std::unexpected("failed to hash data");
-        }
-      }
-    }
-    if (file.fail() && !file.eof()) {
-      BCryptDestroyHash(hHash);
-      BCryptCloseAlgorithmProvider(hAlg, 0);
-      return std::unexpected("error reading from file");
-    }
-  }
-
-  // Get hash length
-  DWORD hash_len = 0;
-  status = BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, (PUCHAR)&hash_len,
-                             sizeof(DWORD), &data_size, 0);
-  if (!BCRYPT_SUCCESS(status)) {
-    BCryptDestroyHash(hHash);
-    BCryptCloseAlgorithmProvider(hAlg, 0);
-    return std::unexpected("failed to get hash length");
-  }
-
-  // Get hash value
-  std::vector<BYTE> hash_value(hash_len);
-  status = BCryptFinishHash(hHash, hash_value.data(), hash_len, 0);
-  if (!BCRYPT_SUCCESS(status)) {
-    BCryptDestroyHash(hHash);
-    BCryptCloseAlgorithmProvider(hAlg, 0);
-    return std::unexpected("failed to finish hash");
-  }
-
-  // Cleanup
-  BCryptDestroyHash(hHash);
-  BCryptCloseAlgorithmProvider(hAlg, 0);
-
-  // Convert to hex string
-  std::string result;
-  result.reserve(hash_len * 2);
-  for (DWORD i = 0; i < hash_len; ++i) {
-    char buf[3];
-    snprintf(buf, sizeof(buf), "%02x", hash_value[i]);
-    result += buf;
-  }
-
-  return result;
+auto calculate_hash(const std::string& filename, bool text_mode = false,
+                    size_t digest_bytes = 64) -> cp::Result<std::string> {
+  return portable_digest::hash_file_hex(portable_digest::HashAlgorithm::Blake2b,
+                                        filename, text_mode, digest_bytes);
 }
 
 auto run(const Config& cfg) -> int {
   if (cfg.check_mode) {
-    // Check mode (not fully implemented)
-    // strict mode: when implemented, exit non-zero for any invalid input
-    cp::report_custom_error(
-        L"b2sum", L"check mode is not fully implemented in this version");
-    return 1;
+    // [GNU] digest_check() over every check FILE operand ("-" = stdin);
+    // digest length is auto-detected per line like GNU b2sum.
+    portable_digest::SumCheckFlags flags{
+        .status_only = cfg.status,
+        .quiet = cfg.quiet,
+        .warn = cfg.warn,
+        .strict = cfg.strict,
+        .ignore_missing = cfg.ignore_missing,
+    };
+    auto hash_fn = [](const std::string& filename, size_t digest_bytes) {
+      return calculate_hash(filename, false, digest_bytes);
+    };
+    return portable_digest::sum_check_main(
+        "b2sum", "BLAKE2b", 0, flags,
+        std::span<const std::string>(cfg.files.data(), cfg.files.size()),
+        hash_fn);
   }
 
   bool all_ok = true;
-
   for (const auto& file : cfg.files) {
-    auto hash_result = calculate_hash(file, cfg.text_mode);
+    auto hash_result = calculate_hash(file, cfg.text_mode,
+                                      static_cast<size_t>(cfg.digest_bits / 8));
     if (!hash_result) {
       cp::report_error(hash_result, L"b2sum");
       all_ok = false;
       continue;
     }
 
-    // Output format: HASH  FILENAME (or BSD-style if --tag)
-    const char* term = cfg.zero ? "\0" : "\n";
+    // GNU/MSYS defaults to binary marker on Windows; --text uses a space.
+    std::string output;
     if (cfg.tag) {
-      safePrint("BLAKE2 (" + file + ") = " + *hash_result + term);
+      std::string tag = "BLAKE2b";
+      if (cfg.digest_bits < 512) {
+        tag += "-" + std::to_string(cfg.digest_bits);
+      }
+      output = tag + " (" + file + ") = " + *hash_result;
     } else {
-      safePrint(*hash_result + "  " + file + term);
+      output = *hash_result + (cfg.binary_mode ? " *" : "  ") + file;
     }
+    output.push_back(cfg.zero ? '\0' : '\n');
+    safePrint(output);
   }
 
   return all_ok ? 0 : 1;
@@ -302,9 +270,8 @@ REGISTER_COMMAND(
     "\n"
     "With no FILE, or when FILE is -, read standard input.\n"
     "\n"
-    "Note: Windows CNG API doesn't support BLAKE2 natively in all versions.\n"
-    "This implementation uses CNG API with SHA512 as a fallback,\n"
-    "providing the same 512-bit hash length as BLAKE2-512.",
+    "Uses WinuxCmd's portable BLAKE2b implementation, matching GNU b2sum's "
+    "default 512-bit digest and --length truncation behavior.",
     "  b2sum file.txt\n"
     "  echo \"test\" | b2sum\n"
     "  b2sum *.txt > checksums.b2",
@@ -315,6 +282,7 @@ REGISTER_COMMAND(
   auto cfg_result = build_config(ctx);
   if (!cfg_result) {
     cp::report_error(cfg_result, L"b2sum");
+    safeErrorPrintLn("Try 'b2sum --help' for more information.");
     return 1;
   }
 

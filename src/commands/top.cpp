@@ -142,6 +142,7 @@ struct TopConfig {
   int max_iterations = -1;
   SortField sort_field = SortField::CPU;
   bool should_exit = false;
+  int rows = 0;
 
   // Runtime interactive options
   bool show_full_command = false;
@@ -149,26 +150,50 @@ struct TopConfig {
   bool ignore_idle = false;
   std::string user_filter;
   int selected_pid = 0;
+
+  // CLI-only options
+  std::set<DWORD> pid_filter;  // [EXT] -p, --pid
+  bool secure_mode = false;    // [EXT] -s, --secure-mode
+  int output_width = 0;        // [EXT] -w, --width
 };
 
 /**
  * @brief TOP command options
  */
 constexpr auto TOP_OPTIONS = std::array{
+    // [EXT] -b, --batch
     OPTION("-b", "--batch",
            "batch mode: don't accept input, run until -n iterations"),
-    OPTION("-d", "--delay", "delay between updates, in seconds"),
-    OPTION("-n", "--iterations", "number of iterations before exiting"),
-    OPTION("-p", "--pid", "monitor only processes with given PIDs"),
-    OPTION("-u", "--user", "monitor only processes with given user"),
-    OPTION("-U", "--User", "monitor only processes with real user ID/name"),
+    // [EXT] -d, --delay
+    OPTION("-d", "--delay", "delay between updates, in seconds", INT_TYPE),
+    // [EXT] -n, --iterations
+    OPTION("-n", "--iterations", "number of iterations before exiting",
+           INT_TYPE),
+    // [EXT] -p, --pid
+    OPTION("-p", "--pid", "monitor only processes with given PIDs",
+           STRING_TYPE),
+    // [EXT] -u, --user
+    OPTION("-u", "--user", "monitor only processes with given user",
+           STRING_TYPE),
+    // [EXT] -U, --User
+    OPTION("-U", "--User", "monitor only processes with real user ID/name",
+           STRING_TYPE),
+    // [EXT] -s, --secure-mode
     OPTION("-s", "--secure-mode", "secure mode: disables some features"),
+    // [EXT] -c, --command
     OPTION("-c", "--command", "show command line instead of process name"),
+    // [EXT] -H, --threads
     OPTION("-H", "--threads", "show threads as if they were processes"),
-    OPTION("-o", "--field-sort", "override sort field"),
-    OPTION("-w", "--width", "override output width"),
+    // [EXT] -o, --field-sort
+    OPTION("-o", "--field-sort", "override sort field", STRING_TYPE),
+    // [EXT] -w, --width
+    OPTION("-w", "--width", "override output width", INT_TYPE),
+    // [EXT] --rows
+    OPTION("", "--rows", "limit number of processes displayed", INT_TYPE),
+    // [EXT] -v, --version
     OPTION("-v", "--version", "print version information"),
-    OPTION("-h", "--help", "display this help")};
+    // [EXT] --help
+    OPTION("", "--help", "display this help")};
 
 // ======================================================
 // Helper Functions
@@ -365,11 +390,10 @@ class ProcessEnumerator {
   }
 
   auto getPreviousSnapshot() const -> const std::vector<ProcessInfo>& {
-    return previous_snapshot_;
+    return current_snapshot_;
   }
 
   auto updateSnapshot(const std::vector<ProcessInfo>& snapshot) -> void {
-    previous_snapshot_ = current_snapshot_;
     current_snapshot_ = snapshot;
   }
 
@@ -389,7 +413,7 @@ class ProcessEnumerator {
 
     // Build PID -> previous info map
     std::unordered_map<DWORD, ProcessInfo> prev_map;
-    for (const auto& proc : previous_snapshot_) {
+    for (const auto& proc : current_snapshot_) {
       prev_map[proc.pid] = proc;
     }
 
@@ -408,7 +432,6 @@ class ProcessEnumerator {
 
  private:
   std::vector<ProcessInfo> current_snapshot_;
-  std::vector<ProcessInfo> previous_snapshot_;
 };
 
 // ======================================================
@@ -647,6 +670,13 @@ class DisplayManager {
     // Filter processes
     std::vector<ProcessInfo> filtered_processes;
     for (const auto& proc : processes) {
+      // [EXT] -p, --pid: PID filter
+      if (!cfg.pid_filter.empty()) {
+        if (cfg.pid_filter.find(proc.pid) == cfg.pid_filter.end()) {
+          continue;
+        }
+      }
+
       // User filter
       if (!cfg.user_filter.empty()) {
         if (proc.username != cfg.user_filter) {
@@ -755,7 +785,9 @@ class DisplayManager {
       CONSOLE_SCREEN_BUFFER_INFO currCsbi;
       GetConsoleScreenBufferInfo(hConsole_, &currCsbi);
       int currentLineLength = currCsbi.dwCursorPosition.X;
-      int remainingWidth = csbi.dwSize.X - currentLineLength - 1;
+      int effectiveWidth =
+          (cfg.output_width > 0) ? cfg.output_width : csbi.dwSize.X;
+      int remainingWidth = effectiveWidth - currentLineLength - 1;
 
       if (remainingWidth > 0 &&
           cmd_to_display.length() > static_cast<size_t>(remainingWidth)) {
@@ -827,24 +859,10 @@ auto parse_config(const CommandContext<TOP_OPTIONS.size()>& ctx)
   cfg.batch_mode =
       ctx.get<bool>("--batch", false) || ctx.get<bool>("-b", false);
 
-  std::string delay_str = ctx.get<std::string>("--delay", "");
-  if (delay_str.empty()) delay_str = ctx.get<std::string>("-d", "");
-  if (!delay_str.empty()) {
-    try {
-      cfg.delay = std::stoi(delay_str);
-    } catch (...) {
-    }
-    if (cfg.delay < 1) cfg.delay = 1;
-  }
+  cfg.delay = ctx.get<int>("--delay", cfg.delay);
+  if (cfg.delay < 1) cfg.delay = 1;
 
-  std::string iter_str = ctx.get<std::string>("--iterations", "");
-  if (iter_str.empty()) iter_str = ctx.get<std::string>("-n", "");
-  if (!iter_str.empty()) {
-    try {
-      cfg.max_iterations = std::stoi(iter_str);
-    } catch (...) {
-    }
-  }
+  cfg.max_iterations = ctx.get<int>("--iterations", cfg.max_iterations);
 
   std::string sort_str = ctx.get<std::string>("--field-sort", "");
   if (sort_str.empty()) sort_str = ctx.get<std::string>("-o", "");
@@ -861,29 +879,114 @@ auto parse_config(const CommandContext<TOP_OPTIONS.size()>& ctx)
       cfg.sort_field = SortField::NAME;
   }
 
+  cfg.rows = ctx.get<int>("--rows", 0);
+  if (cfg.rows < 0) cfg.rows = 0;
+
+  // [EXT] -p, --pid: filter by PIDs (comma-separated)
+  std::string pid_str = ctx.get<std::string>("--pid", "");
+  if (pid_str.empty()) pid_str = ctx.get<std::string>("-p", "");
+  if (!pid_str.empty()) {
+    std::istringstream iss(pid_str);
+    std::string token;
+    while (std::getline(iss, token, ',')) {
+      DWORD pid = static_cast<DWORD>(std::stoul(token));
+      cfg.pid_filter.insert(pid);
+    }
+  }
+
+  // [EXT] -u, --user: filter by user name
+  std::string user_str = ctx.get<std::string>("--user", "");
+  if (user_str.empty()) user_str = ctx.get<std::string>("-u", "");
+  if (!user_str.empty()) {
+    cfg.user_filter = user_str;
+  }
+
+  // [EXT] -U, --User: filter by real user ID/name (same as -u on Windows)
+  std::string user_real_str = ctx.get<std::string>("--User", "");
+  if (user_real_str.empty()) user_real_str = ctx.get<std::string>("-U", "");
+  if (!user_real_str.empty()) {
+    cfg.user_filter = user_real_str;
+  }
+
+  // [EXT] -s, --secure-mode: disable interactive kill/renice
+  cfg.secure_mode =
+      ctx.get<bool>("--secure-mode", false) || ctx.get<bool>("-s", false);
+
+  // [EXT] -c, --command: show command line instead of process name
+  cfg.show_full_command =
+      ctx.get<bool>("--command", false) || ctx.get<bool>("-c", false);
+
+  // [EXT] -H, --threads: show threads as if they were processes
+  cfg.show_threads =
+      ctx.get<bool>("--threads", false) || ctx.get<bool>("-H", false);
+
+  // [EXT] -w, --width: override output width
+  cfg.output_width = ctx.get<int>("--width", 0);
+  if (cfg.output_width <= 0) cfg.output_width = ctx.get<int>("-w", 0);
+
   return cfg;
 }
 
 // 2. Check for help or version
 auto check_help_version(const CommandContext<TOP_OPTIONS.size()>& ctx)
     -> cp::Result<bool> {
-  if (ctx.get<bool>("--help", false) || ctx.get<bool>("-h", false)) {
-    safePrint("Usage: top [options]\n");
-    safePrint("  -b, --batch        Batch mode\n");
-    safePrint("  -d, --delay DELAY  Update interval (default: 3s)\n");
-    safePrint("  -n, --iterations N Exit after N iterations\n");
-    safePrint("  -o, --field-sort F Sort by CPU|MEM|TIME|PID|NAME\n");
-    safePrint("  -h, --help         Show help\n");
-    safePrint("  -v, --version      Show version\n");
+  if (ctx.get<bool>("--help", false)) {
+    const std::string help =
+        "Usage: top [options]\n"
+        "  -b, --batch        Batch mode\n"
+        "  -c, --command      Show command line instead of process name\n"
+        "  -d, --delay DELAY  Update interval (default: 3s)\n"
+        "  -H, --threads      Show threads as if they were processes\n"
+        "  -n, --iterations N Exit after N iterations\n"
+        "  -o, --field-sort F Sort by CPU|MEM|TIME|PID|NAME\n"
+        "  -p, --pid PIDS     Monitor only comma-separated PIDs\n"
+        "  -s, --secure-mode  Secure mode (disables kill/renice)\n"
+        "  -u, --user USER    Monitor only processes with given user\n"
+        "  -U, --User USER    Monitor only by real user ID/name\n"
+        "  -w, --width WIDTH  Override output width\n"
+        "      --rows N       Limit number of displayed processes\n"
+        "      --help         Show help\n"
+        "  -v, --version      Show version\n";
+    safePrint(cmd::meta::format_custom_help(
+        "top", winux::i18n::translate("command.top.custom_help", help)));
     return true;  // Should exit
   }
 
+  // [EXT] -v, --version: print version information
   if (ctx.get<bool>("--version", false) || ctx.get<bool>("-v", false)) {
     safePrint("top (WinuxCmd) 0.1.0\n");
+    safePrint("Copyright (c) 2026 WinuxCmd\n");
     return true;  // Should exit
   }
 
   return false;  // Continue
+}
+
+auto parse_priority_class(std::string value) -> std::optional<DWORD> {
+  std::transform(
+      value.begin(), value.end(), value.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+  if (value == "idle") return IDLE_PRIORITY_CLASS;
+  if (value == "below" || value == "below_normal")
+    return BELOW_NORMAL_PRIORITY_CLASS;
+  if (value == "normal") return NORMAL_PRIORITY_CLASS;
+  if (value == "above" || value == "above_normal")
+    return ABOVE_NORMAL_PRIORITY_CLASS;
+  if (value == "high") return HIGH_PRIORITY_CLASS;
+  if (value == "realtime" || value == "real-time")
+    return REALTIME_PRIORITY_CLASS;
+
+  char* end = nullptr;
+  const long numeric = std::strtol(value.c_str(), &end, 10);
+  if (end == value.c_str()) return std::nullopt;
+
+  if (numeric <= 3) return IDLE_PRIORITY_CLASS;
+  if (numeric <= 6) return BELOW_NORMAL_PRIORITY_CLASS;
+  if (numeric <= 10) return NORMAL_PRIORITY_CLASS;
+  if (numeric <= 13) return ABOVE_NORMAL_PRIORITY_CLASS;
+  if (numeric <= 23) return HIGH_PRIORITY_CLASS;
+  return REALTIME_PRIORITY_CLASS;
 }
 
 // 3. Run top main loop
@@ -893,10 +996,11 @@ auto run_top(TopConfig& cfg) -> cp::Result<bool> {
   DisplayManager display;
 
   CPUSnapshot prev_cpu = monitor.getCPUSnapshot();
-  auto processes = enumerator.enumerate(cfg.show_threads);
-  enumerator.updateSnapshot(processes);
+  auto previous_processes = enumerator.enumerate(cfg.show_threads);
+  enumerator.updateSnapshot(previous_processes);
   Sleep(500);
   CPUSnapshot curr_cpu = monitor.getCPUSnapshot();
+  auto processes = enumerator.enumerate(cfg.show_threads);
 
   SystemStats stats = monitor.getSystemStats();
   enumerator.calculateCPUUsage(processes, prev_cpu, curr_cpu,
@@ -905,6 +1009,7 @@ auto run_top(TopConfig& cfg) -> cp::Result<bool> {
   stats.cpu_usage = monitor.calculateSystemCPUUsage(prev_cpu, curr_cpu);
   stats.total_processes = static_cast<DWORD>(processes.size());
   stats.running_processes = 1;
+  enumerator.updateSnapshot(processes);
 
   char hostname[256] = "localhost";
   gethostname(hostname, sizeof(hostname));
@@ -921,8 +1026,10 @@ auto run_top(TopConfig& cfg) -> cp::Result<bool> {
       display.setCursorPos(0, 0);
     }
 
+    const size_t display_rows =
+        cfg.rows > 0 ? static_cast<size_t>(cfg.rows) : 50;
     display.printHeader(stats, hostname, cfg.delay);
-    display.printProcessList(processes, stats, 50, cfg);
+    display.printProcessList(processes, stats, display_rows, cfg);
 
     if (!cfg.batch_mode) {
       for (int i = 0; i < cfg.delay * 10 && running; ++i) {
@@ -982,6 +1089,12 @@ auto run_top(TopConfig& cfg) -> cp::Result<bool> {
             }
 
             case 'K': {
+              // [EXT] -s, --secure-mode: disable kill
+              if (cfg.secure_mode) {
+                safePrint("\nKill disabled in secure mode.\n");
+                Sleep(1000);
+                break;
+              }
               safePrint("\nEnter PID to kill: ");
               char input[32];
               if (fgets(input, sizeof(input), stdin)) {
@@ -1003,17 +1116,31 @@ auto run_top(TopConfig& cfg) -> cp::Result<bool> {
             }
 
             case 'R': {
+              // [EXT] -s, --secure-mode: disable renice
+              if (cfg.secure_mode) {
+                safePrint("\nRenice disabled in secure mode.\n");
+                Sleep(1000);
+                break;
+              }
               safePrint("\nEnter PID to renice: ");
               char input[32];
               if (fgets(input, sizeof(input), stdin)) {
                 DWORD pid = atoi(input);
-                safePrint("Enter priority (0-31, lower is higher): ");
+                safePrint(
+                    "Enter priority (idle, below, normal, above, high, "
+                    "realtime, or 0-31): ");
                 if (fgets(input, sizeof(input), stdin)) {
-                  int priority = atoi(input);
+                  input[strcspn(input, "\n")] = '\0';
+                  auto priority = parse_priority_class(input);
+                  if (!priority) {
+                    safePrint("Invalid priority.\n");
+                    Sleep(2000);
+                    break;
+                  }
                   HANDLE hProcess =
                       OpenProcess(PROCESS_SET_INFORMATION, FALSE, pid);
                   if (hProcess) {
-                    if (SetPriorityClass(hProcess, priority)) {
+                    if (SetPriorityClass(hProcess, *priority)) {
                       safePrint("Priority changed successfully.\n");
                     } else {
                       safePrint("Failed to change priority.\n");
@@ -1046,7 +1173,7 @@ auto run_top(TopConfig& cfg) -> cp::Result<bool> {
             display.clearScreen();
             display.setCursorPos(0, 0);
             display.printHeader(stats, hostname, cfg.delay);
-            display.printProcessList(processes, stats, 50, cfg);
+            display.printProcessList(processes, stats, display_rows, cfg);
           }
         }
         Sleep(100);
@@ -1114,7 +1241,8 @@ REGISTER_COMMAND(
     "  top                      Show all processes\n"
     "  top -d 5                 Refresh every 5 seconds\n"
     "  top -n 10                Exit after 10 iterations\n"
-    "  top -p 1234,5678         Monitor specific PIDs",
+    "  top -p 1234,5678         Monitor specific PIDs\n"
+    "  top -o MEM --rows 12     Show the largest memory consumers",
     /* see_also */ "ps(1), kill(1), nice(1)",
     /* author */ "caomengxuan666",
     /* copyright */ "Copyright © 2026 WinuxCmd",

@@ -20,22 +20,44 @@ using cmd::meta::OptionType;
 // ======================================================
 
 auto constexpr SED_OPTIONS = std::array{
+    // [GNU]
     OPTION("-n", "--quiet", "suppress automatic printing of pattern space"),
+    // [GNU]
     OPTION("", "--silent", "alias for -n"),
+    // [GNU]
     OPTION("-s", "--separate",
            "consider files as separate rather than as a single continuous "
            "long stream"),
+    // [GNU]
     OPTION("-z", "--null-data", "separate lines by NUL characters"),
+    // [GNU]
     OPTION("", "--zero-terminated", "alias for -z"),
+    // [GNU]
     OPTION("-u", "--unbuffered", "buffer input and output minimally"),
+    // [DIFFERS]
     OPTION("-b", "--binary", "open files in binary mode"),
+    // [GNU]
     OPTION("-i", "--in-place", "edit files in place", OPTIONAL_STRING_TYPE),
+    // [GNU]
     OPTION("-e", "--expression",
            "add the script to the commands to be executed", STRING_TYPE),
+    // [GNU]
     OPTION("-f", "--file", "add the script from FILE", STRING_TYPE),
+    // [GNU]
     OPTION("-l", "--line-length", "specify line-wrap length for the l command",
            INT_TYPE),
+    // [GNU]
     OPTION("-E", "--regexp-extended", "use extended regular expressions"),
+    // [DIFFERS]
+    OPTION("", "--debug", "annotate program execution (unsupported)"),
+    // [DIFFERS]
+    OPTION("", "--follow-symlinks",
+           "follow symlinks when processing in place (unsupported)"),
+    // [GNU]
+    OPTION("", "--sandbox", "restrict file system access in the script"),
+    // [GNU]
+    OPTION("", "--posix", "disable GNU extensions and follow POSIX sed"),
+    // [GNU]
     OPTION("-r", "", "alias for -E")};
 
 // ======================================================
@@ -48,49 +70,119 @@ struct Script {
   enum class Kind {
     Subst,
     Print,
+    PrintFirst,
     Delete,
+    DeleteFirst,
     Append,
     Insert,
     Change,
     Quit,
+    QuitSilent,
     LineNumber,
-    List
+    PrintFilename,
+    List,
+    Next,
+    AppendNext,
+    HoldCopyToPattern,
+    HoldAppendToPattern,
+    PatternCopyToHold,
+    PatternAppendToHold,
+    Exchange,
+    Label,
+    Branch,
+    TestBranch,
+    TestNoBranch,
+    ReadFile,
+    ReadFileLine,
+    WriteFile,
+    WriteFirstFile,
+    ClearPattern
   } kind;
-  std::regex pattern;                     // for Subst
-  std::string replacement;                // for Subst
-  bool global = false;                    // for Subst
-  size_t occurrence = 0;                  // for Subst; 0 means first/all
-  bool print_on_match = false;            // for Subst
-  bool invert_address = false;            // for address!
-  std::string text;                       // for Append/Insert/Change
-  std::array<unsigned char, 256> ymap{};  // for y///
+  portable_regex::Pattern pattern;  // for Subst
+  std::string replacement;          // for Subst
+  bool global = false;              // for Subst
+  size_t occurrence = 0;            // for Subst; 0 means first/all
+  bool print_on_match = false;      // for Subst
+  std::string subst_write_file;     // for s///w FILE
+  int quit_exit_code = 0;           // for q/Q
+  size_t list_line_length = std::numeric_limits<size_t>::max();  // for l
+  bool invert_address = false;                                   // for address!
+  std::string text;   // for Append/Insert/Change
+  std::string label;  // for :/b/t/T
+  size_t jump_index = std::numeric_limits<size_t>::max();  // for b/t/T
+  std::string file_path;                                   // for r/R/w/W
+  std::array<unsigned char, 256> ymap{};                   // for y///
   bool has_ymap = false;
   struct Address {
-    enum class Kind { None, Line, Last, Regex, Step } kind = Kind::None;
+    enum class Kind {
+      None,
+      Line,
+      Last,
+      Regex,
+      Step,
+      Relative,
+      Modulo
+    } kind = Kind::None;
     size_t line_no = 0;
     size_t step = 0;
-    std::regex regex;
+    portable_regex::Pattern regex;
   } addr1, addr2;
+  struct GroupAddress {
+    Address addr1, addr2;
+    bool invert = false;
+  };
+  std::vector<GroupAddress>
+      group_addresses;            // addresses inherited from { } groups
+  size_t group_state_offset = 0;  // first ctx.states slot owned by this script
+  std::string literal_pattern;    // for fast literal s/// substitutions
+  bool literal_substitution = false;
 };
 
 struct Config {
   bool suppress_output = false;
   bool separate_files = false;
+  bool sandbox = false;
+  bool posix = false;
   char delimiter = '\n';
   bool in_place = false;
   std::string in_place_suffix;
   size_t list_line_length = 70;
   SmallVector<Script, 32> scripts;
   SmallVector<std::string, 64> files;
-  std::regex_constants::syntax_option_type regex_syntax =
-      std::regex_constants::basic;
+  portable_regex::Syntax regex_syntax = portable_regex::Syntax::Basic;
 };
 
 struct ScriptState {
   bool range_active = false;
+  bool range_closed = false;
+  size_t range_end_line = 0;
 };
 
-auto split_lines_string(const std::string& s) -> std::vector<std::string> {
+struct LastRegex {
+  std::string pattern;
+  bool ignore_case = false;
+  bool valid = false;
+};
+
+struct ParseContext {
+  LastRegex last_regex;
+  bool at_script_start = true;
+  bool magic_silent = false;
+  bool posix = false;
+};
+
+auto trim_left_space(std::string_view v) -> std::string_view {
+  size_t b = 0;
+  while (b < v.size() && std::isspace(static_cast<unsigned char>(v[b]))) ++b;
+  return v.substr(b);
+}
+
+auto strip_trailing_cr(std::string_view v) -> std::string_view {
+  if (!v.empty() && v.back() == '\r') v.remove_suffix(1);
+  return v;
+}
+
+auto split_script_lines(std::string_view s) -> std::vector<std::string> {
   std::vector<std::string> out;
   out.reserve(s.size() / 20);  // Reserve for ~20 chars per line
   size_t start = 0;
@@ -103,10 +195,78 @@ auto split_lines_string(const std::string& s) -> std::vector<std::string> {
   return out;
 }
 
+auto normalize_text_command_body(std::string_view text) -> std::string {
+  std::string out;
+  out.reserve(text.size());
+  for (size_t i = 0; i < text.size(); ++i) {
+    char c = text[i];
+    if (c != '\\' || i + 1 >= text.size()) {
+      out.push_back(c);
+      continue;
+    }
+
+    char next = text[++i];
+    switch (next) {
+      case 'a':
+        out.push_back('\a');
+        break;
+      case 'f':
+        out.push_back('\f');
+        break;
+      case 'n':
+        out.push_back('\n');
+        break;
+      case 'r':
+        out.push_back('\r');
+        break;
+      case 't':
+        out.push_back('\t');
+        break;
+      case 'v':
+        out.push_back('\v');
+        break;
+      default:
+        out.push_back(next);
+        break;
+    }
+  }
+  return out;
+}
+
+auto has_text_line_continuation(std::string_view text) -> bool {
+  size_t slash_count = 0;
+  for (size_t i = text.size(); i > 0 && text[i - 1] == '\\'; --i) {
+    ++slash_count;
+  }
+  return (slash_count % 2) == 1;
+}
+
+// Defined below with the rest of the script splitter; declared here so the
+// a/i/c text commands in parse_simple_cmd can normalize multi-line bodies.
+auto normalize_text_body_full(std::string_view raw) -> std::string;
+
+auto is_literal_substitution_pattern(std::string_view pattern,
+                                     portable_regex::Syntax syntax) -> bool {
+  if (pattern.empty()) return false;
+
+  const std::string_view bre_meta = ".^$*[\\";
+  const std::string_view ere_meta = ".^$*+?()[{|\\";
+  const auto meta =
+      syntax == portable_regex::Syntax::Extended ? ere_meta : bre_meta;
+  for (char ch : pattern) {
+    if (meta.find(ch) != std::string_view::npos) return false;
+  }
+  return true;
+}
+
+auto is_literal_replacement(std::string_view replacement) -> bool {
+  return replacement.find('&') == std::string_view::npos &&
+         replacement.find('\\') == std::string_view::npos;
+}
+
 // parse s/pat/repl/flags
-auto parse_subst(std::string_view expr,
-                 std::regex_constants::syntax_option_type syntax)
-    -> cp::Result<Script> {
+auto parse_subst(std::string_view expr, portable_regex::Syntax syntax,
+                 ParseContext& parse_context) -> cp::Result<Script> {
   if (expr.size() < 4 || expr[0] != 's')
     return std::unexpected("unsupported script (only s///)");
   char delim = expr[1];
@@ -147,6 +307,7 @@ auto parse_subst(std::string_view expr,
 
   bool g = false, pflag = false, ignore_case = false;
   size_t occurrence = 0;
+  std::string write_file;
   for (; i < expr.size(); ++i) {
     char f = expr[i];
     if (f == 'g') {
@@ -154,7 +315,17 @@ auto parse_subst(std::string_view expr,
     } else if (f == 'p') {
       pflag = true;
     } else if (f == 'I' || f == 'i') {
+      if (parse_context.posix) {
+        return std::unexpected("POSIX sed rejects GNU substitution modifiers");
+      }
       ignore_case = true;
+    } else if (f == 'w') {
+      std::string_view path = trim_left_space(expr.substr(i + 1));
+      if (path.empty()) {
+        return std::unexpected("missing filename in s command w flag");
+      }
+      write_file = std::string(path);
+      break;
     } else if (std::isdigit(static_cast<unsigned char>(f)) != 0) {
       size_t start = i;
       while (i < expr.size() &&
@@ -176,66 +347,206 @@ auto parse_subst(std::string_view expr,
     }
   }
 
-  try {
-    Script s;
-    s.kind = Script::Kind::Subst;
-    auto effective_syntax = syntax;
-    if (ignore_case) effective_syntax |= std::regex_constants::icase;
-    s.pattern = std::regex(pat, effective_syntax);
-    s.replacement = repl;
-    s.global = g;
-    s.occurrence = occurrence;
-    s.print_on_match = pflag;
-    return s;
-  } catch (const std::regex_error&) {
+  bool effective_ignore_case = ignore_case;
+  if (pat.empty()) {
+    if (ignore_case) {
+      return std::unexpected("cannot specify modifiers on empty regexp");
+    }
+    if (!parse_context.last_regex.valid) {
+      return std::unexpected("no previous regular expression");
+    }
+    pat = parse_context.last_regex.pattern;
+    effective_ignore_case = parse_context.last_regex.ignore_case;
+  } else {
+    parse_context.last_regex.pattern = pat;
+    parse_context.last_regex.ignore_case = ignore_case;
+    parse_context.last_regex.valid = true;
+  }
+
+  auto compiled = portable_regex::compile(syntax, pat, effective_ignore_case);
+  if (!compiled) {
     return std::unexpected("invalid regular expression");
   }
+
+  Script s;
+  s.kind = Script::Kind::Subst;
+  s.pattern = std::move(compiled.pattern);
+  s.replacement = repl;
+  s.global = g;
+  s.occurrence = occurrence;
+  s.print_on_match = pflag;
+  s.subst_write_file = std::move(write_file);
+  if (!effective_ignore_case && is_literal_substitution_pattern(pat, syntax) &&
+      is_literal_replacement(repl)) {
+    s.literal_pattern = std::move(pat);
+    s.literal_substitution = true;
+  }
+  return s;
 }
 
 auto parse_simple_cmd(std::string_view line) -> cp::Result<Script> {
   if (line.empty()) return std::unexpected("empty script line");
   char c = line[0];
   std::string_view rest = line.substr(1);
-  auto trim_space = [](std::string_view v) {
-    size_t b = 0, e = v.size();
-    while (b < e && std::isspace(static_cast<unsigned char>(v[b]))) ++b;
-    while (e > b && std::isspace(static_cast<unsigned char>(v[e - 1]))) --e;
-    return v.substr(b, e - b);
+  auto text_body = [](std::string_view v) -> std::string {
+    return normalize_text_body_full(v);
   };
-  rest = trim_space(rest);
-  if (c == 'p') return Script{Script::Kind::Print, {}, {}, false, false, {}};
-  if (c == 'd') return Script{Script::Kind::Delete, {}, {}, false, false, {}};
+  auto no_extra = [&](std::string_view command_name) -> cp::Result<void> {
+    if (!trim_left_space(rest).empty()) {
+      return std::unexpected(std::string("extra characters after ") +
+                             std::string(command_name) + " command");
+    }
+    return {};
+  };
+  auto label_body = [](std::string_view v) -> std::string {
+    v = trim_left_space(v);
+    size_t end = 0;
+    while (end < v.size() &&
+           std::isspace(static_cast<unsigned char>(v[end])) == 0 &&
+           v[end] != ';' && v[end] != '}' && v[end] != '#') {
+      ++end;
+    }
+    return std::string(v.substr(0, end));
+  };
+  auto file_body = [](std::string_view v) -> std::string {
+    v = trim_left_space(v);
+    return std::string(v);
+  };
+  if (c == 'p') {
+    if (auto ok = no_extra("p"); !ok) return std::unexpected(ok.error());
+    Script s;
+    s.kind = Script::Kind::Print;
+    return s;
+  }
+  if (c == 'P') {
+    if (auto ok = no_extra("P"); !ok) return std::unexpected(ok.error());
+    Script s;
+    s.kind = Script::Kind::PrintFirst;
+    return s;
+  }
+  if (c == 'd') {
+    if (auto ok = no_extra("d"); !ok) return std::unexpected(ok.error());
+    Script s;
+    s.kind = Script::Kind::Delete;
+    return s;
+  }
+  if (c == 'D') {
+    if (auto ok = no_extra("D"); !ok) return std::unexpected(ok.error());
+    Script s;
+    s.kind = Script::Kind::DeleteFirst;
+    return s;
+  }
   if (c == '=') {
+    if (auto ok = no_extra("="); !ok) return std::unexpected(ok.error());
     Script s;
     s.kind = Script::Kind::LineNumber;
+    return s;
+  }
+  if (c == 'F') {
+    if (auto ok = no_extra("F"); !ok) return std::unexpected(ok.error());
+    Script s;
+    s.kind = Script::Kind::PrintFilename;
     return s;
   }
   if (c == 'l') {
     Script s;
     s.kind = Script::Kind::List;
+    rest = trim_left_space(rest);
+    if (!rest.empty()) {
+      size_t line_length = 0;
+      auto [ptr, ec] =
+          std::from_chars(rest.data(), rest.data() + rest.size(), line_length);
+      if (ec != std::errc() || ptr != rest.data() + rest.size()) {
+        return std::unexpected("invalid l command line length");
+      }
+      s.list_line_length = line_length;
+    }
+    return s;
+  }
+  if (c == 'n' || c == 'N') {
+    if (auto ok = no_extra(std::string_view(&c, 1)); !ok)
+      return std::unexpected(ok.error());
+    Script s;
+    s.kind = c == 'n' ? Script::Kind::Next : Script::Kind::AppendNext;
+    return s;
+  }
+  if (c == 'g' || c == 'G' || c == 'h' || c == 'H' || c == 'x' || c == 'z') {
+    if (auto ok = no_extra(std::string_view(&c, 1)); !ok)
+      return std::unexpected(ok.error());
+    Script s;
+    if (c == 'g') {
+      s.kind = Script::Kind::HoldCopyToPattern;
+    } else if (c == 'G') {
+      s.kind = Script::Kind::HoldAppendToPattern;
+    } else if (c == 'h') {
+      s.kind = Script::Kind::PatternCopyToHold;
+    } else if (c == 'H') {
+      s.kind = Script::Kind::PatternAppendToHold;
+    } else if (c == 'x') {
+      s.kind = Script::Kind::Exchange;
+    } else {
+      s.kind = Script::Kind::ClearPattern;
+    }
+    return s;
+  }
+  if (c == ':') {
+    Script s;
+    s.kind = Script::Kind::Label;
+    s.label = label_body(rest);
+    if (s.label.empty()) return std::unexpected(": command lacks a label");
+    return s;
+  }
+  if (c == 'b' || c == 't' || c == 'T') {
+    Script s;
+    s.kind = c == 'b'   ? Script::Kind::Branch
+             : c == 't' ? Script::Kind::TestBranch
+                        : Script::Kind::TestNoBranch;
+    s.label = label_body(rest);
+    return s;
+  }
+  if (c == 'r' || c == 'R' || c == 'w' || c == 'W') {
+    Script s;
+    s.kind = c == 'r'   ? Script::Kind::ReadFile
+             : c == 'R' ? Script::Kind::ReadFileLine
+             : c == 'w' ? Script::Kind::WriteFile
+                        : Script::Kind::WriteFirstFile;
+    s.file_path = file_body(rest);
+    if (s.file_path.empty()) {
+      return std::unexpected("missing filename in r/R/w/W command");
+    }
     return s;
   }
   if (c == 'q' || c == 'Q') {
     Script s;
-    s.kind = Script::Kind::Quit;
+    s.kind = c == 'Q' ? Script::Kind::QuitSilent : Script::Kind::Quit;
+    rest = trim_left_space(rest);
+    if (!rest.empty()) {
+      unsigned int exit_code = 0;
+      auto [ptr, ec] =
+          std::from_chars(rest.data(), rest.data() + rest.size(), exit_code);
+      if (ec != std::errc() || ptr != rest.data() + rest.size()) {
+        return std::unexpected("invalid q command exit code");
+      }
+      s.quit_exit_code = static_cast<int>(exit_code & 0xFFu);
+    }
     return s;
   }
   if (c == 'a') {
     Script s;
     s.kind = Script::Kind::Append;
-    s.text = std::string(rest);
+    s.text = text_body(rest);
     return s;
   }
   if (c == 'i') {
     Script s;
     s.kind = Script::Kind::Insert;
-    s.text = std::string(rest);
+    s.text = text_body(rest);
     return s;
   }
   if (c == 'c') {
     Script s;
     s.kind = Script::Kind::Change;
-    s.text = std::string(rest);
+    s.text = text_body(rest);
     return s;
   }
   return std::unexpected("unsupported script command");
@@ -291,11 +602,46 @@ auto parse_y_cmd(std::string_view line) -> cp::Result<Script> {
   return s;
 }
 
+auto parse_unsigned_at(std::string_view text, size_t& i) -> cp::Result<size_t> {
+  size_t start = i;
+  while (i < text.size() &&
+         std::isdigit(static_cast<unsigned char>(text[i])) != 0) {
+    ++i;
+  }
+  if (i == start) return std::unexpected("expected number");
+
+  size_t value = 0;
+  auto value_text = text.substr(start, i - start);
+  auto [ptr, ec] = std::from_chars(
+      value_text.data(), value_text.data() + value_text.size(), value);
+  if (ec != std::errc() || ptr != value_text.data() + value_text.size()) {
+    return std::unexpected("invalid number");
+  }
+  return value;
+}
+
 auto parse_address(std::string_view line, size_t& i,
-                   std::regex_constants::syntax_option_type syntax)
+                   portable_regex::Syntax syntax, ParseContext& parse_context,
+                   bool allow_range_extension = false)
     -> cp::Result<Script::Address> {
   Script::Address addr;
   if (i >= line.size()) return addr;
+  if (allow_range_extension && (line[i] == '+' || line[i] == '~')) {
+    if (parse_context.posix) {
+      return std::unexpected("POSIX sed rejects GNU range extensions");
+    }
+    const char range_type = line[i++];
+    auto value = parse_unsigned_at(line, i);
+    if (!value) return std::unexpected(value.error());
+    if (range_type == '+') {
+      addr.kind = Script::Address::Kind::Relative;
+      addr.line_no = *value;
+    } else {
+      addr.kind = Script::Address::Kind::Modulo;
+      addr.step = *value;
+    }
+    return addr;
+  }
   if (line[i] == '$') {
     ++i;
     addr.kind = Script::Address::Kind::Last;
@@ -307,6 +653,9 @@ auto parse_address(std::string_view line, size_t& i,
       ++i;
     auto first = std::stoul(std::string(line.substr(start, i - start)));
     if (i < line.size() && line[i] == '~') {
+      if (parse_context.posix) {
+        return std::unexpected("POSIX sed rejects GNU step addresses");
+      }
       ++i;
       size_t step_start = i;
       while (i < line.size() &&
@@ -330,8 +679,14 @@ auto parse_address(std::string_view line, size_t& i,
     addr.line_no = first;
     return addr;
   }
-  if (line[i] == '/') {
-    ++i;
+  if (line[i] == '/' || (line[i] == '\\' && i + 1 < line.size())) {
+    char delim = '/';
+    if (line[i] == '/') {
+      ++i;
+    } else {
+      ++i;
+      delim = line[i++];
+    }
     std::string pat;
     bool escape = false;
     for (; i < line.size(); ++i) {
@@ -345,20 +700,26 @@ auto parse_address(std::string_view line, size_t& i,
         escape = true;
         continue;
       }
-      if (c == '/') {
+      if (c == delim) {
         ++i;
-        auto effective_syntax = syntax;
+        bool ignore_case = false;
         if (i < line.size() && (line[i] == 'I' || line[i] == 'i')) {
-          effective_syntax |= std::regex_constants::icase;
+          if (parse_context.posix) {
+            return std::unexpected("POSIX sed rejects GNU address modifiers");
+          }
+          ignore_case = true;
           ++i;
         }
-        try {
-          addr.kind = Script::Address::Kind::Regex;
-          addr.regex = std::regex(pat, effective_syntax);
-          return addr;
-        } catch (const std::regex_error&) {
+        auto compiled = portable_regex::compile(syntax, pat, ignore_case);
+        if (!compiled) {
           return std::unexpected("invalid address regex");
         }
+        addr.kind = Script::Address::Kind::Regex;
+        addr.regex = std::move(compiled.pattern);
+        parse_context.last_regex.pattern = pat;
+        parse_context.last_regex.ignore_case = ignore_case;
+        parse_context.last_regex.valid = true;
+        return addr;
       }
       pat.push_back(c);
     }
@@ -367,142 +728,579 @@ auto parse_address(std::string_view line, size_t& i,
   return addr;
 }
 
-auto parse_script_line(std::string_view line,
-                       std::regex_constants::syntax_option_type syntax)
-    -> cp::Result<std::vector<Script>> {
-  if (!line.empty() && (line.back() == '\r')) line.remove_suffix(1);
-  if (line.empty()) return std::unexpected("empty script line");
-  auto split_commands = [](std::string_view text) {
-    std::vector<std::string> parts;
-    std::string cur;
+auto skip_split_address(std::string_view text, size_t& i,
+                        bool allow_range_extension = false) -> bool {
+  size_t pos = i;
+  while (pos < text.size() &&
+         std::isspace(static_cast<unsigned char>(text[pos]))) {
+    ++pos;
+  }
+  if (pos >= text.size()) return false;
+
+  if (allow_range_extension && (text[pos] == '+' || text[pos] == '~')) {
+    ++pos;
+    size_t start = pos;
+    while (pos < text.size() &&
+           std::isdigit(static_cast<unsigned char>(text[pos])) != 0) {
+      ++pos;
+    }
+    if (pos == start) return false;
+    i = pos;
+    return true;
+  }
+
+  if (text[pos] == '$') {
+    i = pos + 1;
+    return true;
+  }
+
+  if (std::isdigit(static_cast<unsigned char>(text[pos])) != 0) {
+    while (pos < text.size() &&
+           std::isdigit(static_cast<unsigned char>(text[pos])) != 0) {
+      ++pos;
+    }
+    if (pos < text.size() && text[pos] == '~') {
+      ++pos;
+      while (pos < text.size() &&
+             std::isdigit(static_cast<unsigned char>(text[pos])) != 0) {
+        ++pos;
+      }
+    }
+    i = pos;
+    return true;
+  }
+
+  if (text[pos] == '/' || (text[pos] == '\\' && pos + 1 < text.size())) {
+    char delim = '/';
+    if (text[pos] == '/') {
+      ++pos;
+    } else {
+      ++pos;
+      delim = text[pos++];
+    }
     bool escape = false;
-    bool in_addr = false;
-    bool in_sy = false;
-    char sy_delim = '\0';
-    int sy_parts = 0;
-    int sy_need = 0;
-    for (size_t i = 0; i < text.size(); ++i) {
-      char c = text[i];
+    for (; pos < text.size(); ++pos) {
+      char c = text[pos];
       if (escape) {
-        cur.push_back(c);
         escape = false;
         continue;
       }
       if (c == '\\') {
-        cur.push_back(c);
         escape = true;
         continue;
       }
-      if (in_sy) {
-        cur.push_back(c);
-        if (c == sy_delim) {
-          ++sy_parts;
-          if (sy_parts >= sy_need) in_sy = false;
+      if (c == delim) {
+        ++pos;
+        if (pos < text.size() && (text[pos] == 'I' || text[pos] == 'i')) {
+          ++pos;
         }
-        continue;
-      }
-      if (in_addr) {
-        cur.push_back(c);
-        if (c == '/') in_addr = false;
-        continue;
-      }
-      if (c == '/') {
-        cur.push_back(c);
-        in_addr = true;
-        continue;
-      }
-      auto cur_has_only_space = [&]() {
-        for (char ch : cur) {
-          if (!std::isspace(static_cast<unsigned char>(ch))) return false;
-        }
+        i = pos;
         return true;
-      };
-      if ((c == 's' || c == 'y') && (cur.empty() || cur_has_only_space())) {
-        cur.push_back(c);
-        if (i + 1 < text.size()) {
-          sy_delim = text[i + 1];
-          in_sy = true;
-          sy_parts = 0;
-          sy_need = 3;
-        }
-        continue;
       }
-      if (c == ';') {
-        if (!cur.empty()) {
-          parts.push_back(cur);
-          cur.clear();
-        }
-        continue;
-      }
-      cur.push_back(c);
     }
-    if (!cur.empty()) parts.push_back(cur);
-    return parts;
+  }
+
+  return false;
+}
+
+auto command_index(std::string_view part) -> size_t {
+  size_t i = 0;
+  skip_split_address(part, i);
+  while (i < part.size() && std::isspace(static_cast<unsigned char>(part[i]))) {
+    ++i;
+  }
+  if (i < part.size() && part[i] == ',') {
+    ++i;
+    if (!skip_split_address(part, i, true)) return std::string_view::npos;
+  }
+  while (i < part.size() && std::isspace(static_cast<unsigned char>(part[i]))) {
+    ++i;
+  }
+  if (i < part.size() && part[i] == '!') {
+    ++i;
+    while (i < part.size() &&
+           std::isspace(static_cast<unsigned char>(part[i]))) {
+      ++i;
+    }
+  }
+  return i;
+}
+
+auto text_command_index(std::string_view part) -> size_t {
+  size_t i = command_index(part);
+  if (i < part.size() && (part[i] == 'a' || part[i] == 'i' || part[i] == 'c')) {
+    return i;
+  }
+  return std::string_view::npos;
+}
+
+auto file_command_index(std::string_view part) -> size_t {
+  size_t i = command_index(part);
+  if (i < part.size() &&
+      (part[i] == 'r' || part[i] == 'R' || part[i] == 'w' || part[i] == 'W')) {
+    return i;
+  }
+  return std::string_view::npos;
+}
+
+// One command of a sed script, together with the addresses inherited from the
+// brace groups { ... } that enclose it.
+struct ParsedCommand {
+  std::string text;  // command text, including its own address
+  std::vector<std::string>
+      group_prefixes;  // raw address text of each enclosing group
+};
+
+// Normalize the raw body of an a/i/c text command. The body runs from the
+// character after the command to the newline that ends it; a line ending with
+// an odd number of backslashes continues onto the next line.
+auto normalize_text_body_full(std::string_view raw) -> std::string {
+  std::string out;
+  size_t pos = 0;
+  auto next_line = [&]() -> std::optional<std::string_view> {
+    if (pos >= raw.size()) return std::nullopt;
+    size_t eol = raw.find('\n', pos);
+    std::string_view frag;
+    if (eol == std::string_view::npos) {
+      frag = raw.substr(pos);
+      pos = raw.size();
+    } else {
+      frag = raw.substr(pos, eol - pos);
+      pos = eol + 1;
+    }
+    return strip_trailing_cr(frag);
   };
 
-  std::vector<Script> out;
-  for (const auto& part : split_commands(line)) {
-    size_t i = 0;
-    while (i < part.size() && std::isspace(static_cast<unsigned char>(part[i])))
-      ++i;
-    Script::Address a1, a2;
-    auto addr1 = parse_address(part, i, syntax);
-    if (!addr1) return std::unexpected(addr1.error());
-    a1 = *addr1;
-    if (i < part.size() && part[i] == ',') {
-      ++i;
-      auto addr2 = parse_address(part, i, syntax);
-      if (!addr2) return std::unexpected(addr2.error());
-      a2 = *addr2;
+  auto first = next_line();
+  if (!first) return out;
+  std::string_view body = trim_left_space(*first);
+  bool skip_first = false;
+  if (!body.empty() && body.front() == '\\') {
+    body.remove_prefix(1);
+    skip_first = body.empty();
+  }
+  bool has_prev = false;
+  for (;;) {
+    std::string_view frag;
+    if (has_prev || skip_first) {
+      auto more = next_line();
+      if (!more) return out;
+      frag = *more;
+    } else {
+      frag = body;
     }
-    while (i < part.size() && std::isspace(static_cast<unsigned char>(part[i])))
-      ++i;
-    bool invert_address = false;
-    if (i < part.size() && part[i] == '!') {
-      invert_address = true;
-      ++i;
-      while (i < part.size() &&
-             std::isspace(static_cast<unsigned char>(part[i]))) {
-        ++i;
-      }
-    }
-    std::string_view cmd = std::string_view(part).substr(i);
-    cp::Result<Script> s;
-    if (!cmd.empty() && cmd[0] == 's')
-      s = parse_subst(cmd, syntax);
-    else if (!cmd.empty() && cmd[0] == 'y')
-      s = parse_y_cmd(cmd);
-    else
-      s = parse_simple_cmd(cmd);
-    if (!s) return std::unexpected(s.error());
-    s->addr1 = a1;
-    s->addr2 = a2;
-    s->invert_address = invert_address;
-    out.push_back(*s);
+    bool continues = has_text_line_continuation(frag);
+    if (continues) frag.remove_suffix(1);
+    if (has_prev) out.push_back('\n');
+    out.append(normalize_text_command_body(frag));
+    has_prev = true;
+    if (!continues) break;
   }
   return out;
 }
 
-auto read_script_file(const std::string& path,
-                      std::regex_constants::syntax_option_type syntax)
+// Split a whole sed script into commands. Semicolons and newlines separate
+// commands; { ... } groups are supported and the address written before a { is
+// inherited by every command in that group, including groups nested inside it.
+auto split_script_commands(std::string_view text)
+    -> cp::Result<std::vector<ParsedCommand>> {
+  std::vector<ParsedCommand> parts;
+  std::string cur;
+  std::vector<std::string>
+      group_stack;  // address text of every open brace group
+  bool text_body_closed = false;
+  bool escape = false;
+  bool in_addr = false;
+  bool in_sy = false;
+  char addr_delim = '/';
+  char sy_delim = '\0';
+  int sy_parts = 0;
+  int sy_need = 0;
+
+  auto at_command_position = [&]() -> bool {
+    return command_index(cur) == cur.size();
+  };
+
+  auto finish_command = [&]() {
+    if (trim_left_space(cur).empty()) return;
+    if (at_command_position()) return;  // an address with no command
+    ParsedCommand cmd;
+    cmd.text = cur;
+    for (const auto& prefix : group_stack) {
+      if (!trim_left_space(prefix).empty())
+        cmd.group_prefixes.push_back(prefix);
+    }
+    parts.push_back(std::move(cmd));
+  };
+
+  // } closes the innermost brace group. GNU requires a group to end the line,
+  // but a run of } characters closing nested groups is allowed on one line.
+  auto close_groups_until_line_end = [&](size_t& i) -> cp::Result<void> {
+    for (;;) {
+      size_t j = i + 1;
+      // Only horizontal whitespace: the newline itself is the terminator we are
+      // looking for, so it must not be skipped here.
+      while (j < text.size() && (text[j] == ' ' || text[j] == '\t')) {
+        ++j;
+      }
+      if (j >= text.size()) return {};
+      if (text[j] == '#') {
+        while (j < text.size() && text[j] != '\n') ++j;
+        i = j;
+        continue;
+      }
+      if (text[j] == '}') {
+        if (group_stack.empty()) return std::unexpected("unexpected `}'");
+        group_stack.pop_back();
+        i = j;
+        continue;
+      }
+      // [GNU] A ';' may follow '}' and start the next command on the same
+      // line (e.g. "1{p};2{d}"). Leave the ';' for the main loop to consume
+      // as an ordinary command separator.
+      if (text[j] == ';') {
+        i = j - 1;
+        return {};
+      }
+      if (text[j] == '\n') {
+        i = j;
+        return {};
+      }
+      return std::unexpected("extra characters after command");
+    }
+  };
+
+  for (size_t i = 0; i < text.size(); ++i) {
+    char c = text[i];
+    if (escape) {
+      cur.push_back(c);
+      escape = false;
+      continue;
+    }
+    if (c == '\\' && at_command_position() && i + 1 < text.size()) {
+      cur.push_back(c);
+      cur.push_back(text[++i]);
+      addr_delim = text[i];
+      in_addr = true;
+      continue;
+    }
+    if (c == '\\') {
+      cur.push_back(c);
+      escape = true;
+      continue;
+    }
+    if (in_sy) {
+      cur.push_back(c);
+      if (c == sy_delim) {
+        ++sy_parts;
+        if (sy_parts >= sy_need) in_sy = false;
+      }
+      continue;
+    }
+    if (in_addr) {
+      cur.push_back(c);
+      if (c == addr_delim) in_addr = false;
+      continue;
+    }
+    if (c == '/') {
+      cur.push_back(c);
+      addr_delim = '/';
+      in_addr = true;
+      continue;
+    }
+    if ((c == 's' || c == 'y') && at_command_position()) {
+      cur.push_back(c);
+      if (i + 1 < text.size()) {
+        sy_delim = text[i + 1];
+        in_sy = true;
+        sy_parts = 0;
+        sy_need = 3;
+      }
+      continue;
+    }
+    if ((c == 'a' || c == 'i' || c == 'c') && at_command_position()) {
+      cur.push_back(c);
+      // The body runs from the character after the command to the end of the
+      // last text line. A line ending with an odd number of backslashes
+      // continues onto the next line. The first line is tested including the
+      // a/i/c command itself, because that is where a "a\" marker lives.
+      size_t body_start = i + 1;
+      size_t body_end = body_start;
+      size_t scan = body_start;
+      for (;;) {
+        size_t eol = text.find('\n', scan);
+        if (eol == std::string_view::npos) {
+          body_end = text.size();
+          break;
+        }
+        std::string_view line = (scan == body_start)
+                                    ? text.substr(i, eol - i)
+                                    : text.substr(scan, eol - scan);
+        body_end = eol;
+        if (!has_text_line_continuation(strip_trailing_cr(line))) break;
+        scan = eol + 1;
+      }
+      cur.append(text.substr(body_start, body_end - body_start));
+      // The body is fully consumed here, so emit this command now and start the
+      // next one fresh; otherwise the following characters would be appended
+      // to the text body.
+      finish_command();
+      cur.clear();
+      text_body_closed = false;
+      i = body_end;
+      continue;
+    }
+    if (c == '#' && trim_left_space(cur).empty()) {
+      while (i < text.size() && text[i] != '\n') ++i;
+      continue;
+    }
+    if (c == '{' && at_command_position()) {
+      group_stack.push_back(cur);
+      cur.clear();
+      text_body_closed = false;
+      continue;
+    }
+    if (c == '}' && text_command_index(cur) == std::string_view::npos &&
+        file_command_index(cur) == std::string_view::npos) {
+      finish_command();
+      cur.clear();
+      text_body_closed = false;
+      if (group_stack.empty()) return std::unexpected("unexpected `}'");
+      group_stack.pop_back();
+      auto close = close_groups_until_line_end(i);
+      if (!close) return std::unexpected(close.error());
+      continue;
+    }
+    if (c == ';' && !text_body_closed &&
+        (text_command_index(cur) != std::string_view::npos ||
+         file_command_index(cur) != std::string_view::npos)) {
+      cur.push_back(c);
+      continue;
+    }
+    if (c == ';' || c == '\n') {
+      finish_command();
+      cur.clear();
+      text_body_closed = false;
+      continue;
+    }
+    cur.push_back(c);
+  }
+  finish_command();
+  if (!group_stack.empty()) return std::unexpected("unmatched `{'");
+  return parts;
+}
+
+auto parse_group_address(std::string_view text, portable_regex::Syntax syntax,
+                         ParseContext& parse_context)
+    -> cp::Result<Script::GroupAddress> {
+  Script::GroupAddress g;
+  size_t i = 0;
+  while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i])))
+    ++i;
+  if (i >= text.size()) return std::unexpected("empty group address");
+  auto a1 = parse_address(text, i, syntax, parse_context);
+  if (!a1) return std::unexpected(a1.error());
+  g.addr1 = *a1;
+  if (i < text.size() && text[i] == ',') {
+    ++i;
+    auto a2 = parse_address(text, i, syntax, parse_context, true);
+    if (!a2) return std::unexpected(a2.error());
+    g.addr2 = *a2;
+  }
+  while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i])))
+    ++i;
+  if (i < text.size() && text[i] == '!') {
+    g.invert = true;
+    ++i;
+    while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i])))
+      ++i;
+  }
+  if (i != text.size()) return std::unexpected("invalid group address");
+  return g;
+}
+
+auto parse_script_command(const ParsedCommand& part,
+                          portable_regex::Syntax syntax,
+                          ParseContext& parse_context) -> cp::Result<Script> {
+  std::string_view text = part.text;
+  size_t i = 0;
+  while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i])))
+    ++i;
+  Script::Address a1, a2;
+  auto addr1 = parse_address(text, i, syntax, parse_context);
+  if (!addr1) return std::unexpected(addr1.error());
+  a1 = *addr1;
+  if (i < text.size() && text[i] == ',') {
+    ++i;
+    auto addr2 = parse_address(text, i, syntax, parse_context, true);
+    if (!addr2) return std::unexpected(addr2.error());
+    a2 = *addr2;
+  }
+  while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i])))
+    ++i;
+  bool invert_address = false;
+  if (i < text.size() && text[i] == '!') {
+    invert_address = true;
+    ++i;
+    while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i])))
+      ++i;
+  }
+  std::string_view cmd = text.substr(i);
+  cp::Result<Script> s;
+  if (!cmd.empty() && cmd[0] == 's') {
+    s = parse_subst(cmd, syntax, parse_context);
+  } else if (!cmd.empty() && cmd[0] == 'y') {
+    s = parse_y_cmd(cmd);
+  } else {
+    s = parse_simple_cmd(cmd);
+  }
+  if (!s) return std::unexpected(s.error());
+  if (s->kind == Script::Kind::Label &&
+      (a1.kind != Script::Address::Kind::None ||
+       a2.kind != Script::Address::Kind::None || invert_address)) {
+    return std::unexpected(": command does not accept addresses");
+  }
+  s->addr1 = a1;
+  s->addr2 = a2;
+  s->invert_address = invert_address;
+  for (const auto& prefix : part.group_prefixes) {
+    auto g = parse_group_address(prefix, syntax, parse_context);
+    if (!g) return std::unexpected(g.error());
+    s->group_addresses.push_back(std::move(*g));
+  }
+  return *s;
+}
+
+auto parse_script_text(std::string_view script, portable_regex::Syntax syntax,
+                       ParseContext& parse_context)
     -> cp::Result<std::vector<Script>> {
+  std::vector<Script> out;
+
+  // GNU sed honors the #n magic comment only when it is the first line of the
+  // whole script.
+  auto lines = split_script_lines(script);
+  if (!lines.empty() && parse_context.at_script_start) {
+    auto trimmed = trim_left_space(strip_trailing_cr(lines[0]));
+    if (trimmed.starts_with("#n")) parse_context.magic_silent = true;
+    parse_context.at_script_start = false;
+  }
+
+  auto commands = split_script_commands(script);
+  if (!commands) return std::unexpected(commands.error());
+  for (const auto& part : *commands) {
+    auto s = parse_script_command(part, syntax, parse_context);
+    if (!s) return std::unexpected(s.error());
+    out.push_back(std::move(*s));
+  }
+  return out;
+}
+
+auto read_script_file(const std::string& path) -> cp::Result<std::string> {
   std::ifstream in(path, std::ios::binary);
   if (!in.is_open())
     return std::unexpected("cannot open script file '" + path + "'");
-  std::vector<Script> out;
-  std::string line;
-  while (std::getline(in, line)) {
-    if (line.empty()) continue;
-    auto s = parse_script_line(line, syntax);
-    if (!s) return std::unexpected(s.error());
-    out.insert(out.end(), s->begin(), s->end());
+  return std::string(std::istreambuf_iterator<char>{in},
+                     std::istreambuf_iterator<char>{});
+}
+
+auto address_uses_gnu_extension(const Script::Address& addr) -> bool {
+  return addr.kind == Script::Address::Kind::Step ||
+         addr.kind == Script::Address::Kind::Relative ||
+         addr.kind == Script::Address::Kind::Modulo ||
+         (addr.kind == Script::Address::Kind::Line && addr.line_no == 0);
+}
+
+auto script_is_sandbox_forbidden(const Script& script) -> bool {
+  return script.kind == Script::Kind::ReadFile ||
+         script.kind == Script::Kind::ReadFileLine ||
+         script.kind == Script::Kind::WriteFile ||
+         script.kind == Script::Kind::WriteFirstFile ||
+         !script.subst_write_file.empty();
+}
+
+auto script_is_posix_forbidden(const Script& script) -> bool {
+  if (address_uses_gnu_extension(script.addr1) ||
+      address_uses_gnu_extension(script.addr2)) {
+    return true;
   }
-  return out;
+  for (const auto& group : script.group_addresses) {
+    if (address_uses_gnu_extension(group.addr1) ||
+        address_uses_gnu_extension(group.addr2)) {
+      return true;
+    }
+  }
+  return script.kind == Script::Kind::QuitSilent ||
+         script.kind == Script::Kind::PrintFilename ||
+         script.kind == Script::Kind::TestNoBranch ||
+         script.kind == Script::Kind::ReadFileLine ||
+         script.kind == Script::Kind::WriteFirstFile ||
+         script.kind == Script::Kind::ClearPattern;
+}
+
+auto validate_script_capabilities(const std::vector<Script>& scripts,
+                                  const Config& cfg) -> cp::Result<void> {
+  for (const auto& script : scripts) {
+    if (cfg.sandbox && script_is_sandbox_forbidden(script)) {
+      return std::unexpected(
+          "--sandbox rejects scripts that read or write files");
+    }
+    if (cfg.posix && script_is_posix_forbidden(script)) {
+      return std::unexpected("--posix rejects GNU sed extensions");
+    }
+  }
+  return {};
+}
+
+auto resolve_labels(std::vector<Script>& scripts) -> cp::Result<void> {
+  std::unordered_map<std::string, size_t> labels;
+  labels.reserve(scripts.size());
+  for (size_t i = 0; i < scripts.size(); ++i) {
+    const auto& script = scripts[i];
+    if (script.kind == Script::Kind::Label) {
+      labels[script.label] = i;
+    }
+  }
+
+  for (auto& script : scripts) {
+    if (script.kind != Script::Kind::Branch &&
+        script.kind != Script::Kind::TestBranch &&
+        script.kind != Script::Kind::TestNoBranch) {
+      continue;
+    }
+
+    if (script.label.empty()) {
+      script.jump_index = scripts.size();
+      continue;
+    }
+
+    auto it = labels.find(script.label);
+    if (it == labels.end()) {
+      return std::unexpected("can't find label for jump to '" + script.label +
+                             "'");
+    }
+    script.jump_index = it->second;
+  }
+  return {};
 }
 
 auto build_config(const CommandContext<SED_OPTIONS.size()>& ctx)
     -> cp::Result<Config> {
   Config cfg;
+  if (ctx.has("--debug")) {
+    return std::unexpected(
+        "--debug is not supported by this sed implementation");
+  }
+  if (ctx.has("--follow-symlinks")) {
+    return std::unexpected(
+        "--follow-symlinks is not supported by this sed implementation");
+  }
+  // [DIFFERS] -u/--unbuffered: accepted; Windows stdout is line-buffered
+  (void)ctx.has("--unbuffered");
+  (void)ctx.has("-u");
+  // [DIFFERS] -b/--binary: accepted; files are opened in binary mode on
+  // Windows by default
+  (void)ctx.has("--binary");
+  (void)ctx.has("-b");
   cfg.suppress_output = ctx.get<bool>("--quiet", false) ||
                         ctx.get<bool>("-n", false) ||
                         ctx.get<bool>("--silent", false);
@@ -522,7 +1320,7 @@ auto build_config(const CommandContext<SED_OPTIONS.size()>& ctx)
 
   if (ctx.get<bool>("--regexp-extended", false) || ctx.get<bool>("-E", false) ||
       ctx.get<bool>("-r", false)) {
-    cfg.regex_syntax = std::regex_constants::ECMAScript;
+    cfg.regex_syntax = portable_regex::Syntax::Extended;
   }
 
   if (ctx.has("--line-length") || ctx.has("-l")) {
@@ -535,36 +1333,65 @@ auto build_config(const CommandContext<SED_OPTIONS.size()>& ctx)
 
   std::vector<Script> scripts;
   scripts.reserve(32);  // Reserve for reasonable number of scripts
+  ParseContext parse_context;
+  cfg.sandbox = ctx.get<bool>("--sandbox", false);
+  cfg.posix = ctx.get<bool>("--posix", false);
+  parse_context.posix = cfg.posix;
 
   auto script_options =
       ctx.string_occurrences({"--expression", "-e", "--file", "-f"});
-  for (const auto& occurrence : script_options) {
-    if (occurrence.long_name == "--expression" ||
-        occurrence.short_name == "-e") {
-      auto lines = split_lines_string(occurrence.value);
-      for (auto& e : lines) {
-        if (e.empty()) continue;
-        auto s = parse_script_line(e, cfg.regex_syntax);
-        if (!s) return std::unexpected(s.error());
-        scripts.insert(scripts.end(), s->begin(), s->end());
+  if (!script_options.empty()) {
+    // [GNU] Every -e expression and -f file is concatenated (separated by
+    // newlines) into a single script before it is compiled, so brace groups,
+    // a/i/c text bodies, labels and comments may span option boundaries:
+    //   sed -e '1{' -e 'p' -e '}'
+    std::string script_text;
+    for (const auto& occurrence : script_options) {
+      if (occurrence.long_name == "--expression" ||
+          occurrence.short_name == "-e") {
+        script_text += occurrence.value;
+        script_text += '\n';
+      } else if (occurrence.long_name == "--file" ||
+                 occurrence.short_name == "-f") {
+        auto file_text = read_script_file(occurrence.value);
+        if (!file_text) return std::unexpected(file_text.error());
+        script_text += *file_text;
+        script_text += '\n';
       }
-    } else if (occurrence.long_name == "--file" ||
-               occurrence.short_name == "-f") {
-      auto fscripts = read_script_file(occurrence.value, cfg.regex_syntax);
-      if (!fscripts) return std::unexpected(fscripts.error());
-      scripts.insert(scripts.end(), fscripts->begin(), fscripts->end());
     }
+    auto s = parse_script_text(script_text, cfg.regex_syntax, parse_context);
+    if (!s) return std::unexpected(s.error());
+    scripts.insert(scripts.end(), s->begin(), s->end());
   }
 
   size_t consumed_positional = 0;
-  if (scripts.empty()) {
+  // When -e/-f supplied the script (even an empty one, as in "sed -e '' FILE"),
+  // the first positional operand is an input file, not a script.
+  if (script_options.empty()) {
     if (ctx.positionals.empty()) return std::unexpected("script required");
-    auto s = parse_script_line(ctx.positionals[0], cfg.regex_syntax);
+    auto s =
+        parse_script_text(ctx.positionals[0], cfg.regex_syntax, parse_context);
     if (!s) return std::unexpected(s.error());
     scripts.insert(scripts.end(), s->begin(), s->end());
     consumed_positional = 1;
   }
 
+  if (parse_context.magic_silent) cfg.suppress_output = true;
+
+  if (auto ok = resolve_labels(scripts); !ok) {
+    return std::unexpected(ok.error());
+  }
+  if (auto ok = validate_script_capabilities(scripts, cfg); !ok) {
+    return std::unexpected(ok.error());
+  }
+
+  // Each script owns one range state plus one per inherited group address, so
+  // allocate the states densely and remember each script's first slot.
+  size_t state_slots = 0;
+  for (auto& s : scripts) {
+    s.group_state_offset = state_slots;
+    state_slots += 1 + s.group_addresses.size();
+  }
   for (auto& s : scripts) cfg.scripts.push_back(std::move(s));
 
   for (size_t i = consumed_positional; i < ctx.positionals.size(); ++i) {
@@ -574,23 +1401,46 @@ auto build_config(const CommandContext<SED_OPTIONS.size()>& ctx)
   return cfg;
 }
 
+auto append_match_text(std::string& out, std::string_view input,
+                       const portable_regex::Submatch& match) -> void {
+  if (!match.matched || match.end < match.begin || match.end > input.size()) {
+    return;
+  }
+  out.append(input.substr(match.begin, match.end - match.begin));
+}
+
 auto expand_substitution_replacement(const std::string& replacement,
-                                     const std::smatch& match) -> std::string {
+                                     std::string_view input,
+                                     const portable_regex::Match& match)
+    -> std::string {
   std::string out;
-  out.reserve(replacement.size() + match.length(0));
+  out.reserve(replacement.size() + (match.end - match.begin));
   for (size_t i = 0; i < replacement.size(); ++i) {
     char c = replacement[i];
     if (c == '&') {
-      out.append(match.str(0));
+      append_match_text(out, input,
+                        portable_regex::Submatch{match.begin, match.end, true});
       continue;
     }
     if (c == '\\' && i + 1 < replacement.size()) {
       char next = replacement[++i];
       if (next >= '1' && next <= '9') {
         size_t group = static_cast<size_t>(next - '0');
-        if (group < match.size() && match[group].matched) {
-          out.append(match.str(group));
+        if (group < match.captures.size()) {
+          append_match_text(out, input, match.captures[group]);
         }
+      } else if (next == 'a') {
+        out.push_back('\a');
+      } else if (next == 'f') {
+        out.push_back('\f');
+      } else if (next == 'n') {
+        out.push_back('\n');
+      } else if (next == 'r') {
+        out.push_back('\r');
+      } else if (next == 't') {
+        out.push_back('\t');
+      } else if (next == 'v') {
+        out.push_back('\v');
       } else if (next == '&' || next == '\\') {
         out.push_back(next);
       } else {
@@ -603,8 +1453,65 @@ auto expand_substitution_replacement(const std::string& replacement,
   return out;
 }
 
+auto append_literal_substitution(std::string& output, std::string_view input,
+                                 const Script& script) -> bool {
+  const auto& needle = script.literal_pattern;
+  const size_t output_start = output.size();
+  size_t search_start = 0;
+  size_t last_append = 0;
+  size_t match_index = 0;
+  bool changed = false;
+
+  while (true) {
+    size_t match_start = input.find(needle, search_start);
+    if (match_start == std::string::npos) break;
+
+    ++match_index;
+    const size_t match_end = match_start + needle.size();
+    const bool replace_this =
+        script.occurrence == 0
+            ? script.global || match_index == 1
+            : match_index >= script.occurrence &&
+                  (script.global || match_index == script.occurrence);
+
+    if (replace_this) {
+      output.append(input.substr(last_append, match_start - last_append));
+      output.append(script.replacement);
+      last_append = match_end;
+      changed = true;
+    }
+
+    search_start = match_end;
+    if (script.occurrence == 0 && !script.global && changed) break;
+    if (script.occurrence != 0 && !script.global &&
+        match_index >= script.occurrence) {
+      break;
+    }
+  }
+
+  if (changed) {
+    output.append(input.substr(last_append));
+    return true;
+  }
+  output.resize(output_start);
+  return false;
+}
+
+auto substitute_literal_line(const std::string& input, const Script& script,
+                             bool& changed) -> std::string {
+  std::string output;
+  output.reserve(input.size());
+  changed = append_literal_substitution(output, input, script);
+  if (changed) return output;
+  return input;
+}
+
 auto substitute_line(const std::string& input, const Script& script,
                      bool& changed) -> std::string {
+  if (script.literal_substitution) {
+    return substitute_literal_line(input, script, changed);
+  }
+
   changed = false;
   std::string output;
   output.reserve(input.size());
@@ -612,13 +1519,11 @@ auto substitute_line(const std::string& input, const Script& script,
   size_t search_start = 0;
   size_t last_append = 0;
   size_t match_index = 0;
-  std::smatch match;
-  std::string suffix = input;
 
-  while (std::regex_search(suffix, match, script.pattern)) {
+  while (auto match = script.pattern.find_first(input, search_start)) {
     ++match_index;
-    size_t match_start = search_start + static_cast<size_t>(match.position(0));
-    size_t match_end = match_start + static_cast<size_t>(match.length(0));
+    size_t match_start = match->begin;
+    size_t match_end = match->end;
     const bool replace_this =
         script.occurrence == 0
             ? script.global || match_index == 1
@@ -627,18 +1532,18 @@ auto substitute_line(const std::string& input, const Script& script,
 
     if (replace_this) {
       output.append(input, last_append, match_start - last_append);
-      output.append(expand_substitution_replacement(script.replacement, match));
+      output.append(
+          expand_substitution_replacement(script.replacement, input, *match));
       last_append = match_end;
       changed = true;
     }
 
-    if (match.length(0) == 0) {
+    if (match_end == match_start) {
       if (match_end >= input.size()) break;
       search_start = match_end + 1;
     } else {
       search_start = match_end;
     }
-    suffix = input.substr(search_start);
 
     if (script.occurrence == 0 && !script.global && changed) break;
     if (script.occurrence != 0 && !script.global &&
@@ -668,7 +1573,8 @@ auto list_escape_line(std::string_view input, size_t wrap_length)
   };
 
   auto append_wrapped = [&](std::string_view text) {
-    if (wrap_length > 0 && column > 0 && column + text.size() > wrap_length) {
+    if (wrap_length > 0 && column > 0 &&
+        column + text.size() + 1 > wrap_length) {
       output.push_back('\\');
       output.push_back('\n');
       column = 0;
@@ -720,162 +1626,576 @@ auto list_escape_line(std::string_view input, size_t wrap_length)
   return output;
 }
 
-auto apply_scripts(std::string_view line, const std::vector<Script>& scripts,
-                   std::vector<ScriptState>& states, const Config& cfg,
-                   size_t line_no, bool is_last, std::string& out_line,
-                   bool& matched_any, bool& should_quit) -> bool {
-  std::string current(line);
-  matched_any = false;
-  std::vector<std::string> early_output;
-  early_output.reserve(4);
-  std::vector<std::string> insert_before;
-  insert_before.reserve(8);  // Reserve for reasonable number of insertions
-  std::vector<std::string> append_after;
-  append_after.reserve(
-      8);  // Reserve for reasonable number of append operations
-  bool deleted = false;
-  bool explicit_print = false;
-  should_quit = false;
+struct AppendAction {
+  std::string text;
+  bool terminate = true;
+};
 
-  for (size_t idx = 0; idx < scripts.size(); ++idx) {
-    const auto& s = scripts[idx];
-    auto& state = states[idx];
+struct ProcessRuntime {
+  std::string hold;
+  bool hold_had_delimiter = false;
+  std::unordered_set<std::string> truncated_write_files;
+  std::unordered_map<std::string, std::ifstream> read_files;
+  std::unordered_set<std::string> missing_read_files;
+  bool io_error = false;
+};
 
-    auto addr_match = [&](const Script::Address& a) -> bool {
-      if (a.kind == Script::Address::Kind::None) return true;
-      if (a.kind == Script::Address::Kind::Line) return line_no == a.line_no;
-      if (a.kind == Script::Address::Kind::Last) return is_last;
-      if (a.kind == Script::Address::Kind::Step) {
-        return line_no >= a.line_no && (line_no - a.line_no) % a.step == 0;
-      }
-      return std::regex_search(current, a.regex);
-    };
+struct AddressEval {
+  bool apply = false;
+  bool range_ended = false;
+};
 
-    bool apply = false;
-    if (s.addr2.kind == Script::Address::Kind::None) {
-      apply = addr_match(s.addr1);
+auto saturating_add(size_t lhs, size_t rhs) -> size_t {
+  if (std::numeric_limits<size_t>::max() - lhs < rhs) {
+    return std::numeric_limits<size_t>::max();
+  }
+  return lhs + rhs;
+}
+
+auto set_dynamic_range_end(ScriptState& range_state,
+                           const Script::Address& addr, size_t line_no)
+    -> bool {
+  if (addr.kind == Script::Address::Kind::Relative) {
+    range_state.range_end_line = saturating_add(line_no, addr.line_no);
+    return true;
+  }
+  if (addr.kind == Script::Address::Kind::Modulo) {
+    if (addr.step == 0) {
+      range_state.range_end_line = line_no;
     } else {
-      if (!state.range_active) {
-        if (addr_match(s.addr1)) {
+      size_t remainder = line_no % addr.step;
+      size_t delta = remainder == 0 ? addr.step : addr.step - remainder;
+      range_state.range_end_line = saturating_add(line_no, delta);
+    }
+    return true;
+  }
+  return false;
+}
+
+auto read_record(std::istream& in, char delimiter, std::string& record,
+                 bool& had_delimiter) -> bool {
+  record.clear();
+  if (!std::getline(in, record, delimiter)) return false;
+  had_delimiter = !in.eof();
+  return true;
+}
+
+auto write_file_once_truncated(ProcessRuntime& runtime, const std::string& path,
+                               std::string_view text) -> bool {
+  auto mode = std::ios::binary | std::ios::app;
+  if (!runtime.truncated_write_files.contains(path)) {
+    mode = std::ios::binary | std::ios::trunc;
+    runtime.truncated_write_files.insert(path);
+  }
+
+  std::ofstream out(path, mode);
+  if (!out.is_open()) {
+    safeErrorPrint("sed: cannot open '" + path + "' for writing\n");
+    return false;
+  }
+  out.write(text.data(), static_cast<std::streamsize>(text.size()));
+  if (!out.good()) {
+    safeErrorPrint("sed: cannot write '" + path + "'\n");
+    return false;
+  }
+  return true;
+}
+
+auto read_whole_file_for_append(const std::string& path) -> std::string {
+  std::ifstream in(path, std::ios::binary);
+  if (!in.is_open()) return {};
+  return std::string(std::istreambuf_iterator<char>{in},
+                     std::istreambuf_iterator<char>{});
+}
+
+auto read_one_file_record_for_append(ProcessRuntime& runtime,
+                                     const std::string& path, char delimiter)
+    -> std::optional<AppendAction> {
+  if (runtime.missing_read_files.contains(path)) return std::nullopt;
+
+  auto [it, inserted] = runtime.read_files.try_emplace(path);
+  if (inserted) {
+    it->second.open(path, std::ios::binary);
+    if (!it->second.is_open()) {
+      runtime.missing_read_files.insert(path);
+      return std::nullopt;
+    }
+  }
+
+  std::string line;
+  bool had_delimiter = false;
+  if (!read_record(it->second, delimiter, line, had_delimiter)) {
+    return std::nullopt;
+  }
+  return AppendAction{std::move(line), had_delimiter};
+}
+
+struct ExecutionContext {
+  std::istream& in;
+  const Config& cfg;
+  const std::vector<Script>& scripts;
+  std::vector<ScriptState>& states;
+  ProcessRuntime& runtime;
+  size_t& line_no;
+  std::string_view current_file = "-";
+  bool final_input = false;
+  std::string current;
+  bool current_had_delimiter = false;
+  std::vector<AppendAction> append_after;
+  std::string output;
+  bool has_output = false;
+  bool substituted_since_branch = false;
+  bool should_quit = false;
+  int quit_exit_code = 0;
+};
+
+auto append_output(ExecutionContext& ctx, std::string_view text, bool terminate)
+    -> void {
+  ctx.output.append(text);
+  if (terminate) ctx.output.push_back(ctx.cfg.delimiter);
+  ctx.has_output = true;
+}
+
+auto flush_append_queue(ExecutionContext& ctx) -> void {
+  for (const auto& item : ctx.append_after) {
+    if (!item.text.empty()) {
+      ctx.output.append(item.text);
+      ctx.has_output = true;
+    }
+    if (item.terminate) {
+      ctx.output.push_back(ctx.cfg.delimiter);
+      ctx.has_output = true;
+    }
+  }
+  ctx.append_after.clear();
+}
+
+auto is_current_last_input_record(ExecutionContext& ctx) -> bool {
+  if (!ctx.final_input) return false;
+  if (!ctx.current_had_delimiter) return true;
+  return ctx.in.peek() == EOF;
+}
+
+auto read_next_input_record(ExecutionContext& ctx, bool append) -> bool {
+  std::string next;
+  bool had_delimiter = false;
+  if (!read_record(ctx.in, ctx.cfg.delimiter, next, had_delimiter)) {
+    return false;
+  }
+
+  ++ctx.line_no;
+  ctx.substituted_since_branch = false;
+  if (append) {
+    ctx.current.push_back(ctx.cfg.delimiter);
+    ctx.current.append(next);
+  } else {
+    ctx.current = std::move(next);
+  }
+  ctx.current_had_delimiter = had_delimiter;
+  return true;
+}
+
+auto evaluate_address_range(ExecutionContext& ctx, const Script::Address& addr1,
+                            const Script::Address& addr2, bool invert_address,
+                            ScriptState& state) -> AddressEval {
+  auto addr_match = [&](const Script::Address& a) -> bool {
+    if (a.kind == Script::Address::Kind::None) return true;
+    if (a.kind == Script::Address::Kind::Line) return ctx.line_no == a.line_no;
+    if (a.kind == Script::Address::Kind::Last) {
+      return is_current_last_input_record(ctx);
+    }
+    if (a.kind == Script::Address::Kind::Step) {
+      return ctx.line_no >= a.line_no &&
+             (ctx.line_no - a.line_no) % a.step == 0;
+    }
+    if (a.kind == Script::Address::Kind::Relative ||
+        a.kind == Script::Address::Kind::Modulo) {
+      return false;
+    }
+    return a.regex.find_first(ctx.current).has_value();
+  };
+
+  AddressEval result;
+  const bool line_zero_range = addr2.kind != Script::Address::Kind::None &&
+                               addr1.kind == Script::Address::Kind::Line &&
+                               addr1.line_no == 0;
+  if (line_zero_range && !state.range_closed) {
+    // GNU sed treats 0,/RE/ as a range that is active before line 1, so the
+    // first matching line can also end the range.
+    state.range_active = true;
+  }
+  if (addr2.kind == Script::Address::Kind::None) {
+    result.apply = addr_match(addr1);
+  } else {
+    if (!state.range_active) {
+      if (addr_match(addr1)) {
+        result.apply = true;
+        if (addr2.kind == Script::Address::Kind::Line &&
+            ctx.line_no >= addr2.line_no) {
+          result.range_ended = true;
+        } else if (set_dynamic_range_end(state, addr2, ctx.line_no)) {
+          if (ctx.line_no >= state.range_end_line) {
+            result.range_ended = true;
+          } else {
+            state.range_active = true;
+          }
+        } else {
           state.range_active = true;
-          apply = true;
         }
+      }
+    } else {
+      result.apply = true;
+      bool end_matches = false;
+      if (addr2.kind == Script::Address::Kind::Line) {
+        end_matches = ctx.line_no >= addr2.line_no;
+      } else if (addr2.kind == Script::Address::Kind::Relative ||
+                 addr2.kind == Script::Address::Kind::Modulo) {
+        end_matches = ctx.line_no >= state.range_end_line;
       } else {
-        apply = true;
-        if (addr_match(s.addr2)) state.range_active = false;
+        end_matches = addr_match(addr2);
+      }
+      if (end_matches) {
+        state.range_active = false;
+        if (line_zero_range) state.range_closed = true;
+        result.range_ended = true;
       }
     }
+  }
 
-    if (s.invert_address) apply = !apply;
+  if (invert_address) result.apply = !result.apply;
+  return result;
+}
 
-    if (!apply) continue;
+// A command's own address is ANDed with the addresses of every brace group that
+// encloses it, which is how GNU sed applies "1 { p; }" and nested groups.
+auto evaluate_address(ExecutionContext& ctx, const Script& script,
+                      size_t script_index) -> AddressEval {
+  auto result =
+      evaluate_address_range(ctx, script.addr1, script.addr2,
+                             script.invert_address, ctx.states[script_index]);
+  for (size_t k = 0; k < script.group_addresses.size(); ++k) {
+    if (!result.apply) break;
+    const auto& group = script.group_addresses[k];
+    auto& group_state = ctx.states[script.group_state_offset + k];
+    auto group_result = evaluate_address_range(ctx, group.addr1, group.addr2,
+                                               group.invert, group_state);
+    if (!group_result.apply) result.apply = false;
+  }
+  return result;
+}
+
+auto first_pattern_segment(std::string_view current, char delimiter)
+    -> std::pair<std::string_view, bool> {
+  size_t pos = current.find(delimiter);
+  if (pos == std::string_view::npos) return {current, false};
+  return {current.substr(0, pos), true};
+}
+
+auto pattern_with_terminator(std::string_view text, bool terminate,
+                             char delimiter) -> std::string {
+  std::string out(text);
+  if (terminate) out.push_back(delimiter);
+  return out;
+}
+
+auto run_scripts_for_cycle(ExecutionContext& ctx) -> void {
+  bool deleted = false;
+  bool discard_append_queue = false;
+  bool end_cycle = false;
+  size_t pc = 0;
+
+  while (pc < ctx.scripts.size()) {
+    const auto& s = ctx.scripts[pc];
+    auto address = evaluate_address(ctx, s, pc);
+    if (!address.apply) {
+      ++pc;
+      continue;
+    }
 
     switch (s.kind) {
       case Script::Kind::Subst: {
         if (s.has_ymap) {
-          for (auto& ch : current) {
+          for (auto& ch : ctx.current) {
             ch = static_cast<char>(s.ymap[static_cast<unsigned char>(ch)]);
           }
         } else {
           bool changed = false;
-          std::string replaced = substitute_line(current, s, changed);
-          matched_any = matched_any || changed;
-          current.swap(replaced);
-          if (s.print_on_match && changed) explicit_print = true;
+          std::string replaced = substitute_line(ctx.current, s, changed);
+          ctx.substituted_since_branch =
+              ctx.substituted_since_branch || changed;
+          ctx.current.swap(replaced);
+          if (s.print_on_match && changed) {
+            append_output(ctx, ctx.current, true);
+          }
+          if (!s.subst_write_file.empty() && changed) {
+            std::string text = pattern_with_terminator(
+                ctx.current, ctx.current_had_delimiter, ctx.cfg.delimiter);
+            ctx.runtime.io_error = !write_file_once_truncated(
+                                       ctx.runtime, s.subst_write_file, text) ||
+                                   ctx.runtime.io_error;
+          }
         }
         break;
       }
       case Script::Kind::Print:
-        explicit_print = true;
+        append_output(ctx, ctx.current, true);
         break;
+      case Script::Kind::PrintFirst: {
+        auto [segment, ended_by_delimiter] =
+            first_pattern_segment(ctx.current, ctx.cfg.delimiter);
+        append_output(ctx, segment,
+                      ended_by_delimiter || ctx.current_had_delimiter);
+        break;
+      }
       case Script::Kind::Delete:
         deleted = true;
+        end_cycle = true;
         break;
+      case Script::Kind::DeleteFirst: {
+        size_t pos = ctx.current.find(ctx.cfg.delimiter);
+        if (pos == std::string::npos) {
+          deleted = true;
+          end_cycle = true;
+          break;
+        }
+        ctx.current.erase(0, pos + 1);
+        pc = 0;
+        continue;
+      }
       case Script::Kind::Quit:
-        should_quit = true;
+        ctx.should_quit = true;
+        ctx.quit_exit_code = s.quit_exit_code;
+        end_cycle = true;
+        break;
+      case Script::Kind::QuitSilent:
+        ctx.should_quit = true;
+        ctx.quit_exit_code = s.quit_exit_code;
+        deleted = true;
+        discard_append_queue = true;
+        end_cycle = true;
         break;
       case Script::Kind::Insert:
-        insert_before.push_back(s.text);
+        append_output(ctx, s.text, true);
         break;
       case Script::Kind::Append:
-        append_after.push_back(s.text);
+        ctx.append_after.push_back(AppendAction{s.text, true});
         break;
       case Script::Kind::Change:
-        current = s.text;
+        if (s.addr2.kind == Script::Address::Kind::None || s.invert_address ||
+            address.range_ended) {
+          append_output(ctx, s.text, true);
+        }
+        deleted = true;
+        end_cycle = true;
         break;
       case Script::Kind::LineNumber:
-        early_output.push_back(std::to_string(line_no));
+        append_output(ctx, std::to_string(ctx.line_no), true);
+        break;
+      case Script::Kind::PrintFilename:
+        append_output(ctx, ctx.current_file, true);
         break;
       case Script::Kind::List:
-        early_output.push_back(list_escape_line(current, cfg.list_line_length));
+        append_output(
+            ctx,
+            list_escape_line(
+                ctx.current,
+                s.list_line_length == std::numeric_limits<size_t>::max()
+                    ? ctx.cfg.list_line_length
+                    : s.list_line_length),
+            true);
+        break;
+      case Script::Kind::Next:
+        if (!ctx.cfg.suppress_output) {
+          append_output(ctx, ctx.current, ctx.current_had_delimiter);
+        }
+        flush_append_queue(ctx);
+        if (!read_next_input_record(ctx, false)) {
+          deleted = true;
+          end_cycle = true;
+        }
+        break;
+      case Script::Kind::AppendNext:
+        if (!read_next_input_record(ctx, true)) {
+          deleted = ctx.cfg.suppress_output;
+          end_cycle = true;
+        }
+        break;
+      case Script::Kind::HoldCopyToPattern:
+        ctx.current = ctx.runtime.hold;
+        ctx.current_had_delimiter = ctx.runtime.hold_had_delimiter;
+        break;
+      case Script::Kind::HoldAppendToPattern:
+        ctx.current.push_back(ctx.cfg.delimiter);
+        ctx.current.append(ctx.runtime.hold);
+        break;
+      case Script::Kind::PatternCopyToHold:
+        ctx.runtime.hold = ctx.current;
+        ctx.runtime.hold_had_delimiter = ctx.current_had_delimiter;
+        break;
+      case Script::Kind::PatternAppendToHold:
+        ctx.runtime.hold.push_back(ctx.cfg.delimiter);
+        ctx.runtime.hold.append(ctx.current);
+        ctx.runtime.hold_had_delimiter = ctx.current_had_delimiter;
+        break;
+      case Script::Kind::Exchange:
+        std::swap(ctx.current, ctx.runtime.hold);
+        std::swap(ctx.current_had_delimiter, ctx.runtime.hold_had_delimiter);
+        break;
+      case Script::Kind::Label:
+        break;
+      case Script::Kind::Branch:
+        pc = s.jump_index;
+        continue;
+      case Script::Kind::TestBranch:
+        if (ctx.substituted_since_branch) {
+          ctx.substituted_since_branch = false;
+          pc = s.jump_index;
+          continue;
+        }
+        break;
+      case Script::Kind::TestNoBranch:
+        if (!ctx.substituted_since_branch) {
+          pc = s.jump_index;
+          continue;
+        }
+        ctx.substituted_since_branch = false;
+        break;
+      case Script::Kind::ReadFile: {
+        std::string contents = read_whole_file_for_append(s.file_path);
+        if (!contents.empty()) {
+          ctx.append_after.push_back(AppendAction{std::move(contents), false});
+        }
+        break;
+      }
+      case Script::Kind::ReadFileLine:
+        if (auto line = read_one_file_record_for_append(
+                ctx.runtime, s.file_path, ctx.cfg.delimiter)) {
+          ctx.append_after.push_back(std::move(*line));
+        }
+        break;
+      case Script::Kind::WriteFile: {
+        std::string text = pattern_with_terminator(
+            ctx.current, ctx.current_had_delimiter, ctx.cfg.delimiter);
+        ctx.runtime.io_error =
+            !write_file_once_truncated(ctx.runtime, s.file_path, text) ||
+            ctx.runtime.io_error;
+        break;
+      }
+      case Script::Kind::WriteFirstFile: {
+        auto [segment, ended_by_delimiter] =
+            first_pattern_segment(ctx.current, ctx.cfg.delimiter);
+        std::string text = pattern_with_terminator(
+            segment, ended_by_delimiter || ctx.current_had_delimiter,
+            ctx.cfg.delimiter);
+        ctx.runtime.io_error =
+            !write_file_once_truncated(ctx.runtime, s.file_path, text) ||
+            ctx.runtime.io_error;
+        break;
+      }
+      case Script::Kind::ClearPattern:
+        ctx.current.clear();
         break;
     }
-    if (deleted || should_quit) break;
+
+    if (end_cycle || ctx.should_quit) break;
+    ++pc;
   }
 
-  std::string output;
-  for (auto& e : early_output) {
-    output.append(e);
-    output.push_back(cfg.delimiter);
-  }
-  for (auto& b : insert_before) {
-    output.append(b);
-    output.push_back('\n');
+  if (!deleted && !ctx.cfg.suppress_output) {
+    append_output(ctx, ctx.current, ctx.current_had_delimiter);
   }
 
-  if (!deleted && (!cfg.suppress_output || explicit_print)) {
-    output.append(current);
-    output.push_back(cfg.delimiter);
+  if (!discard_append_queue) {
+    flush_append_queue(ctx);
   }
-
-  if (deleted && explicit_print) {
-    output.append(current);
-    output.push_back(cfg.delimiter);
-  }
-
-  for (auto& a : append_after) {
-    output.append(a);
-    output.push_back('\n');
-  }
-
-  if (!output.empty() && output.back() == cfg.delimiter) output.pop_back();
-  out_line.swap(output);
-  return !out_line.empty();
 }
 
 auto process_stream(std::istream& in, const Config& cfg,
-                    std::vector<ScriptState>& states, size_t& line_no,
-                    bool final_input, std::string* capture) -> bool {
+                    std::vector<ScriptState>& states, ProcessRuntime& runtime,
+                    size_t& line_no, bool final_input,
+                    std::string_view current_file, std::string* capture)
+    -> std::optional<int> {
   std::vector<Script> scripts_vec(cfg.scripts.begin(), cfg.scripts.end());
-  std::string line;
-  while (std::getline(in, line, cfg.delimiter)) {
-    std::string out_line;
-    bool matched_any = false;
-    bool should_quit = false;
-    bool is_last = final_input && in.peek() == EOF;
-    bool should_print =
-        apply_scripts(line, scripts_vec, states, cfg, line_no, is_last,
-                      out_line, matched_any, should_quit);
-    if (should_print) {
+
+  for (;;) {
+    ExecutionContext ctx{in, cfg, scripts_vec, states, runtime, line_no};
+    ctx.current_file = current_file;
+    ctx.final_input = final_input;
+    if (!read_next_input_record(ctx, false)) break;
+
+    run_scripts_for_cycle(ctx);
+
+    if (ctx.has_output) {
       if (capture) {
-        capture->append(out_line);
-        capture->push_back(cfg.delimiter);
+        capture->append(ctx.output);
       } else {
-        safePrint(out_line);
-        safePrint(std::string_view(&cfg.delimiter, 1));
+        safePrint(ctx.output);
       }
     }
-    if (should_quit) return true;
-    ++line_no;
+    if (ctx.should_quit) return ctx.quit_exit_code;
   }
-  return false;
+  return std::nullopt;
+}
+
+auto can_use_literal_stream_fast_path(const Config& cfg) -> bool {
+  if (cfg.scripts.size() != 1 || cfg.suppress_output) return false;
+
+  const auto& script = cfg.scripts.front();
+  return script.kind == Script::Kind::Subst && script.literal_substitution &&
+         !script.print_on_match && !script.invert_address &&
+         script.subst_write_file.empty() &&
+         script.addr1.kind == Script::Address::Kind::None &&
+         script.addr2.kind == Script::Address::Kind::None;
+}
+
+auto read_binary_stream(std::istream& in) -> std::string {
+  return std::string(std::istreambuf_iterator<char>{in},
+                     std::istreambuf_iterator<char>{});
+}
+
+auto apply_literal_stream_fast_path(std::string_view input, const Config& cfg)
+    -> std::string {
+  const auto& script = cfg.scripts.front();
+  std::string output;
+  output.reserve(input.size());
+
+  if (script.global && script.occurrence == 0 &&
+      script.literal_pattern.find(cfg.delimiter) == std::string::npos) {
+    if (!append_literal_substitution(output, input, script)) {
+      output.assign(input.data(), input.size());
+    }
+    return output;
+  }
+
+  size_t record_start = 0;
+  while (record_start < input.size()) {
+    const size_t delim_pos = input.find(cfg.delimiter, record_start);
+    const bool had_delim = delim_pos != std::string_view::npos;
+    const size_t record_end = had_delim ? delim_pos : input.size();
+    const std::string_view record =
+        input.substr(record_start, record_end - record_start);
+
+    const size_t before_substitution = output.size();
+    if (!append_literal_substitution(output, record, script)) {
+      output.resize(before_substitution);
+      output.append(record);
+    }
+    if (had_delim) output.push_back(cfg.delimiter);
+
+    if (!had_delim) break;
+    record_start = delim_pos + 1;
+  }
+
+  return output;
 }
 
 auto make_in_place_backup_path(const std::string& path,
                                const std::string& suffix)
     -> std::filesystem::path {
+  // Build from the wide form: the narrow path ctor decodes via the system
+  // ACP, which mangles non-ASCII UTF-8 paths (#88).
   if (suffix.find('*') == std::string::npos) {
-    return std::filesystem::path(path + suffix);
+    return std::filesystem::path(utf8_to_wstring(path + suffix));
   }
 
   std::string backup;
@@ -887,19 +2207,21 @@ auto make_in_place_backup_path(const std::string& path,
       backup.push_back(ch);
     }
   }
-  return std::filesystem::path(backup);
+  return std::filesystem::path(utf8_to_wstring(backup));
 }
 
 auto preserve_in_place_backup(const std::filesystem::path& original,
                               const std::string& suffix) -> bool {
   if (suffix.empty()) return true;
 
-  auto backup = make_in_place_backup_path(original.string(), suffix);
+  auto backup =
+      make_in_place_backup_path(wstring_to_utf8(original.wstring()), suffix);
   std::error_code ec;
   std::filesystem::copy_file(
       original, backup, std::filesystem::copy_options::overwrite_existing, ec);
   if (ec) {
-    safeErrorPrint("sed: cannot create backup '" + backup.string() + "'\n");
+    safeErrorPrint("sed: cannot create backup '" +
+                   wstring_to_utf8(backup.wstring()) + "'\n");
     return false;
   }
   return true;
@@ -908,11 +2230,12 @@ auto preserve_in_place_backup(const std::filesystem::path& original,
 auto replace_file_atomically(const std::string& path,
                              const std::string& backup_suffix,
                              const std::string& content) -> bool {
-  auto original = std::filesystem::path(path);
+  auto original = std::filesystem::path(utf8_to_wstring(path));
+  DWORD original_attrs = GetFileAttributesW(utf8_to_wstring(path).c_str());
   auto suffix =
       std::string(".winuxtmp.") + std::to_string(GetCurrentProcessId());
-  auto temp = std::filesystem::path(path + suffix);
-  auto backup = std::filesystem::path(path + suffix + ".bak");
+  auto temp = std::filesystem::path(utf8_to_wstring(path + suffix));
+  auto backup = std::filesystem::path(utf8_to_wstring(path + suffix + ".bak"));
 
   {
     std::ofstream out(temp, std::ios::binary | std::ios::trunc);
@@ -954,6 +2277,9 @@ auto replace_file_atomically(const std::string& path,
     return false;
   }
 
+  if (original_attrs != INVALID_FILE_ATTRIBUTES)
+    SetFileAttributesW(utf8_to_wstring(path).c_str(), original_attrs);
+
   std::filesystem::remove(backup, ec);
   return true;
 }
@@ -984,8 +2310,11 @@ auto process_files(const Config& cfg) -> int {
   }
 
   bool any_error = false;
-  std::vector<ScriptState> states(cfg.scripts.size());
-  size_t line_no = 1;
+  size_t state_slots = 0;
+  for (const auto& s : cfg.scripts) state_slots += 1 + s.group_addresses.size();
+  std::vector<ScriptState> states(state_slots);
+  ProcessRuntime runtime;
+  size_t line_no = 0;
   for (size_t file_index = 0; file_index < expanded_files.size();
        ++file_index) {
     const auto& f = expanded_files[file_index];
@@ -998,6 +2327,13 @@ auto process_files(const Config& cfg) -> int {
     std::ifstream file;
     std::istream* in = nullptr;
     if (f == "-") {
+      // [GNU] closed stdin (<&-) reports a read error instead of
+      // dereferencing a bad stream (MSYS sed itself segfaults here).
+      if (file_io::stdin_is_bad()) {
+        safeErrorPrint("sed: can't read -: Bad file descriptor\n");
+        any_error = true;
+        continue;
+      }
       in = &std::cin;
     } else {
       file.open(f, std::ios::binary);
@@ -1010,27 +2346,54 @@ auto process_files(const Config& cfg) -> int {
     }
 
     if (cfg.separate_files || cfg.in_place) {
-      states.assign(cfg.scripts.size(), {});
-      line_no = 1;
+      size_t reset_slots = 0;
+      for (const auto& s : cfg.scripts)
+        reset_slots += 1 + s.group_addresses.size();
+      states.assign(reset_slots, {});
+      runtime.hold.clear();
+      runtime.hold_had_delimiter = false;
+      line_no = 0;
     }
 
     const bool final_input =
         cfg.separate_files || (file_index + 1 == expanded_files.size());
 
+    if (can_use_literal_stream_fast_path(cfg)) {
+      std::string content = read_binary_stream(*in);
+      std::string output = apply_literal_stream_fast_path(content, cfg);
+      if (cfg.in_place) {
+        file.close();
+        if (!replace_file_atomically(f, cfg.in_place_suffix, output)) {
+          any_error = true;
+        }
+      } else {
+        safePrint(output);
+      }
+      continue;
+    }
+
+    const std::string_view current_file =
+        f == "-" ? std::string_view("-") : std::string_view(f);
     if (cfg.in_place) {
       std::string output;
-      bool should_quit =
-          process_stream(*in, cfg, states, line_no, true, &output);
+      auto quit_exit_code = process_stream(*in, cfg, states, runtime, line_no,
+                                           true, current_file, &output);
+      any_error = any_error || runtime.io_error;
       file.close();
       if (!replace_file_atomically(f, cfg.in_place_suffix, output)) {
         any_error = true;
       }
-      if (should_quit) break;
+      if (quit_exit_code) return any_error ? 1 : *quit_exit_code;
       continue;
     }
 
-    if (process_stream(*in, cfg, states, line_no, final_input, nullptr))
-      return any_error ? 1 : 0;
+    if (auto quit_exit_code =
+            process_stream(*in, cfg, states, runtime, line_no, final_input,
+                           current_file, nullptr)) {
+      any_error = any_error || runtime.io_error;
+      return any_error ? 1 : *quit_exit_code;
+    }
+    any_error = any_error || runtime.io_error;
   }
   return any_error ? 1 : 0;
 }

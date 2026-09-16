@@ -37,30 +37,52 @@
 import std;
 import core;
 import utils;
+import container;
 
 using cmd::meta::OptionMeta;
 using cmd::meta::OptionType;
 
 auto constexpr HEXDUMP_OPTIONS = std::array{
+    // [GNU]
     OPTION("-b", "", "one-byte octal display"),
+    // [GNU]
     OPTION("-c", "", "one-byte character display"),
+    // [GNU]
     OPTION("-C", "", "canonical hex+ASCII display"),
+    // [GNU]
     OPTION("-d", "", "two-byte decimal display"),
+    // [GNU]
     OPTION("-o", "", "two-byte octal display"),
+    // [GNU]
     OPTION("-x", "", "two-byte hex display"),
+    // [GNU]
     OPTION("-e", "", "format string", STRING_TYPE),
+    // [GNU]
     OPTION("-f", "", "format file", STRING_TYPE),
+    // [GNU]
     OPTION("-n", "", "interpret only LENGTH bytes of input", STRING_TYPE),
+    // [GNU]
     OPTION("-s", "", "skip offset bytes from the beginning", STRING_TYPE),
-    OPTION("-v", "", "display all input, no squeeze")};
+    // [GNU]
+    OPTION("-v", "", "display all input, no squeeze"),
+    // [GNU] -L, --color: interpret color formatting specifiers
+    OPTION("-L", "--color", "interpret color formatting specifiers")};
 
 namespace hexdump_pipeline {
 namespace cp = core::pipeline;
 
-enum class DisplayMode { Octal1, Char, Canonical, Decimal2, Octal2, Hex2 };
+enum class DisplayMode {
+  Octal1,
+  Char,
+  Canonical,
+  Decimal2,
+  Octal2,
+  DefaultHex2,
+  Hex2
+};
 
 struct Config {
-  DisplayMode mode = DisplayMode::Canonical;
+  DisplayMode mode = DisplayMode::DefaultHex2;
   size_t length = 0;  // 0 = all
   size_t skip = 0;
   bool no_squeeze = false;
@@ -89,22 +111,25 @@ auto build_config(const CommandContext<HEXDUMP_OPTIONS.size()>& ctx)
 
   cfg.no_squeeze = ctx.get<bool>("-v", false);
   cfg.format_string = ctx.get<std::string>("-e", "");
+  if (!cfg.format_string.empty()) {
+    return std::unexpected("-e format strings are not yet supported");
+  }
   cfg.format_file = ctx.get<std::string>("-f", "");
 
   auto length_opt = ctx.get<std::string>("-n", "");
   if (!length_opt.empty()) {
-    try {
-      cfg.length = std::stoull(length_opt);
-    } catch (...) {
+    auto [ptr, ec] = std::from_chars(
+        length_opt.data(), length_opt.data() + length_opt.size(), cfg.length);
+    if (ec != std::errc() || ptr != length_opt.data() + length_opt.size()) {
       return std::unexpected("invalid length");
     }
   }
 
   auto skip_opt = ctx.get<std::string>("-s", "");
   if (!skip_opt.empty()) {
-    try {
-      cfg.skip = std::stoull(skip_opt);
-    } catch (...) {
+    auto [ptr, ec] = std::from_chars(
+        skip_opt.data(), skip_opt.data() + skip_opt.size(), cfg.skip);
+    if (ec != std::errc() || ptr != skip_opt.data() + skip_opt.size()) {
       return std::unexpected("invalid skip");
     }
   }
@@ -116,12 +141,11 @@ auto build_config(const CommandContext<HEXDUMP_OPTIONS.size()>& ctx)
   return cfg;
 }
 
-auto print_canonical(const std::vector<uint8_t>& data) -> void {
+auto print_canonical(const std::vector<uint8_t>& data, size_t base_offset)
+    -> void {
   for (size_t i = 0; i < data.size(); i += 16) {
-    // Offset
-    safePrint(std::format("{:07x}  ", i));
+    safePrint(std::format("{:08x}  ", base_offset + i));
 
-    // Hex bytes
     for (size_t j = 0; j < 16; ++j) {
       if (i + j < data.size()) {
         safePrint(std::format("{:02x}", data[i + j]));
@@ -132,7 +156,6 @@ auto print_canonical(const std::vector<uint8_t>& data) -> void {
       if (j < 15) safePrint(" ");
     }
 
-    // ASCII representation
     safePrint("  |");
     for (size_t j = 0; j < 16 && i + j < data.size(); ++j) {
       unsigned char ch = data[i + j];
@@ -144,81 +167,117 @@ auto print_canonical(const std::vector<uint8_t>& data) -> void {
     }
     safePrintLn("|");
   }
+
+  if (!data.empty()) {
+    safePrintLn(std::format("{:08x}", base_offset + data.size()));
+  }
 }
 
-auto print_hex2(const std::vector<uint8_t>& data) -> void {
+auto print_hex2(const std::vector<uint8_t>& data, size_t base_offset,
+                bool padded_words) -> void {
   for (size_t i = 0; i < data.size(); i += 16) {
-    safePrint(std::format("{:07x}  ", i));
+    safePrint(std::format("{:07x} ", base_offset + i));
     for (size_t j = 0; j < 16 && i + j + 1 < data.size(); j += 2) {
       uint16_t val = static_cast<uint16_t>(data[i + j]) |
                      (static_cast<uint16_t>(data[i + j + 1]) << 8);
-      safePrint(std::format("{:04x} ", val));
+      if (padded_words) {
+        safePrint(std::format("   {:04x} ", val));
+      } else {
+        if (j > 0) safePrint(" ");
+        safePrint(std::format("{:04x}", val));
+      }
     }
     safePrintLn("");
   }
+  if (!data.empty()) {
+    safePrintLn(std::format("{:07x}", base_offset + data.size()));
+  }
 }
 
-auto print_octal2(const std::vector<uint8_t>& data) -> void {
+auto print_octal2(const std::vector<uint8_t>& data, size_t base_offset)
+    -> void {
   for (size_t i = 0; i < data.size(); i += 16) {
-    safePrint(std::format("{:07o}  ", i));
+    safePrint(std::format("{:07x} ", base_offset + i));
     for (size_t j = 0; j < 16 && i + j + 1 < data.size(); j += 2) {
       uint16_t val = static_cast<uint16_t>(data[i + j]) |
                      (static_cast<uint16_t>(data[i + j + 1]) << 8);
-      safePrint(std::format("{:06o} ", val));
+      safePrint(std::format("  {:06o} ", val));
     }
     safePrintLn("");
   }
+  if (!data.empty()) {
+    safePrintLn(std::format("{:07x}", base_offset + data.size()));
+  }
 }
 
-auto print_decimal2(const std::vector<uint8_t>& data) -> void {
+auto print_decimal2(const std::vector<uint8_t>& data, size_t base_offset)
+    -> void {
   for (size_t i = 0; i < data.size(); i += 16) {
-    safePrint(std::format("{:07d}  ", i));
+    safePrint(std::format("{:07x} ", base_offset + i));
     for (size_t j = 0; j < 16 && i + j + 1 < data.size(); j += 2) {
       uint16_t val = static_cast<uint16_t>(data[i + j]) |
                      (static_cast<uint16_t>(data[i + j + 1]) << 8);
-      safePrint(std::format("{:05d} ", val));
+      safePrint(std::format("  {:05d} ", val));
     }
     safePrintLn("");
   }
-}
-
-auto print_octal1(const std::vector<uint8_t>& data) -> void {
-  for (size_t i = 0; i < data.size(); i += 16) {
-    safePrint(std::format("{:07o}  ", i));
-    for (size_t j = 0; j < 16 && i + j < data.size(); ++j) {
-      safePrint(std::format("{:03o} ", data[i + j]));
-    }
-    safePrintLn("");
+  if (!data.empty()) {
+    safePrintLn(std::format("{:07x}", base_offset + data.size()));
   }
 }
 
-auto print_char(const std::vector<uint8_t>& data) -> void {
+auto print_octal1(const std::vector<uint8_t>& data, size_t base_offset)
+    -> void {
   for (size_t i = 0; i < data.size(); i += 16) {
-    safePrint(std::format("{:07o}  ", i));
-    for (size_t j = 0; j < 16 && i + j < data.size(); ++j) {
+    safePrint(std::format("{:07x} ", base_offset + i));
+    for (size_t j = 0; j < 16; ++j) {
+      if (i + j < data.size()) {
+        safePrint(std::format("{:03o} ", data[i + j]));
+      } else {
+        safePrint("    ");
+      }
+    }
+    safePrintLn("");
+  }
+  if (!data.empty()) {
+    safePrintLn(std::format("{:07x}", base_offset + data.size()));
+  }
+}
+
+auto print_char(const std::vector<uint8_t>& data, size_t base_offset) -> void {
+  for (size_t i = 0; i < data.size(); i += 16) {
+    safePrint(std::format("{:07x} ", base_offset + i));
+    for (size_t j = 0; j < 16; ++j) {
+      if (i + j >= data.size()) {
+        safePrint("    ");
+        continue;
+      }
       unsigned char ch = data[i + j];
       if (ch == 0)
-        safePrint("  \\0");
+        safePrint(" \\0 ");
       else if (ch == 7)
-        safePrint("  \\a");
+        safePrint(" \\a ");
       else if (ch == 8)
-        safePrint("  \\b");
+        safePrint(" \\b ");
       else if (ch == 9)
-        safePrint("  \\t");
+        safePrint(" \\t ");
       else if (ch == 10)
-        safePrint("  \\n");
+        safePrint(" \\n ");
       else if (ch == 11)
-        safePrint("  \\v");
+        safePrint(" \\v ");
       else if (ch == 12)
-        safePrint("  \\f");
+        safePrint(" \\f ");
       else if (ch == 13)
-        safePrint("  \\r");
+        safePrint(" \\r ");
       else if (ch >= 32 && ch <= 126)
-        safePrint(std::format("   {}", static_cast<char>(ch)));
+        safePrint(std::format("  {} ", static_cast<char>(ch)));
       else
-        safePrint(std::format("  {:03o}", ch));
+        safePrint(std::format("{:03o} ", ch));
     }
     safePrintLn("");
+  }
+  if (!data.empty()) {
+    safePrintLn(std::format("{:07x}", base_offset + data.size()));
   }
 }
 
@@ -234,7 +293,8 @@ auto dump_file(const std::string& filename, const Config& cfg) -> int {
       data.insert(data.end(), buf, buf + std::cin.gcount());
     }
   } else {
-    std::ifstream file(filename, std::ios::binary);
+    std::ifstream file(native_path::normalize_api_operand(filename),
+                       std::ios::binary);
     if (!file) {
       safeErrorPrint("hexdump: '");
       safeErrorPrint(filename);
@@ -245,36 +305,40 @@ auto dump_file(const std::string& filename, const Config& cfg) -> int {
                 std::istreambuf_iterator<char>());
   }
 
-  // Apply skip
+  size_t base_offset = 0;
   if (cfg.skip > 0 && cfg.skip < data.size()) {
-    data.erase(data.begin(), data.begin() + cfg.skip);
+    base_offset = cfg.skip;
+    data.erase(data.begin(),
+               data.begin() + static_cast<std::ptrdiff_t>(cfg.skip));
   } else if (cfg.skip >= data.size()) {
     return 0;
   }
 
-  // Apply length
   if (cfg.length > 0 && cfg.length < data.size()) {
     data.resize(cfg.length);
   }
 
   switch (cfg.mode) {
     case DisplayMode::Canonical:
-      print_canonical(data);
+      print_canonical(data, base_offset);
+      break;
+    case DisplayMode::DefaultHex2:
+      print_hex2(data, base_offset, false);
       break;
     case DisplayMode::Hex2:
-      print_hex2(data);
+      print_hex2(data, base_offset, true);
       break;
     case DisplayMode::Octal2:
-      print_octal2(data);
+      print_octal2(data, base_offset);
       break;
     case DisplayMode::Decimal2:
-      print_decimal2(data);
+      print_decimal2(data, base_offset);
       break;
     case DisplayMode::Octal1:
-      print_octal1(data);
+      print_octal1(data, base_offset);
       break;
     case DisplayMode::Char:
-      print_char(data);
+      print_char(data, base_offset);
       break;
   }
 
@@ -298,8 +362,7 @@ auto run(const Config& cfg) -> int {
 }  // namespace hexdump_pipeline
 
 REGISTER_COMMAND(
-    hexdump, "hexdump",
-    "hexdump [OPTION]... [FILE]...",
+    hexdump, "hexdump", "hexdump [OPTION]... [FILE]...",
     "Display file contents in hexadecimal, decimal, octal, or ascii.\n"
     "\n"
     "The hexdump utility is a filter which displays the specified files,\n"
@@ -309,7 +372,7 @@ REGISTER_COMMAND(
     "\n"
     "  -b               one-byte octal display\n"
     "  -c               one-byte character display\n"
-    "  -C               canonical hex+ASCII display (default)\n"
+    "  -C               canonical hex+ASCII display\n"
     "  -d               two-byte decimal display\n"
     "  -e FORMAT        format string\n"
     "  -f FORMAT_FILE   format file\n"

@@ -34,7 +34,8 @@ jobs:
           git submodule update --init --depth=1
           ./bootstrap --skip-po
           ./configure --disable-nls --disable-dependency-tracking
-          make -j2 src/base64 src/base32 src/basenc src/tac src/date src/expr src/factor src/printf src/od src/dircolors
+          # The default target generates gnulib BUILT_SOURCES before compiling.
+          make -j2
           git rev-parse HEAD
           git submodule status
       - name: Record GNU byte-level results
